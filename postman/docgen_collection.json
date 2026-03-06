@@ -1,0 +1,41 @@
+{
+  "info": {
+    "name": "AI Doc Generator API",
+    "description": "API collection for AI Document Generator",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": { "method": "GET", "url": "http://localhost:8000/health" }
+    },
+    {
+      "name": "Generate Document",
+      "request": {
+        "method": "POST",
+        "url": "http://localhost:8000/api/generate",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"title\": \"Data Retention Policy\",\n  \"industry\": \"saas\",\n  \"doc_type\": \"policy\",\n  \"description\": \"Policy for data retention\",\n  \"tags\": [\"compliance\", \"data\"],\n  \"created_by\": \"admin\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Publish to Notion",
+      "request": {
+        "method": "POST",
+        "url": "http://localhost:8000/api/publish",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"doc_id\": \"your-doc-id\",\n  \"title\": \"Data Retention Policy\",\n  \"industry\": \"saas\",\n  \"doc_type\": \"policy\",\n  \"content\": \"Document content here\",\n  \"tags\": [\"compliance\"],\n  \"created_by\": \"admin\",\n  \"version\": \"v1.0\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Get Library",
+      "request": { "method": "GET", "url": "http://localhost:8000/api/library" }
+    }
+  ]
+}
