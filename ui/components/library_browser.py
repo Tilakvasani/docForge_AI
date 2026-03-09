@@ -4,8 +4,6 @@ import httpx
 API_URL = "http://localhost:8000/api"
 
 def render_library_browser():
-    st.header("📚 Document Library")
-
     try:
         response = httpx.get(f"{API_URL}/library", timeout=15)
         if response.status_code != 200:
@@ -14,50 +12,64 @@ def render_library_browser():
 
         data = response.json()
         docs = data.get("documents", [])
-
-        st.markdown(f"**Total Documents:** {data.get('total', 0)}")
-        st.markdown("---")
-
-        if not docs:
-            st.info("No documents found in Notion database.")
-            return
-
-        # Build dynamic filter options from actual data
-        industries = ["All"] + sorted(list(set(d["industry"] for d in docs if d.get("industry"))))
-        doc_types = ["All"] + sorted(list(set(d["doc_type"] for d in docs if d.get("doc_type"))))
+        total = data.get("total", 0)
 
         col1, col2 = st.columns(2)
+        doc_types = ["All"] + sorted(set(d["doc_type"] for d in docs if d.get("doc_type")))
+        statuses  = ["All", "Generated", "Draft", "Reviewed", "Archived"]
+
         with col1:
-            filter_industry = st.selectbox("Filter by Industry", industries)
+            ftype = st.selectbox("Type", doc_types)
         with col2:
-            filter_type = st.selectbox("Filter by Type", doc_types)
+            fstatus = st.selectbox("Status", statuses)
 
         filtered = docs
-        if filter_industry != "All":
-            filtered = [d for d in filtered if d.get("industry") == filter_industry]
-        if filter_type != "All":
-            filtered = [d for d in filtered if d.get("doc_type") == filter_type]
+        if ftype   != "All": filtered = [d for d in filtered if d.get("doc_type") == ftype]
+        if fstatus != "All": filtered = [d for d in filtered if d.get("status") == fstatus]
 
-        st.markdown(f"**Showing:** {len(filtered)} documents")
+        st.markdown(f'<div class="count-line">Showing <b>{len(filtered)}</b> of <b>{total}</b> documents</div>', unsafe_allow_html=True)
 
+        if not filtered:
+            st.markdown("""
+            <div class="empty">
+                <div class="empty-icon">◫</div>
+                <div class="empty-text">No documents yet.</div>
+            </div>
+            """, unsafe_allow_html=True)
+            return
+
+        st.markdown('<div class="lib-grid">', unsafe_allow_html=True)
         for doc in filtered:
-            with st.expander(f"📄 {doc['title']} | {doc.get('industry', 'N/A')} | {doc.get('doc_type', 'N/A')}"):
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Version", f"v{doc.get('version', '1')}")
-                col2.metric("Status", doc.get("status", "Generated"))
-                col3.metric("Word Count", doc.get("word_count", 0))
+            status = doc.get("status", "Generated")
+            badge_cls = {"Generated": "badge-gen", "Draft": "badge-draft"}.get(status, "badge-rev")
+            tags = doc.get("tags", [])
+            chips = "".join([f'<span class="chip chip-grey">{t}</span>' for t in tags[:4]])
+            wc = doc.get("word_count", 0)
+            created = doc.get("created_at", "")[:10] or "—"
+            notion_url = doc.get("notion_url", "")
+            notion_btn = f'<a href="{notion_url}" target="_blank" class="notion-link">◫ Notion</a>' if notion_url else ""
 
-                tags = doc.get("tags", [])
-                if tags:
-                    st.markdown("**Tags:** " + " ".join([f"`{t}`" for t in tags]))
+            st.markdown(f"""
+            <div class="lcard">
+                <div>
+                    <div class="lcard-title">{doc.get('title','Untitled')}</div>
+                    <div class="lcard-meta">{doc.get('doc_type','')} · {doc.get('industry','')} · {created} · by {doc.get('created_by','—')}</div>
+                    <div class="lcard-chips">{chips}</div>
+                </div>
+                <div class="lcard-right">
+                    <span class="badge {badge_cls}">{status}</span>
+                    <div class="lcard-stat">
+                        <div class="lcard-stat-n">{wc:,}</div>
+                        <div class="lcard-stat-l">words</div>
+                    </div>
+                    {notion_btn}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-                st.markdown(f"**Created by:** {doc.get('created_by', 'AI Doc Generator')}")
-                st.markdown(f"**Created at:** {doc.get('created_at', '')[:10]}")
-
-                if doc.get("notion_url"):
-                    st.markdown(f"[📝 View in Notion]({doc['notion_url']})")
+        st.markdown('</div>', unsafe_allow_html=True)
 
     except httpx.ConnectError:
-        st.error("❌ Cannot connect to backend. Make sure FastAPI is running: `uvicorn backend.main:app --reload`")
+        st.error("Cannot connect to backend. Run: uvicorn backend.main:app --reload")
     except Exception as e:
-        st.error(f"Error loading library: {e}")
+        st.error(f"Error: {e}")
