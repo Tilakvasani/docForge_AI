@@ -1,361 +1,359 @@
 import streamlit as st
 import httpx
+import sys, os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+from prompts.templates import get_sections_for_doc_type
 
 API_URL = "http://localhost:8000/api"
 
 DEPARTMENTS = [
-    "Human Resources (HR)",
-    "Legal",
-    "Finance / Accounting",
-    "Sales",
-    "Marketing",
-    "Engineering / Development",
-    "Product Management",
-    "Operations",
-    "Customer Support",
-    "Compliance / Risk Management",
+    "Human Resources (HR)", "Legal", "Finance / Accounting", "Sales",
+    "Marketing", "Engineering / Development", "Product Management",
+    "Operations", "Customer Support", "Compliance / Risk Management",
 ]
 
 DOC_TYPES = [
-    "Terms of Service",
-    "Employment Contract",
-    "Privacy Policy",
-    "SOP",
-    "SLA",
-    "Product Requirement Document",
-    "Technical Specification",
-    "Incident Report",
-    "Security Policy",
-    "Customer Onboarding Guide",
-    "Business Proposal",
-    "NDA",
+    "Terms of Service", "Employment Contract", "Privacy Policy", "SOP",
+    "SLA", "Product Requirement Document", "Technical Specification",
+    "Incident Report", "Security Policy", "Customer Onboarding Guide",
+    "Business Proposal", "NDA",
 ]
 
-SECTIONS = [
-    {
-        "name": "Title & Overview",
-        "icon": "◈",
-        "questions": [
-            ("doc_title", "What is the official title of this document?", "e.g. Data Privacy Policy v2.0"),
-            ("doc_version", "What version or effective date should appear?", "e.g. v1.0 — March 2026"),
-        ]
-    },
-    {
-        "name": "Purpose",
-        "icon": "◎",
-        "questions": [
-            ("purpose_main", "What is the primary purpose of this document?", "e.g. Define data handling procedures for all employees"),
-            ("purpose_problem", "What problem or business need does it address?", "e.g. GDPR compliance gap identified in Q1 audit"),
-        ]
-    },
-    {
-        "name": "Scope",
-        "icon": "◐",
-        "questions": [
-            ("scope_applies", "Who does this document apply to?", "e.g. All full-time employees, contractors, and third-party vendors"),
-            ("scope_exclusions", "Are there any exclusions or limitations?", "e.g. Does not apply to legacy systems pre-2020"),
-        ]
-    },
-    {
-        "name": "Responsibilities",
-        "icon": "◑",
-        "questions": [
-            ("resp_implement", "Who is responsible for implementing this document?", "e.g. Department heads and team leads"),
-            ("resp_maintain", "Who is responsible for maintaining and reviewing it?", "e.g. Legal team and CTO office"),
-        ]
-    },
-    {
-        "name": "Procedure / Process",
-        "icon": "◒",
-        "questions": [
-            ("proc_steps", "Describe the main steps or process this document outlines.", "e.g. Data collection → encryption → storage → deletion after 90 days"),
-            ("proc_tools", "Are there any tools, systems, or templates involved?", "e.g. Jira for tracking, Notion for documentation, AWS S3 for storage"),
-        ]
-    },
-    {
-        "name": "Compliance & Risk",
-        "icon": "◓",
-        "questions": [
-            ("comp_regs", "What regulations or standards must this comply with?", "e.g. GDPR, SOC2, ISO 27001"),
-            ("comp_risks", "What are the key risks if this document is not followed?", "e.g. Data breach, regulatory fines up to €20M"),
-        ]
-    },
-    {
-        "name": "Conclusion",
-        "icon": "●",
-        "questions": [
-            ("conc_outcome", "What is the expected outcome after following this document?", "e.g. Full GDPR compliance and reduced breach risk by 80%"),
-            ("conc_review", "How often should this document be reviewed or updated?", "e.g. Annually or after any major regulatory change"),
-        ]
-    },
-]
+# Section count per doc type — shown in config preview
+SECTION_COUNTS = {t: len(get_sections_for_doc_type(t)) for t in DOC_TYPES}
+
 
 def init_state():
-    if "gen_step" not in st.session_state:
-        st.session_state.gen_step = "config"
-        st.session_state.gen_section = 0
-        st.session_state.gen_answers = {}
-        st.session_state.gen_config = {}
-        st.session_state.last_doc = None
-        st.session_state.published = False
-        st.session_state.notion_url = ""
+    for k, v in {
+        "gen_step": "config", "gen_section": 0,
+        "gen_answers": {}, "gen_config": {},
+        "last_doc": None, "published": False,
+        "notion_url": "", "cur_sections": [],
+    }.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-def progress_bar(current, total):
-    pct = int((current / total) * 100)
-    filled = int((current / total) * 20)
-    bar = "█" * filled + "░" * (20 - filled)
-    st.markdown(f"""
-    <div style="margin: 1.5rem 0">
-        <div style="display:flex; justify-content:space-between; margin-bottom:6px">
-            <span style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#7a7568; letter-spacing:0.1em; text-transform:uppercase">
-                Section {current} of {total}
-            </span>
-            <span style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#f5a623">{pct}%</span>
-        </div>
-        <div style="font-family:'Space Mono',monospace; font-size:0.75rem; color:#f5a623; letter-spacing:0.1em">{bar}</div>
-    </div>
-    """, unsafe_allow_html=True)
 
-def section_breadcrumb():
-    dots = []
-    total = len(SECTIONS)
+def _progress(current, total):
+    pct = int((current / total) * 100) if total else 0
+    filled = int((current / total) * 24) if total else 0
+    bar = "█" * filled + "░" * (24 - filled)
+    st.markdown(
+        f'<div style="margin:1.2rem 0">'
+        f'<div style="display:flex;justify-content:space-between;margin-bottom:5px">'
+        f'<span style="font-family:monospace;font-size:0.62rem;color:#555;'
+        f'letter-spacing:0.1em;text-transform:uppercase">Section {current} of {total}</span>'
+        f'<span style="font-family:monospace;font-size:0.62rem;color:#d4a64a">{pct}%</span>'
+        f'</div>'
+        f'<div style="font-family:monospace;font-size:0.7rem;color:#d4a64a">{bar}</div>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
+
+def _breadcrumb(sections):
     current = st.session_state.gen_section
-    for i, s in enumerate(SECTIONS):
+    dots = []
+    for i, s in enumerate(sections):
         if i < current:
-            color = "#f5a623"
-            sym = "●"
+            c, sym = "#d4a64a", "●"
         elif i == current:
-            color = "#f5a623"
-            sym = s["icon"]
+            c, sym = "#d4a64a", s["icon"]
         else:
-            color = "#2e2b24"
-            sym = "○"
-        dots.append(f'<span style="color:{color}; font-size:0.8rem" title="{s["name"]}">{sym}</span>')
-    st.markdown(f'<div style="display:flex; gap:8px; margin-bottom:1.5rem; align-items:center">{"".join(dots)}</div>', unsafe_allow_html=True)
+            c, sym = "#2a2820", "○"
+        dots.append(
+            f'<span title="{s["name"]}" style="color:{c};font-size:0.95rem;margin:0 3px">{sym}</span>'
+        )
+    st.markdown(
+        f'<div style="text-align:center;margin-bottom:1.2rem">{"".join(dots)}</div>',
+        unsafe_allow_html=True
+    )
+
+
+def _section_header(sec):
+    freq = sec.get("freq", "")
+    freq_html = (
+        f'<span style="background:rgba(212,166,74,0.1);border:1px solid rgba(212,166,74,0.2);'
+        f'border-radius:4px;padding:1px 7px;font-size:0.6rem;color:#d4a64a;'
+        f'font-family:monospace;margin-left:8px">{freq}</span>'
+    ) if freq else ""
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:1.4rem">'
+        f'<span style="font-size:1.4rem">{sec["icon"]}</span>'
+        f'<span style="font-family:monospace;font-size:0.68rem;color:#d4a64a;'
+        f'letter-spacing:0.14em;text-transform:uppercase">{sec["name"]}</span>'
+        f'{freq_html}</div>',
+        unsafe_allow_html=True
+    )
+
 
 def render_generator_form():
     init_state()
 
-    # ── STEP 1: CONFIG ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    #  STEP 1 — CONFIG
+    # ══════════════════════════════════════════════════════════════
     if st.session_state.gen_step == "config":
-        st.markdown('<div class="panel"><div class="panel-label">Document Setup</div>', unsafe_allow_html=True)
 
-        with st.form("config_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.text_input("Industry", value="SaaS", disabled=True)
-            with col2:
-                department = st.selectbox("Department", DEPARTMENTS)
+        st.markdown(
+            '<p style="font-family:monospace;font-size:0.62rem;color:#555;'
+            'letter-spacing:0.14em;text-transform:uppercase;margin-bottom:1.4rem">'
+            '◈ Document Configuration</p>',
+            unsafe_allow_html=True
+        )
 
-            doc_type = st.selectbox("Document Type", DOC_TYPES)
+        col1, col2 = st.columns(2)
+        with col1:
+            department = st.selectbox("Department", DEPARTMENTS, key="cfg_dept")
+        with col2:
+            doc_type = st.selectbox("Document Type", DOC_TYPES, key="cfg_doc_type")
 
-            col3, col4 = st.columns(2)
-            with col3:
-                tags = st.text_input("Tags", placeholder="e.g. gdpr, b2b, enterprise")
-            with col4:
-                created_by = st.text_input("Author", value="admin")
+        # ── Live section preview ──────────────────────────────────
+        preview = get_sections_for_doc_type(doc_type)
+        n       = len(preview)
 
-            start = st.form_submit_button("◈  Begin Guided Generation →")
+        # Auto-generated sections notice
+        st.markdown(
+            '<div style="background:#0d0c0a;border:1px solid #1a1812;border-radius:10px;'
+            'padding:1rem 1.2rem;margin:1rem 0">'
+            '<p style="font-family:monospace;font-size:0.58rem;color:#3a3830;'
+            'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:0.5rem">'
+            '◈ auto-generated (no questions needed)</p>'
+            '<p style="font-size:0.78rem;color:#3a3830;line-height:1.7">'
+            'Document Metadata &nbsp;·&nbsp; Version Control Table &nbsp;·&nbsp; Confidentiality Notice'
+            '</p></div>',
+            unsafe_allow_html=True
+        )
 
-        st.markdown('</div>', unsafe_allow_html=True)
+        # User-answered sections preview
+        names_html = " &nbsp;›&nbsp; ".join(
+            f'<span style="color:#6a6560">{s["name"]}</span>' for s in preview
+        )
+        st.markdown(
+            f'<div style="background:#0d0c0a;border:1px solid #1a1812;border-radius:10px;'
+            f'padding:1rem 1.2rem;margin:0.5rem 0 1.2rem">'
+            f'<p style="font-family:monospace;font-size:0.58rem;color:#d4a64a;'
+            f'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:0.5rem">'
+            f'◉ {n} sections · you will answer {n * 2} questions</p>'
+            f'<p style="font-size:0.76rem;line-height:1.9">{names_html}</p>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
-        if start:
+        tags   = st.text_input("Tags (comma-separated)", placeholder="e.g. SaaS, GDPR, Q2-2026")
+        author = st.text_input("Document Author", placeholder="e.g. Jane Smith")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Continue to Questions →", type="primary", use_container_width=True):
             st.session_state.gen_config = {
-                "industry": "SaaS",
+                "industry":  "SaaS",
                 "department": department,
-                "doc_type": doc_type,
-                "tags": [t.strip() for t in tags.split(",") if t.strip()],
-                "created_by": created_by,
+                "doc_type":   doc_type,
+                "tags":       [t.strip() for t in tags.split(",") if t.strip()],
+                "author":     author or "Admin",
+                "title":      f"{doc_type} — {department}",
             }
-            st.session_state.gen_step = "questions"
-            st.session_state.gen_section = 0
+            st.session_state.cur_sections = preview
+            st.session_state.gen_section  = 0
+            st.session_state.gen_answers  = {}
+            st.session_state.gen_step     = "questions"
             st.rerun()
 
-    # ── STEP 2: SECTION QUESTIONS ───────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    #  STEP 2 — GUIDED QUESTIONS
+    # ══════════════════════════════════════════════════════════════
     elif st.session_state.gen_step == "questions":
-        cfg = st.session_state.gen_config
-        sec_idx = st.session_state.gen_section
-        section = SECTIONS[sec_idx]
+        sections = st.session_state.cur_sections
+        idx      = st.session_state.gen_section
+        total    = len(sections)
+        sec      = sections[idx]
+        cfg      = st.session_state.gen_config
 
-        # Header
-        st.markdown(f"""
-        <div class="panel-label" style="margin-bottom:1rem">
-            {section['icon']} {section['name'].upper()}
-            &nbsp;·&nbsp;
-            <span style="color:#7a7568">{cfg['doc_type']} · {cfg['department']} · SaaS</span>
-        </div>
-        """, unsafe_allow_html=True)
+        _progress(idx + 1, total)
+        _breadcrumb(sections)
+        _section_header(sec)
 
-        progress_bar(sec_idx + 1, len(SECTIONS))
-        section_breadcrumb()
+        st.markdown(
+            f'<p style="font-family:monospace;font-size:0.6rem;color:#2a2820;'
+            f'letter-spacing:0.1em;margin-bottom:1.4rem">'
+            f'{cfg["doc_type"]} &nbsp;·&nbsp; {cfg["department"]}</p>',
+            unsafe_allow_html=True
+        )
 
-        # Question card
-        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        # Render the 2 questions
+        temp = {}
+        for (key, label, ph) in sec["questions"]:
+            temp[key] = st.text_area(
+                label,
+                value=st.session_state.gen_answers.get(key, ""),
+                placeholder=ph,
+                height=88,
+                key=f"ta_{key}_{idx}"
+            )
 
-        with st.form(f"section_form_{sec_idx}"):
-            for key, question, placeholder in section["questions"]:
-                existing = st.session_state.gen_answers.get(key, "")
-                st.text_area(
-                    question,
-                    value=existing,
-                    placeholder=placeholder,
-                    height=90,
-                    key=f"input_{key}"
-                )
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_back, col_next = st.columns([1, 3])
 
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                back = st.form_submit_button("← Back") if sec_idx > 0 else None
-            with col2:
-                is_last = sec_idx == len(SECTIONS) - 1
-                label = "◈  Generate Document" if is_last else "Next Section →"
-                nxt = st.form_submit_button(label)
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        if nxt:
-            for key, question, _ in section["questions"]:
-                val = st.session_state.get(f"input_{key}", "")
-                st.session_state.gen_answers[key] = val
-
-            if is_last:
-                st.session_state.gen_step = "generating"
-            else:
-                st.session_state.gen_section += 1
-            st.rerun()
-
-        if back:
-            st.session_state.gen_section -= 1
-            st.rerun()
-
-    # ── STEP 3: GENERATE ────────────────────────────────────────────────
-    elif st.session_state.gen_step == "generating":
-        cfg = st.session_state.gen_config
-        ans = st.session_state.gen_answers
-
-        description = f"""
-Department: {cfg['department']}
-
-TITLE & OVERVIEW:
-- Document Title: {ans.get('doc_title', '')}
-- Version/Date: {ans.get('doc_version', '')}
-
-PURPOSE:
-- Primary Purpose: {ans.get('purpose_main', '')}
-- Business Need: {ans.get('purpose_problem', '')}
-
-SCOPE:
-- Applies To: {ans.get('scope_applies', '')}
-- Exclusions: {ans.get('scope_exclusions', '')}
-
-RESPONSIBILITIES:
-- Implementation Owner: {ans.get('resp_implement', '')}
-- Maintenance Owner: {ans.get('resp_maintain', '')}
-
-PROCEDURE / PROCESS:
-- Main Steps: {ans.get('proc_steps', '')}
-- Tools & Systems: {ans.get('proc_tools', '')}
-
-COMPLIANCE & RISK:
-- Regulations: {ans.get('comp_regs', '')}
-- Key Risks: {ans.get('comp_risks', '')}
-
-CONCLUSION:
-- Expected Outcome: {ans.get('conc_outcome', '')}
-- Review Frequency: {ans.get('conc_review', '')}
-        """.strip()
-
-        title = ans.get('doc_title') or f"{cfg['doc_type']} — {cfg['department']}"
-
-        with st.spinner("Generating your document..."):
-            try:
-                response = httpx.post(f"{API_URL}/generate", json={
-                    "title": title,
-                    "industry": "SaaS",
-                    "doc_type": cfg["doc_type"],
-                    "description": description,
-                    "tags": cfg["tags"],
-                    "created_by": cfg["created_by"],
-                }, timeout=60)
-
-                if response.status_code == 200:
-                    doc = response.json()
-                    st.session_state.last_doc = doc
-                    st.session_state.published = False
-                    st.session_state.gen_step = "result"
-                    st.rerun()
+        with col_back:
+            if st.button("← Back", use_container_width=True):
+                st.session_state.gen_answers.update(temp)
+                if idx > 0:
+                    st.session_state.gen_section -= 1
                 else:
-                    st.error(f"Generation failed: {response.text}")
-                    st.session_state.gen_step = "questions"
-                    st.session_state.gen_section = len(SECTIONS) - 1
+                    st.session_state.gen_step = "config"
+                st.rerun()
+
+        with col_next:
+            is_last   = (idx == total - 1)
+            btn_label = "⚡  Generate Document" if is_last else f"Next: {sections[idx+1]['name']} →"
+            btn_type  = "primary" if is_last else "secondary"
+
+            if st.button(btn_label, type=btn_type, use_container_width=True):
+                st.session_state.gen_answers.update(temp)
+                if is_last:
+                    st.session_state.gen_step = "generating"
+                else:
+                    st.session_state.gen_section += 1
+                st.rerun()
+
+    # ══════════════════════════════════════════════════════════════
+    #  STEP 3 — GENERATING
+    # ══════════════════════════════════════════════════════════════
+    elif st.session_state.gen_step == "generating":
+
+        st.markdown(
+            '<div style="text-align:center;padding:3rem 0">'
+            '<p style="font-size:1.8rem;margin-bottom:0.8rem">⚡</p>'
+            '<p style="font-family:monospace;font-size:0.68rem;color:#d4a64a;'
+            'letter-spacing:0.16em;text-transform:uppercase">Generating Document</p>'
+            '<p style="font-size:0.82rem;color:#444;margin-top:0.6rem">'
+            'LLaMA 3.3 · 70B Versatile is writing your enterprise document…</p>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        cfg      = st.session_state.gen_config
+        answers  = st.session_state.gen_answers
+        sections = st.session_state.cur_sections
+
+        # Collect all answer keys
+        section_answers = {
+            key: answers.get(key, "")
+            for sec in sections
+            for (key, _label, _ph) in sec.get("questions", [])
+        }
+
+        payload = {
+            "title":            cfg["title"],
+            "industry":         cfg["industry"],
+            "department":       cfg["department"],
+            "doc_type":         cfg["doc_type"],
+            "tags":             cfg["tags"],
+            "created_by":       cfg["author"],
+            "description":      f"{cfg['doc_type']} for {cfg['department']} department",
+            "section_answers":  section_answers,
+        }
+
+        with st.spinner("Writing your document..."):
+            try:
+                r = httpx.post(f"{API_URL}/generate", json=payload, timeout=120.0)
+                r.raise_for_status()
+                doc = r.json()
+                st.session_state.last_doc  = doc
+                st.session_state.published = False
+                st.session_state.notion_url = ""
+                st.session_state.gen_step  = "result"
+                st.rerun()
+            except httpx.HTTPStatusError as e:
+                st.error(f"API error {e.response.status_code}: {e.response.text}")
+                st.session_state.gen_step = "questions"
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Connection error: {e}")
                 st.session_state.gen_step = "questions"
 
-    # ── STEP 4: RESULT ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    #  STEP 4 — RESULT
+    # ══════════════════════════════════════════════════════════════
     elif st.session_state.gen_step == "result":
         doc = st.session_state.last_doc
+        if not doc:
+            st.session_state.gen_step = "config"
+            st.rerun()
+
         cfg = st.session_state.gen_config
+        wc  = len(doc.get("content", "").split())
 
-        st.markdown(f"""
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:1.5rem">
-            <div>
-                <div style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#f5a623; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:4px">
-                    ● Document Ready
-                </div>
-                <div style="font-family:'Playfair Display',serif; font-size:1.5rem; font-weight:700; color:#f0ede6">
-                    {doc.get('title','')}
-                </div>
-            </div>
-            <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end">
-                <span class="chip chip-rose">{doc.get('doc_type','')}</span>
-                <span class="chip chip-amber">{cfg.get('department','')}</span>
-                <span class="chip chip-teal">v{doc.get('version','1.0')}</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown(f"""
-        <div class="doc-card">
-            <div class="doc-body">{doc.get('content','').replace(chr(10), '<br>')}</div>
-            <div class="doc-footer">
-                <div style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#7a7568">
-                    {len(doc.get('content','').split())} words · by {doc.get('created_by','admin')} · SaaS
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        # Header
+        col_t, col_b = st.columns([3, 1])
+        with col_t:
+            st.markdown(
+                f'<p style="font-size:1.05rem;font-weight:600;color:#f0ece3;margin-bottom:0.2rem">'
+                f'{doc.get("title","Document")}</p>'
+                f'<p style="font-family:monospace;font-size:0.6rem;color:#444">'
+                f'{cfg["department"]} &nbsp;·&nbsp; {cfg["doc_type"]} &nbsp;·&nbsp; v{doc.get("version","1.0")}</p>',
+                unsafe_allow_html=True
+            )
+        with col_b:
+            st.markdown(
+                f'<div style="text-align:right;padding-top:4px">'
+                f'<span style="background:rgba(212,166,74,0.1);border:1px solid rgba(212,166,74,0.2);'
+                f'border-radius:6px;padding:4px 10px;font-family:monospace;font-size:0.62rem;'
+                f'color:#d4a64a">{wc} words</span></div>',
+                unsafe_allow_html=True
+            )
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        if not st.session_state.get("published"):
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                if st.button("◫  Publish to Notion"):
+        # Document body
+        st.markdown(
+            f'<div style="background:#0d0c0a;border:1px solid #1a1812;border-radius:12px;'
+            f'padding:2rem;max-height:520px;overflow-y:auto;font-size:0.85rem;'
+            f'line-height:1.85;color:#8a857a;white-space:pre-wrap">'
+            f'{doc.get("content","")}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        def _reset():
+            for k in ["gen_step","gen_section","gen_answers","gen_config",
+                      "last_doc","published","notion_url","cur_sections"]:
+                st.session_state.pop(k, None)
+
+        if not st.session_state.published:
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("◫  Publish to Notion", type="primary", use_container_width=True):
                     with st.spinner("Publishing..."):
                         try:
-                            pub = httpx.post(f"{API_URL}/publish", json=doc, timeout=30)
-                            if pub.status_code == 200:
-                                st.session_state.notion_url = pub.json().get("notion_url", "")
-                                st.session_state.published = True
-                                st.success("Published to Notion!")
-                                st.rerun()
-                            else:
-                                st.error(f"Publish failed: {pub.text}")
+                            pr = httpx.post(
+                                f"{API_URL}/publish",
+                                json={"doc_id": doc.get("doc_id"), **doc},
+                                timeout=30.0
+                            )
+                            pr.raise_for_status()
+                            pd = pr.json()
+                            st.session_state.published  = True
+                            st.session_state.notion_url = pd.get("notion_url", "")
+                            st.rerun()
                         except Exception as e:
-                            st.error(f"Error: {e}")
-            with col2:
-                if st.button("◈  New Document"):
-                    for k in ["gen_step","gen_section","gen_answers","gen_config","last_doc","published","notion_url"]:
-                        st.session_state.pop(k, None)
-                    st.rerun()
+                            st.error(f"Publish failed: {e}")
+            with c2:
+                if st.button("◈  New Document", use_container_width=True):
+                    _reset(); st.rerun()
         else:
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                notion_url = st.session_state.get("notion_url", "#")
-                st.markdown(f'<a href="{notion_url}" target="_blank" class="notion-link">◫ View in Notion →</a>', unsafe_allow_html=True)
-            with col2:
-                if st.button("◈  New Document"):
-                    for k in ["gen_step","gen_section","gen_answers","gen_config","last_doc","published","notion_url"]:
-                        st.session_state.pop(k, None)
-                    st.rerun()
+            st.success("✓ Published to Notion successfully!")
+            if st.session_state.notion_url:
+                st.markdown(
+                    f'<a href="{st.session_state.notion_url}" target="_blank" '
+                    f'style="display:inline-flex;align-items:center;gap:8px;'
+                    f'background:rgba(0,180,150,0.08);border:1px solid rgba(0,180,150,0.2);'
+                    f'border-radius:8px;padding:8px 16px;color:#00b496;font-family:monospace;'
+                    f'font-size:0.72rem;text-decoration:none">◫ &nbsp; View in Notion</a>',
+                    unsafe_allow_html=True
+                )
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("◈  Generate Another Document", type="primary", use_container_width=True):
+                _reset(); st.rerun()
