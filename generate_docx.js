@@ -1,35 +1,21 @@
 /**
- * DocForge AI — generate_docx.js
- * Usage: node generate_docx.js <input_json_path> <output_docx_path>
+ * DocForge AI — generate_docx.js  v2.0
+ * - Renders pipe-formatted tables as real Word tables
+ * - Plain text sections as paragraphs
+ * - Professional styling: header, footer, page numbers
  *
- * input_json format:
- * {
- *   "doc_type": "Employee Offer Letter",
- *   "department": "HR",
- *   "company_name": "Turabit",
- *   "industry": "Technology / SaaS",
- *   "region": "India",
- *   "sections": [
- *     { "name": "Job Position Details", "content": "plain text content..." },
- *     ...
- *   ]
- * }
+ * Usage: node generate_docx.js <input.json> <output.docx>
  */
 
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 const {
-  Document, Packer, Paragraph, TextRun,
-  Table, TableRow, TableCell,
-  Header, Footer,
-  AlignmentType, HeadingLevel,
-  BorderStyle, WidthType, ShadingType,
-  PageNumber, NumberFormat,
-  LevelFormat, TabStopType, TabStopPosition,
-  PageBreak,
+  Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
+  Header, Footer, AlignmentType, HeadingLevel,
+  BorderStyle, WidthType, ShadingType, VerticalAlign,
+  PageNumber, PageBreak,
 } = require('docx');
 
-// ── Read input ─────────────────────────────────────────────────────────────
 const [,, inputPath, outputPath] = process.argv;
 if (!inputPath || !outputPath) {
   console.error('Usage: node generate_docx.js <input.json> <output.docx>');
@@ -41,77 +27,134 @@ const { doc_type, department, company_name, industry, region, sections } = input
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function textParagraph(text, opts = {}) {
-  return new Paragraph({
-    spacing: { after: 120 },
-    ...opts,
-    children: [new TextRun({ text, font: "Arial", size: opts.size || 22, ...opts.run })],
-  });
+const ACCENT  = "2E4057";
+const GRAY    = "888888";
+const LGRAY   = "F3F4F6";
+
+function isTableRow(line)      { return line.includes('|'); }
+function isSeparatorRow(line)  { return /^\s*[\|\-\s:]+$/.test(line) && line.includes('-'); }
+
+function parseTableLines(lines) {
+  // Returns array of rows, each row is array of cell strings
+  return lines
+    .filter(l => isTableRow(l) && !isSeparatorRow(l))
+    .map(l => l.split('|').map(c => c.trim()).filter((_, i, arr) => i > 0 && i < arr.length - 1 || (arr[0] !== '' || arr[arr.length-1] !== '')))
+    .map(row => {
+      // Handle leading/trailing empty from "| a | b |" format
+      const cells = l => l.split('|').map(c => c.trim());
+      return cells(lines.find(x => x === lines[lines.indexOf(l)] ));
+    });
 }
 
-function sectionHeading(text) {
-  return new Paragraph({
-    heading: HeadingLevel.HEADING_2,
-    spacing: { before: 280, after: 120 },
-    children: [new TextRun({ text, font: "Arial", size: 26, bold: true, color: "2E4057" })],
-  });
+// Better parser
+function parseTable(tableLines) {
+  const rows = [];
+  for (const line of tableLines) {
+    if (isSeparatorRow(line)) continue;
+    if (!isTableRow(line)) continue;
+    const raw = line.split('|');
+    // Remove empty first/last if the line starts/ends with |
+    const cells = raw.map(c => c.trim());
+    const clean = (cells[0] === '' ? cells.slice(1) : cells);
+    const final = (clean[clean.length-1] === '' ? clean.slice(0,-1) : clean);
+    if (final.length > 0) rows.push(final);
+  }
+  return rows;
 }
 
-function metaRow(label, value) {
-  const border = { style: BorderStyle.NONE, size: 0, color: "FFFFFF" };
+function makeWordTable(rows) {
+  if (!rows || rows.length === 0) return null;
+
+  const colCount = Math.max(...rows.map(r => r.length));
+  const tableW   = 9360;
+  const colW     = Math.floor(tableW / colCount);
+  const colWidths = Array(colCount).fill(colW);
+
+  const border = { style: BorderStyle.SINGLE, size: 4, color: "CCCCCC" };
   const borders = { top: border, bottom: border, left: border, right: border };
-  return new TableRow({
-    children: [
-      new TableCell({
-        borders,
-        width: { size: 2800, type: WidthType.DXA },
-        children: [new Paragraph({
-          spacing: { after: 60 },
-          children: [new TextRun({ text: label, font: "Arial", size: 20, bold: true, color: "555555" })],
-        })],
+
+  const tableRows = rows.map((row, ri) => {
+    const isHeader = ri === 0;
+    return new TableRow({
+      tableHeader: isHeader,
+      children: Array.from({ length: colCount }, (_, ci) => {
+        const cellText = row[ci] || '';
+        return new TableCell({
+          borders,
+          width: { size: colW, type: WidthType.DXA },
+          shading: isHeader
+            ? { fill: ACCENT, type: ShadingType.CLEAR }
+            : (ri % 2 === 0 ? { fill: LGRAY, type: ShadingType.CLEAR } : undefined),
+          margins: { top: 80, bottom: 80, left: 120, right: 120 },
+          children: [new Paragraph({
+            spacing: { after: 0 },
+            children: [new TextRun({
+              text: cellText,
+              font: "Arial",
+              size: 20,
+              bold: isHeader,
+              color: isHeader ? "FFFFFF" : "222222",
+            })],
+          })],
+        });
       }),
-      new TableCell({
-        borders,
-        width: { size: 6560, type: WidthType.DXA },
-        children: [new Paragraph({
-          spacing: { after: 60 },
-          children: [new TextRun({ text: value, font: "Arial", size: 20, color: "222222" })],
-        })],
-      }),
-    ],
+    });
+  });
+
+  return new Table({
+    width: { size: tableW, type: WidthType.DXA },
+    columnWidths: colWidths,
+    rows: tableRows,
   });
 }
 
-// ── Content blocks from plain text ────────────────────────────────────────
+// ── Parse section content into blocks ─────────────────────────────────────
 
-function parsePlainTextToBlocks(text) {
-  if (!text) return [textParagraph("")];
+function parseSectionToBlocks(content) {
   const blocks = [];
-  const lines = text.split('\n');
+  const rawLines = content.split('\n');
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      // blank line = spacing paragraph
-      blocks.push(new Paragraph({ spacing: { after: 80 } }));
+  let i = 0;
+  while (i < rawLines.length) {
+    const line = rawLines[i];
+
+    // Collect a table block
+    if (isTableRow(line)) {
+      const tableLines = [];
+      while (i < rawLines.length && (isTableRow(rawLines[i]) || isSeparatorRow(rawLines[i]))) {
+        tableLines.push(rawLines[i]);
+        i++;
+      }
+      const rows = parseTable(tableLines);
+      if (rows.length > 0) {
+        const tbl = makeWordTable(rows);
+        if (tbl) {
+          blocks.push(tbl);
+          blocks.push(new Paragraph({ spacing: { after: 120 } })); // spacer after table
+        }
+      }
       continue;
     }
 
-    // Numbered list line: "1. Item" or "1) Item"
-    const numberedMatch = trimmed.match(/^(\d+)[.)]\s+(.+)$/);
-    if (numberedMatch) {
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      blocks.push(new Paragraph({ spacing: { after: 80 } }));
+      i++; continue;
+    }
+
+    // Numbered: "1. Text"
+    const numMatch = trimmed.match(/^(\d+)[.)]\s+(.+)$/);
+    if (numMatch) {
       blocks.push(new Paragraph({
         spacing: { after: 80 },
         indent: { left: 360 },
-        children: [new TextRun({
-          text: `${numberedMatch[1]}. ${numberedMatch[2]}`,
-          font: "Arial", size: 22,
-        })],
+        children: [new TextRun({ text: `${numMatch[1]}. ${numMatch[2]}`, font: "Arial", size: 22 })],
       }));
-      continue;
+      i++; continue;
     }
 
-    // Bullet line: "  - Item" or "- Item"
+    // Bullet: "- Text"
     const bulletMatch = trimmed.match(/^[-•]\s+(.+)$/);
     if (bulletMatch) {
       blocks.push(new Paragraph({
@@ -122,14 +165,15 @@ function parsePlainTextToBlocks(text) {
           new TextRun({ text: bulletMatch[1], font: "Arial", size: 22 }),
         ],
       }));
-      continue;
+      i++; continue;
     }
 
-    // Regular paragraph line
+    // Regular text
     blocks.push(new Paragraph({
       spacing: { after: 120 },
       children: [new TextRun({ text: trimmed, font: "Arial", size: 22 })],
     }));
+    i++;
   }
 
   return blocks;
@@ -139,92 +183,64 @@ function parsePlainTextToBlocks(text) {
 
 const children = [];
 
-// ── Title block ────────────────────────────────────────────────────────────
-children.push(
-  new Paragraph({
-    heading: HeadingLevel.HEADING_1,
-    spacing: { after: 200 },
-    children: [new TextRun({
-      text: doc_type,
-      font: "Arial", size: 40, bold: true, color: "2E4057",
-    })],
-  })
-);
+// Title
+children.push(new Paragraph({
+  heading: HeadingLevel.HEADING_1,
+  spacing: { after: 200 },
+  children: [new TextRun({ text: doc_type, font: "Arial", size: 40, bold: true, color: ACCENT })],
+}));
 
-// ── Meta table ─────────────────────────────────────────────────────────────
-const metaBorder = { style: BorderStyle.SINGLE, size: 4, color: "E8E8E8" };
-const metaBorders = { top: metaBorder, bottom: metaBorder, left: metaBorder, right: metaBorder };
+// Subtitle line
+children.push(new Paragraph({
+  spacing: { after: 240 },
+  children: [new TextRun({ text: `${company_name}  ·  ${department}  ·  ${region}`, font: "Arial", size: 20, color: GRAY })],
+}));
 
-children.push(
-  new Table({
-    width: { size: 9360, type: WidthType.DXA },
-    columnWidths: [2800, 6560],
-    rows: [
-      metaRow("Organization:", company_name),
-      metaRow("Department:", department),
-      metaRow("Industry:", industry),
-      metaRow("Region:", region),
-      metaRow("Version:", "v1.0"),
-      metaRow("Classification:", "Internal Use Only"),
-      metaRow("Generated by:", "DocForge AI"),
-    ],
-  })
-);
+// Divider
+children.push(new Paragraph({
+  border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: ACCENT } },
+  spacing: { after: 280 },
+  children: [new TextRun({ text: "" })],
+}));
 
-children.push(new Paragraph({ spacing: { after: 240 } }));
-
-// ── Divider ────────────────────────────────────────────────────────────────
-const divBorder = { style: BorderStyle.SINGLE, size: 6, color: "2E4057" };
-children.push(
-  new Paragraph({
-    border: { bottom: divBorder },
-    spacing: { after: 280 },
-    children: [new TextRun({ text: "" })],
-  })
-);
-
-// ── Sections ───────────────────────────────────────────────────────────────
+// Sections
 sections.forEach((sec, idx) => {
-  if (idx > 0) {
-    // Small visual separator between sections
-    children.push(new Paragraph({ spacing: { after: 160 } }));
-  }
-  children.push(sectionHeading(sec.name));
-  const contentBlocks = parsePlainTextToBlocks(sec.content);
+  if (idx > 0) children.push(new Paragraph({ spacing: { after: 160 } }));
+
+  // Section heading
+  children.push(new Paragraph({
+    heading: HeadingLevel.HEADING_2,
+    spacing: { before: 280, after: 120 },
+    children: [new TextRun({ text: sec.name, font: "Arial", size: 26, bold: true, color: ACCENT })],
+  }));
+
+  // Section content
+  const contentBlocks = parseSectionToBlocks(sec.content || "");
   children.push(...contentBlocks);
 });
 
-// ── Footer spacer ──────────────────────────────────────────────────────────
+// Footer note
 children.push(new Paragraph({ spacing: { after: 400 } }));
-children.push(
-  new Paragraph({
-    alignment: AlignmentType.CENTER,
-    spacing: { before: 200 },
-    children: [
-      new TextRun({ text: `${doc_type}  ·  Generated by DocForge AI  ·  Confidential`, font: "Arial", size: 16, color: "AAAAAA" }),
-    ],
-  })
-);
+children.push(new Paragraph({
+  alignment: AlignmentType.CENTER,
+  children: [new TextRun({
+    text: `${doc_type}  ·  Generated by DocForge AI  ·  Confidential`,
+    font: "Arial", size: 16, color: "AAAAAA",
+  })],
+}));
 
-// ── Build doc ─────────────────────────────────────────────────────────────
+// ── Assemble ───────────────────────────────────────────────────────────────
+
 const doc = new Document({
   styles: {
-    default: {
-      document: { run: { font: "Arial", size: 22 } },
-    },
+    default: { document: { run: { font: "Arial", size: 22 } } },
     paragraphStyles: [
-      {
-        id: "Heading1", name: "Heading 1",
-        basedOn: "Normal", next: "Normal", quickFormat: true,
-        run: { size: 40, bold: true, font: "Arial", color: "2E4057" },
-        paragraph: { spacing: { before: 0, after: 200 }, outlineLevel: 0 },
-      },
-      {
-        id: "Heading2", name: "Heading 2",
-        basedOn: "Normal", next: "Normal", quickFormat: true,
-        run: { size: 26, bold: true, font: "Arial", color: "2E4057" },
-        paragraph: { spacing: { before: 280, after: 120 }, outlineLevel: 1 },
-      },
+      { id: "Heading1", name: "Heading 1", basedOn: "Normal", next: "Normal", quickFormat: true,
+        run: { size: 40, bold: true, font: "Arial", color: ACCENT },
+        paragraph: { spacing: { before: 0, after: 200 }, outlineLevel: 0 } },
+      { id: "Heading2", name: "Heading 2", basedOn: "Normal", next: "Normal", quickFormat: true,
+        run: { size: 26, bold: true, font: "Arial", color: ACCENT },
+        paragraph: { spacing: { before: 280, after: 120 }, outlineLevel: 1 } },
     ],
   },
   sections: [{
@@ -236,40 +252,31 @@ const doc = new Document({
     },
     headers: {
       default: new Header({
-        children: [
-          new Paragraph({
-            alignment: AlignmentType.RIGHT,
-            spacing: { after: 0 },
-            children: [
-              new TextRun({ text: `${company_name}  |  ${doc_type}`, font: "Arial", size: 16, color: "888888" }),
-            ],
-          }),
-        ],
+        children: [new Paragraph({
+          alignment: AlignmentType.RIGHT,
+          children: [new TextRun({ text: `${company_name}  |  ${doc_type}`, font: "Arial", size: 16, color: GRAY })],
+        })],
       }),
     },
     footers: {
       default: new Footer({
-        children: [
-          new Paragraph({
-            alignment: AlignmentType.CENTER,
-            spacing: { before: 0 },
-            children: [
-              new TextRun({ text: "Page ", font: "Arial", size: 16, color: "888888" }),
-              new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 16, color: "888888" }),
-              new TextRun({ text: " of ", font: "Arial", size: 16, color: "888888" }),
-              new TextRun({ children: [PageNumber.TOTAL_PAGES], font: "Arial", size: 16, color: "888888" }),
-            ],
-          }),
-        ],
+        children: [new Paragraph({
+          alignment: AlignmentType.CENTER,
+          children: [
+            new TextRun({ text: "Page ", font: "Arial", size: 16, color: GRAY }),
+            new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 16, color: GRAY }),
+            new TextRun({ text: " of ", font: "Arial", size: 16, color: GRAY }),
+            new TextRun({ children: [PageNumber.TOTAL_PAGES], font: "Arial", size: 16, color: GRAY }),
+          ],
+        })],
       }),
     },
     children,
   }],
 });
 
-// ── Write file ─────────────────────────────────────────────────────────────
-Packer.toBuffer(doc).then(buffer => {
-  fs.writeFileSync(outputPath, buffer);
+Packer.toBuffer(doc).then(buf => {
+  fs.writeFileSync(outputPath, buf);
   console.log(`OK:${outputPath}`);
 }).catch(err => {
   console.error('DOCX error:', err.message);

@@ -1,41 +1,29 @@
 """
 DocForge AI — notion_service.py
-Fixed Notion schema (updated live):
-  - Department: select with exact options: HR, Finance, Legal, Sales, Marketing,
-                IT, Operations, Customer Support, Product Management, Procurement
-  - Doc Type:   rich_text (free text — no restricted options)
-  - Industry:   rich_text (free text)
-  - Tags:       REMOVED
-  - Status:     select: Draft | Generated | Reviewed | Archived
-  - Content stored as plain text (no markdown)
+- Publishes plain-text documents to Notion with metadata callout block at top
+- gen_doc_full contains ONLY section content (no metadata)
+- Notion page gets: metadata callout + section headings + content
+- Library fetch for sidebar
 """
 import httpx
 import asyncio
 from backend.core.config import settings
 from backend.core.logger import logger
-from backend.schemas.document_schema import NotionPublishRequest, NotionPublishResponse
+from backend.schemas.document_schema import NotionPublishRequest
 
 NOTION_API_URL = "https://api.notion.com/v1"
 
-# Map our department names to the exact Notion select option names
 DEPT_MAP = {
-    "HR":                  "HR",
-    "Human Resources":     "HR",
-    "Finance":             "Finance",
-    "Finance / Accounting": "Finance",
-    "Legal":               "Legal",
-    "Sales":               "Sales",
-    "Marketing":           "Marketing",
-    "IT":                  "IT",
-    "Information Technology": "IT",
-    "Operations":          "Operations",
-    "Customer Support":    "Customer Support",
-    "Product Management":  "Product Management",
-    "Procurement":         "Procurement",
+    "HR": "HR", "Human Resources": "HR",
+    "Finance": "Finance", "Finance / Accounting": "Finance",
+    "Legal": "Legal", "Sales": "Sales", "Marketing": "Marketing",
+    "IT": "IT", "Information Technology": "IT",
+    "Operations": "Operations", "Customer Support": "Customer Support",
+    "Product Management": "Product Management", "Procurement": "Procurement",
 }
 
 
-def get_headers() -> dict:
+def _headers() -> dict:
     return {
         "Authorization": f"Bearer {settings.NOTION_API_KEY}",
         "Content-Type": "application/json",
@@ -43,225 +31,303 @@ def get_headers() -> dict:
     }
 
 
-def chunk_text(text: str, size: int = 1900) -> list[str]:
-    """Split plain text into ≤1900-char chunks for Notion paragraph blocks."""
-    return [text[i:i+size] for i in range(0, len(text), size)]
+def _txt(content: str, bold: bool = False) -> dict:
+    """Shorthand for a rich_text text object."""
+    obj = {"type": "text", "text": {"content": content}}
+    if bold:
+        obj["annotations"] = {"bold": True}
+    return obj
 
 
-def plain_text_to_notion_blocks(plain_text: str) -> list[dict]:
+def _para(content: str, bold: bool = False) -> dict:
+    return {"object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [_txt(content, bold)]}}
+
+
+def _heading2(content: str) -> dict:
+    return {"object": "block", "type": "heading_2",
+            "heading_2": {"rich_text": [_txt(content)], "color": "default"}}
+
+
+def _divider() -> dict:
+    return {"object": "block", "type": "divider", "divider": {}}
+
+
+def _callout(lines: list[str]) -> dict:
+    """Build a grey callout block with metadata lines."""
+    rich = []
+    for i, line in enumerate(lines):
+        if ':' in line:
+            key, _, val = line.partition(':')
+            rich.append(_txt(key.strip() + ": ", bold=True))
+            rich.append(_txt(val.strip() + ("\n" if i < len(lines) - 1 else "")))
+        else:
+            rich.append(_txt(line + ("\n" if i < len(lines) - 1 else "")))
+    return {
+        "object": "block", "type": "callout",
+        "callout": {
+            "rich_text": rich,
+            "icon": {"type": "emoji", "emoji": "📋"},
+            "color": "gray_background",
+        }
+    }
+
+
+def _table_to_notion(table_lines: list[str]) -> dict | None:
+    """Convert pipe-format table lines to a Notion table block."""
+    rows = []
+    for line in table_lines:
+        if all(c in '-|: ' for c in line):
+            continue   # skip separator row
+        if '|' not in line:
+            continue
+        cells = [c.strip() for c in line.strip().strip('|').split('|')]
+        if cells:
+            rows.append(cells)
+
+    if not rows:
+        return None
+
+    col_count = max(len(r) for r in rows)
+    # Pad shorter rows
+    rows = [r + [''] * (col_count - len(r)) for r in rows]
+
+    return {
+        "object": "block", "type": "table",
+        "table": {
+            "table_width": col_count,
+            "has_column_header": True,
+            "has_row_header": False,
+            "children": [
+                {
+                    "object": "block", "type": "table_row",
+                    "table_row": {
+                        "cells": [[_txt(cell)] for cell in row]
+                    }
+                }
+                for row in rows
+            ]
+        }
+    }
+
+
+def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list[dict]:
     """
-    Convert plain text document to Notion blocks.
-    Detects section headings (ALL CAPS line followed by dashes) and paragraph text.
+    Convert plain-text document (sections only, no metadata) to Notion blocks.
+    Structure expected:
+      SECTION NAME
+      -----------
+      content text...
+
+      NEXT SECTION
+      ------------
+      content...
     """
-    blocks = []
-    lines = plain_text.split('\n')
-    i = 0
+    blocks = [meta_callout, _divider()]
+    lines  = plain_text.split('\n')
+    i      = 0
 
     while i < len(lines):
-        line = lines[i]
+        line     = lines[i]
         stripped = line.strip()
 
         if not stripped:
             i += 1
             continue
 
-        # Detect section heading: uppercase line followed by a dash line
-        is_heading = stripped.isupper() and len(stripped) > 3
-        next_is_dash = (i + 1 < len(lines)) and bool(lines[i+1].strip().startswith('-') and len(lines[i+1].strip()) > 3)
+        # Section heading: ALL CAPS line followed by a dash-only line
+        next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        is_heading = (stripped.isupper() and len(stripped) > 2
+                      and next_line and all(c == '-' for c in next_line))
 
-        if is_heading and next_is_dash:
-            blocks.append({
-                "object": "block",
-                "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [{"type": "text", "text": {"content": stripped}}],
-                    "color": "default"
-                }
-            })
-            i += 2  # skip the dash line too
+        if is_heading:
+            blocks.append(_heading2(stripped))
+            i += 2  # skip heading + dash line
             continue
 
-        # Detect doc title: very first ALL CAPS line (before meta table)
-        if is_heading and i < 3:
-            blocks.append({
-                "object": "block",
-                "type": "heading_1",
-                "heading_1": {
-                    "rich_text": [{"type": "text", "text": {"content": stripped}}]
-                }
-            })
-            i += 1
-            continue
-
-        # Detect meta lines: "Key:    Value"
-        if ':' in stripped and not stripped.startswith('-'):
-            parts = stripped.split(':', 1)
-            if len(parts) == 2 and len(parts[0]) < 30:
-                key = parts[0].strip()
-                val = parts[1].strip()
-                if val:
-                    blocks.append({
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [
-                                {"type": "text", "text": {"content": key + ":  "},
-                                 "annotations": {"bold": True}},
-                                {"type": "text", "text": {"content": val}},
-                            ]
-                        }
-                    })
-                    i += 1
-                    continue
-
-        # Skip pure dash separator lines
+        # Pure dash separator line — skip (already handled above or standalone)
         if all(c == '-' for c in stripped):
-            blocks.append({"object": "block", "type": "divider", "divider": {}})
             i += 1
             continue
 
-        # Regular paragraph — collect until blank line
+        # Table block: collect all contiguous pipe lines
+        if '|' in stripped:
+            table_lines = []
+            while i < len(lines) and ('|' in lines[i] or
+                  (lines[i].strip() and all(c in '-|: ' for c in lines[i]))):
+                table_lines.append(lines[i])
+                i += 1
+            tbl = _table_to_notion(table_lines)
+            if tbl:
+                blocks.append(tbl)
+            continue
+
+        # Numbered list line
+        import re
+        num_match = re.match(r'^(\d+)[.)]\s+(.+)$', stripped)
+        if num_match:
+            blocks.append({
+                "object": "block", "type": "numbered_list_item",
+                "numbered_list_item": {"rich_text": [_txt(num_match.group(2))]}
+            })
+            i += 1
+            continue
+
+        # Bullet line
+        bullet_match = re.match(r'^[-•]\s+(.+)$', stripped)
+        if bullet_match:
+            blocks.append({
+                "object": "block", "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": [_txt(bullet_match.group(1))]}
+            })
+            i += 1
+            continue
+
+        # Regular paragraph — collect until blank line or heading
         para_lines = []
-        while i < len(lines) and lines[i].strip():
-            para_lines.append(lines[i].strip())
+        while i < len(lines):
+            cur = lines[i].strip()
+            if not cur:
+                break
+            # Stop if next looks like a heading
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            if cur.isupper() and nxt and all(c == '-' for c in nxt):
+                break
+            para_lines.append(cur)
             i += 1
 
-        para_text = ' '.join(para_lines)
-        # Chunk if needed
-        for chunk in chunk_text(para_text):
-            blocks.append({
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": chunk}}]
-                }
-            })
+        if para_lines:
+            text = ' '.join(para_lines)
+            # Chunk at 1900 chars for Notion's limit
+            for chunk in [text[j:j+1900] for j in range(0, len(text), 1900)]:
+                blocks.append(_para(chunk))
 
     return blocks
 
 
-async def publish_to_notion(request: NotionPublishRequest) -> NotionPublishResponse:
-    """Publish plain-text document to Notion database."""
-    ctx         = request.company_context or {}
-    company     = ctx.get("company_name", "Company")
-    industry    = ctx.get("industry", "")
-    title       = f"{request.doc_type} — {company}"
-    dept        = DEPT_MAP.get(request.department, "Operations")
-    word_count  = len(request.gen_doc_full.split())
+async def _post_blocks_in_batches(page_id: str, blocks: list[dict]):
+    """Append blocks to a Notion page in batches of 100 (API limit)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        for start in range(0, len(blocks), 100):
+            batch = blocks[start:start + 100]
+            for attempt in range(4):
+                resp = await client.patch(
+                    f"{NOTION_API_URL}/blocks/{page_id}/children",
+                    headers=_headers(),
+                    json={"children": batch},
+                )
+                if resp.status_code == 429:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                break
+            if resp.status_code not in (200, 201):
+                logger.error(f"Block append error {resp.status_code}: {resp.text[:200]}")
+
+
+async def publish_to_notion(request: NotionPublishRequest) -> dict:
+    ctx        = request.company_context or {}
+    company    = ctx.get("company_name", "Company")
+    industry   = ctx.get("industry", "")
+    region     = ctx.get("region", "")
+    company_sz = ctx.get("company_size", "")
+    title      = f"{request.doc_type} — {company}"
+    dept       = DEPT_MAP.get(request.department, "Operations")
+    word_count = len(request.gen_doc_full.split())
 
     logger.info(f"Publishing to Notion: '{title}' | dept={dept} | words={word_count}")
 
-    # Build content blocks from plain text
-    blocks = plain_text_to_notion_blocks(request.gen_doc_full)
+    # Build metadata callout (shown in Notion, NOT in downloaded doc)
+    meta_lines = [
+        f"Organization: {company}",
+        f"Department: {request.department}",
+        f"Industry: {industry}",
+        f"Region: {region}",
+        f"Company Size: {company_sz}",
+        "Version: v1.0",
+        "Classification: Internal Use Only",
+        "Generated by: DocForge AI",
+    ]
+    meta_callout = _callout([l for l in meta_lines if l.split(': ', 1)[-1].strip()])
 
-    # Notion API limits 100 blocks per request — batch if needed
-    # For safety, take first 100 blocks (most docs fit)
-    blocks = blocks[:100]
+    # Convert plain text to Notion blocks
+    all_blocks = _plain_text_to_blocks(request.gen_doc_full, meta_callout)
 
-    properties = {
-        "Title": {
-            "title": [{"text": {"content": title}}]
-        },
-        "Department": {
-            "select": {"name": dept}
-        },
-        "Doc Type": {
-            "rich_text": [{"text": {"content": request.doc_type}}]
-        },
-        "Industry": {
-            "rich_text": [{"text": {"content": industry}}]
-        },
-        "Status": {
-            "select": {"name": "Generated"}
-        },
-        "Created By": {
-            "rich_text": [{"text": {"content": "DocForge AI"}}]
-        },
-        "Version": {"number": 1},
-        "Word Count": {"number": word_count},
-    }
-
+    # Step 1: Create page with properties only (no children — avoids 100-block limit on create)
     payload = {
-        "parent": {"database_id": settings.NOTION_DATABASE_ID},
-        "properties": properties,
-        "children": blocks,
+        "parent":     {"database_id": settings.NOTION_DATABASE_ID},
+        "properties": {
+            "Title":      {"title":     [{"text": {"content": title}}]},
+            "Department": {"select":    {"name": dept}},
+            "Doc Type":   {"rich_text": [{"text": {"content": request.doc_type}}]},
+            "Industry":   {"rich_text": [{"text": {"content": industry}}]},
+            "Status":     {"select":    {"name": "Generated"}},
+            "Created By": {"rich_text": [{"text": {"content": "DocForge AI"}}]},
+            "Version":    {"number": 1},
+            "Word Count": {"number": word_count},
+        },
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
         for attempt in range(4):
             resp = await client.post(
-                f"{NOTION_API_URL}/pages",
-                headers=get_headers(),
-                json=payload,
+                f"{NOTION_API_URL}/pages", headers=_headers(), json=payload
             )
             if resp.status_code == 429:
-                wait = 2 ** attempt
-                logger.warning(f"Rate limited — waiting {wait}s")
-                await asyncio.sleep(wait)
+                await asyncio.sleep(2 ** attempt)
                 continue
             break
 
-        if resp.status_code not in (200, 201):
-            logger.error(f"Notion error {resp.status_code}: {resp.text}")
-            raise Exception(f"Notion API {resp.status_code}: {resp.text[:300]}")
+    if resp.status_code not in (200, 201):
+        logger.error(f"Notion create error {resp.status_code}: {resp.text}")
+        raise Exception(f"Notion API {resp.status_code}: {resp.text[:300]}")
 
-        data       = resp.json()
-        notion_url = data.get("url", "")
-        page_id    = data.get("id", "")
-        logger.info(f"Published: {notion_url}")
-        return NotionPublishResponse(notion_url=notion_url, notion_page_id=page_id)
+    data    = resp.json()
+    page_id = data.get("id", "")
+    url     = data.get("url", "")
+
+    # Step 2: Append content blocks in batches of 100
+    if all_blocks:
+        await _post_blocks_in_batches(page_id, all_blocks)
+
+    logger.info(f"Published: {url}")
+    return {"notion_url": url, "notion_page_id": page_id}
 
 
 async def fetch_library_from_notion() -> list[dict]:
-    """
-    Fetch all pages from the Notion database for the library.
-    Returns list of {title, doc_type, department, industry, status, notion_url, created_at}
-    """
-    payload = {
-        "sorts": [{"property": "Created At", "direction": "descending"}],
-        "page_size": 50,
-    }
-
+    """Fetch all pages from the Notion database for the library tab."""
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{NOTION_API_URL}/databases/{settings.NOTION_DATABASE_ID}/query",
-            headers=get_headers(),
-            json=payload,
+            headers=_headers(),
+            json={"sorts": [{"property": "Created At", "direction": "descending"}],
+                  "page_size": 50},
         )
 
     if resp.status_code != 200:
         logger.error(f"Library fetch error: {resp.status_code}")
         return []
 
-    results = resp.json().get("results", [])
     library = []
-
-    for page in results:
+    for page in resp.json().get("results", []):
         props = page.get("properties", {})
 
-        def get_text(prop_name):
-            p = props.get(prop_name, {})
-            if p.get("type") == "title":
-                items = p.get("title", [])
-            elif p.get("type") == "rich_text":
-                items = p.get("rich_text", [])
-            else:
-                return ""
+        def get_text(k):
+            p     = props.get(k, {})
+            items = p.get("title", []) if p.get("type") == "title" else p.get("rich_text", [])
             return "".join(i.get("text", {}).get("content", "") for i in items)
 
-        def get_select(prop_name):
-            p = props.get(prop_name, {})
-            sel = p.get("select")
+        def get_select(k):
+            sel = props.get(k, {}).get("select")
             return sel.get("name", "") if sel else ""
 
         library.append({
-            "title":       get_text("Title"),
-            "doc_type":    get_text("Doc Type"),
-            "department":  get_select("Department"),
-            "industry":    get_text("Industry"),
-            "status":      get_select("Status"),
-            "notion_url":  page.get("url", ""),
-            "created_at":  page.get("created_time", "")[:10],
+            "title":      get_text("Title"),
+            "doc_type":   get_text("Doc Type"),
+            "department": get_select("Department"),
+            "industry":   get_text("Industry"),
+            "status":     get_select("Status"),
+            "notion_url": page.get("url", ""),
+            "created_at": page.get("created_time", "")[:10],
         })
 
     return library
