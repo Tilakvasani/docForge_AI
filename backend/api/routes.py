@@ -1,20 +1,10 @@
-"""
-DocForge AI — routes.py
-All API endpoints for the full workflow.
-"""
-import json
-import subprocess
-import tempfile
-import os
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 
 from backend.core.logger import logger
 from backend.services.db_service import (
     get_all_departments, get_sections_by_doc_type,
-    get_generated_document, get_all_generated_documents,
     save_generated_document,
 )
 from backend.services.generator import (
@@ -27,36 +17,37 @@ from backend.schemas.document_schema import (
     GenerateSectionRequest, EditSectionRequest,
     NotionPublishRequest,
 )
+from backend.services.redis_service import cache
 
 router = APIRouter()
 
-
-# ── Request schemas ────────────────────────────────────────────────────────────
 
 class SaveDocRequest(BaseModel):
     doc_id: int
     doc_sec_id: int
     sec_id: int
     gen_doc_sec_dec: List[str]
-    gen_doc_full: str          # PLAIN TEXT
+    gen_doc_full: str
 
 
-class DownloadDocxRequest(BaseModel):
-    doc_type: str
-    department: str
-    company_name: str
-    industry: str
-    region: str
-    sections: List[dict]       # [{"name": ..., "content": ...}]
-
-
-# ── Static data ────────────────────────────────────────────────────────────────
+# ── Departments & Sections ────────────────────────────────────────────────────
 
 @router.get("/departments")
 async def get_departments():
     try:
+        # Try cache first
+        cached = await cache.get_departments()
+        if cached is not None:
+            logger.info("✅ [CACHE HIT] departments")
+            return {"departments": cached, "total": len(cached), "cached": True}
+
         depts = await get_all_departments()
-        return {"departments": depts, "total": len(depts)}
+
+        # Store in cache
+        await cache.set_departments(depts)
+        logger.info("💾 [CACHE SET] departments (%d items)", len(depts))
+
+        return {"departments": depts, "total": len(depts), "cached": False}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -65,42 +56,80 @@ async def get_departments():
 async def get_sections(doc_type: str):
     decoded = doc_type.replace("%2F", "/").replace("%28", "(").replace("%29", ")")
     try:
+        # Try cache first
+        cached = await cache.get_sections(decoded)
+        if cached is not None:
+            logger.info("✅ [CACHE HIT] sections:%s", decoded)
+            return {**cached, "cached": True}
+
         sections = await get_sections_by_doc_type(decoded)
         if not sections:
             raise HTTPException(status_code=404, detail=f"No sections for: {decoded}")
-        return sections
+
+        # Store in cache
+        await cache.set_sections(decoded, sections)
+        logger.info("💾 [CACHE SET] sections:%s", decoded)
+
+        return {**sections, "cached": False}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Questions ──────────────────────────────────────────────────────────────────
+# ── Questions & Answers ───────────────────────────────────────────────────────
 
 @router.post("/questions/generate")
 async def api_generate_questions(req: GenerateQuestionsRequest):
     try:
-        return await generate_questions(req)
+        result = await generate_questions(req)
+
+        # Cache by sec_id so re-generating the same section is instant
+        sec_id = result.get("sec_id")
+        if sec_id:
+            await cache.set_questions(sec_id, result)
+            logger.info("💾 [CACHE SET] questions:%s", sec_id)
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── Answers ────────────────────────────────────────────────────────────────────
 
 @router.post("/answers/save")
 async def api_save_answers(req: SaveAnswersRequest):
     try:
-        return await save_user_answers(req)
+        result = await save_user_answers(req)
+
+        # Invalidate cached section content — answers changed, regenerate fresh
+        if req.sec_id:
+            await cache.invalidate_section_content(req.sec_id)
+            logger.info("🗑️  [CACHE DEL] section content:%s (answers updated)", req.sec_id)
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Section content ────────────────────────────────────────────────────────────
+# ── Section Generation & Edit ─────────────────────────────────────────────────
 
 @router.post("/section/generate")
 async def api_generate_section(req: GenerateSectionRequest):
     try:
-        return await generate_section_content(req)
+        # Check cache — if same sec_id already generated, return instantly
+        if req.sec_id:
+            cached = await cache.get_section_content(req.sec_id)
+            if cached is not None:
+                logger.info("✅ [CACHE HIT] section content:%s", req.sec_id)
+                return {**cached, "cached": True}
+
+        result = await generate_section_content(req)
+
+        # Cache the expensive LLM result
+        if req.sec_id and result:
+            await cache.set_section_content(req.sec_id, result)
+            logger.info("💾 [CACHE SET] section content:%s", req.sec_id)
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -108,131 +137,62 @@ async def api_generate_section(req: GenerateSectionRequest):
 @router.post("/section/edit")
 async def api_edit_section(req: EditSectionRequest):
     try:
-        return await edit_section(req)
+        result = await edit_section(req)
+
+        # Invalidate old cached content after edit
+        if req.sec_id:
+            await cache.invalidate_section_content(req.sec_id)
+            logger.info("🗑️  [CACHE DEL] section content:%s (edited)", req.sec_id)
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Save full document to gen_doc ──────────────────────────────────────────────
+# ── Document Save ─────────────────────────────────────────────────────────────
 
 @router.post("/document/save")
 async def api_save_document(req: SaveDocRequest):
     try:
         gen_id = await save_generated_document(
-            doc_id=req.doc_id,
-            doc_sec_id=req.doc_sec_id,
-            sec_id=req.sec_id,
-            gen_doc_sec_dec=req.gen_doc_sec_dec,
-            gen_doc_full=req.gen_doc_full,
+            doc_id=req.doc_id, doc_sec_id=req.doc_sec_id, sec_id=req.sec_id,
+            gen_doc_sec_dec=req.gen_doc_sec_dec, gen_doc_full=req.gen_doc_full,
         )
-        logger.info(f"Document saved: gen_id={gen_id}")
         return {"gen_id": gen_id, "saved": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Publish to Notion ──────────────────────────────────────────────────────────
+# ── Notion ────────────────────────────────────────────────────────────────────
 
 @router.post("/document/publish")
 async def api_publish_document(req: NotionPublishRequest):
     try:
-        return await publish_to_notion(req)
+        result = await publish_to_notion(req)
+
+        # Invalidate library cache so new doc appears immediately
+        await cache.invalidate_notion_library()
+        logger.info("🗑️  [CACHE DEL] notion_library (new doc published)")
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── Notion Library ─────────────────────────────────────────────────────────────
 
 @router.get("/library/notion")
 async def api_notion_library():
-    """Fetch all published docs from Notion database for the Library view."""
     try:
+        # Try cache first (5-min TTL)
+        cached = await cache.get_notion_library()
+        if cached is not None:
+            logger.info("✅ [CACHE HIT] notion_library (%d docs)", len(cached))
+            return {"total": len(cached), "documents": cached, "cached": True}
+
         docs = await fetch_library_from_notion()
-        return {"total": len(docs), "documents": docs}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
+        await cache.set_notion_library(docs)
+        logger.info("💾 [CACHE SET] notion_library (%d docs)", len(docs))
 
-# ── Generate DOCX file ─────────────────────────────────────────────────────────
-
-@router.post("/document/download/docx")
-async def api_download_docx(req: DownloadDocxRequest):
-    """
-    Generate a .docx file from section data and return it as a file download.
-    Uses generate_docx.js via subprocess.
-    """
-    try:
-        # Write input JSON to temp file
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.json', delete=False
-        ) as f:
-            json.dump({
-                "doc_type":     req.doc_type,
-                "department":   req.department,
-                "company_name": req.company_name,
-                "industry":     req.industry,
-                "region":       req.region,
-                "sections":     req.sections,
-            }, f)
-            input_path = f.name
-
-        output_path = input_path.replace('.json', '.docx')
-
-        # Find generate_docx.js (located next to this file or in project root)
-        script_candidates = [
-            os.path.join(os.path.dirname(__file__), '..', '..', 'generate_docx.js'),
-            os.path.join(os.path.dirname(__file__), '..', 'generate_docx.js'),
-            'generate_docx.js',
-        ]
-        script_path = next(
-            (p for p in script_candidates if os.path.exists(p)),
-            'generate_docx.js'
-        )
-
-        result = subprocess.run(
-            ['node', script_path, input_path, output_path],
-            capture_output=True, text=True, timeout=30
-        )
-
-        if result.returncode != 0:
-            raise Exception(f"DOCX generation failed: {result.stderr}")
-
-        safe_name = req.doc_type.replace(" ", "_").replace("/", "-")
-        return FileResponse(
-            path=output_path,
-            filename=f"{safe_name}.docx",
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
-    except Exception as e:
-        logger.error(f"DOCX generation failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        try:
-            os.unlink(input_path)
-        except Exception:
-            pass
-
-
-# ── Fetch documents from DB ────────────────────────────────────────────────────
-
-@router.get("/document/{gen_id}")
-async def api_get_document(gen_id: int):
-    try:
-        doc = await get_generated_document(gen_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail=f"gen_id={gen_id} not found")
-        return doc
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/documents")
-async def api_get_all_documents(doc_id: int = None):
-    try:
-        docs = await get_all_generated_documents(doc_id=doc_id)
-        return {"total": len(docs), "documents": docs}
+        return {"total": len(docs), "documents": docs, "cached": False}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

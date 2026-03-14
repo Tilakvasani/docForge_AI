@@ -684,6 +684,7 @@ elif st.session_state.active_tab == "generate":
 
         with c2:
             st.markdown("**📃 Plain Text (.txt)**")
+            st.markdown("*Clean text — no markdown symbols*")
             st.download_button(
                 "⬇️ Download .txt",
                 data=full_doc,
