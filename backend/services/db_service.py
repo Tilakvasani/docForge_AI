@@ -87,17 +87,15 @@ async def save_questions(
     doc_sec_id: int,
     doc_id: int,
     section_name: str,
-    questions: List[str]
+    questions: List[str],
+    section_type: str = "text"        # ← add this
 ) -> int:
-    """
-    Insert a new row into section_que_ans with generated questions.
-    Returns the new sec_id (SERIAL PK).
-    """
     pool = await get_pool()
     qa_data = json.dumps({
         "section_name": section_name,
+        "section_type": section_type,  # ← add this
         "questions": questions,
-        "answers": []          # Answers filled in next step
+        "answers": []
     })
     async with pool.acquire() as conn:
         sec_id = await conn.fetchval(
