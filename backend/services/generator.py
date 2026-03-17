@@ -344,7 +344,6 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
     sec_id = await save_questions(
         doc_sec_id=req.doc_sec_id, doc_id=req.doc_id,
         section_name=sec_name, questions=questions,
-        section_type=sec_type,              # save type to DB for generation step
     )
 
     logger.info(f"[{sec_type.upper()}] {len(questions)} questions saved for '{sec_name}'")
@@ -773,7 +772,19 @@ def _clean_preserve_flowcharts(text: str) -> str:
     """
     Preserve ```mermaid ... ``` blocks exactly.
     Strip markdown from everything outside those blocks.
+
+    Safety net: if LLM output contains 'flowchart TD' without backtick fences,
+    automatically wraps it so docx_builder can detect and render it as an image.
     """
+    # Auto-wrap bare flowchart blocks (LLM forgot the fences)
+    if re.search(r'flowchart\s+(?:TD|LR|BT|RL)', text) and "```mermaid" not in text:
+        text = re.sub(
+            r'(flowchart\s+(?:TD|LR|BT|RL).*?)(\n\n|\Z)',
+            lambda m: "```mermaid\n" + m.group(1).rstrip() + "\n```" + m.group(2),
+            text,
+            flags=re.DOTALL
+        )
+
     mermaid_pattern = re.compile(r"(```mermaid.*?```)", re.DOTALL)
     parts = mermaid_pattern.split(text)
     cleaned = []

@@ -1,20 +1,24 @@
 """
-DocForge AI — docx_builder.py  v3.0  (pure Python, no Node.js)
-Drop-in replacement for the old JS-based builder.
+DocForge AI — docx_builder.py  v5.0  (pure Python, no Node.js)
 
-Features (1:1 match with generate_docx.js):
+Features:
   ✅ Professional header:  Company  |  Doc Type  (right-aligned, grey)
   ✅ Footer:               Page N of M  (centred, grey)
   ✅ Title block:          Doc type (large, accent blue) + subtitle line
-  ✅ Section headings:     Heading 2, accent blue
-  ✅ Pipe-format tables → real Word tables (header row shaded, zebra rows)
-  ✅ Bullet lines  (- text)
-  ✅ Numbered lines (1. text)
+  ✅ Section headings:     accent blue, bold, underline divider
+  ✅ Pipe-format tables  → real Word tables (header shaded, zebra rows)
+  ✅ Mermaid flowcharts  → real PNG image embedded in Word (via flowchart_renderer.py)
+  ✅ Bullet lines        → indented bullet paragraphs
+  ✅ Numbered lines      → indented numbered paragraphs
   ✅ Plain paragraphs
-  ✅ Returns raw bytes — no temp files, no subprocess
+  ✅ Returns raw bytes   — no temp files, no subprocess
 
-Install once:
-    pip install python-docx
+Dependencies:
+    pip install python-docx matplotlib pillow
+
+Both files must be in the same directory:
+    docx_builder.py
+    flowchart_renderer.py
 """
 
 import re
@@ -27,23 +31,34 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
+try:
+    from flowchart_renderer import mermaid_to_png_bytes
+    FLOWCHART_RENDERER_AVAILABLE = True
+except ImportError:
+    FLOWCHART_RENDERER_AVAILABLE = False
 
-# ── Colour palette (matches JS) ────────────────────────────────────────────────
-ACCENT  = RGBColor(0x2E, 0x40, 0x57)   # dark blue
+
+# ── Colour palette ─────────────────────────────────────────────────────────────
+ACCENT  = RGBColor(0x2E, 0x40, 0x57)
 GRAY    = RGBColor(0x88, 0x88, 0x88)
 LGRAY   = RGBColor(0xF3, 0xF4, 0xF6)
 WHITE   = RGBColor(0xFF, 0xFF, 0xFF)
 DARK    = RGBColor(0x22, 0x22, 0x22)
 BORDER  = RGBColor(0xCC, 0xCC, 0xCC)
+FLOW_BG = RGBColor(0xEE, 0xF2, 0xFF)
+FLOW_BD = RGBColor(0x66, 0x7E, 0xEA)
 
 
-# ── Low-level XML helpers ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  LOW-LEVEL XML HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _set_run_font(run, size_pt: float, bold=False, color: RGBColor = None,
-                  font_name="Arial"):
+def _set_run_font(run, size_pt: float, bold=False, italic=False,
+                  color: RGBColor = None, font_name="Arial"):
     run.font.name   = font_name
     run.font.size   = Pt(size_pt)
     run.font.bold   = bold
+    run.font.italic = italic
     if color:
         run.font.color.rgb = color
 
@@ -53,7 +68,6 @@ def _hex(color: RGBColor) -> str:
 
 
 def _cell_shade(cell, fill_color: RGBColor):
-    """Apply solid background shading to a table cell."""
     tc   = cell._tc
     tcPr = tc.get_or_add_tcPr()
     shd  = OxmlElement("w:shd")
@@ -63,8 +77,8 @@ def _cell_shade(cell, fill_color: RGBColor):
     tcPr.append(shd)
 
 
-def _cell_borders(cell):
-    """Apply thin light-grey borders to a table cell."""
+def _cell_borders(cell, color: RGBColor = None):
+    bc   = color or BORDER
     tc   = cell._tc
     tcPr = tc.get_or_add_tcPr()
     tcBorders = OxmlElement("w:tcBorders")
@@ -73,7 +87,7 @@ def _cell_borders(cell):
         el.set(qn("w:val"),   "single")
         el.set(qn("w:sz"),    "4")
         el.set(qn("w:space"), "0")
-        el.set(qn("w:color"), _hex(BORDER))
+        el.set(qn("w:color"), _hex(bc))
         tcBorders.append(el)
     tcPr.append(tcBorders)
 
@@ -92,7 +106,6 @@ def _cell_margins(cell, top=80, bottom=80, left=120, right=120):
 
 
 def _add_page_number_field(paragraph):
-    """Add PAGE / NUMPAGES fields to a paragraph for 'Page N of M'."""
     def _field(fld_char_type):
         fldChar = OxmlElement("w:fldChar")
         fldChar.set(qn("w:fldCharType"), fld_char_type)
@@ -105,26 +118,19 @@ def _add_page_number_field(paragraph):
         return instrText
 
     p = paragraph._p
-    # "Page "
     r1 = OxmlElement("w:r")
-    rPr = OxmlElement("w:rPr")
-    r1.append(rPr)
+    r1.append(OxmlElement("w:rPr"))
     t = OxmlElement("w:t")
     t.set(qn("xml:space"), "preserve")
     t.text = "Page "
     r1.append(t)
     p.append(r1)
 
-    # PAGE field
     for part in ("begin", "PAGE", "end"):
         r = OxmlElement("w:r")
-        if part in ("begin", "end"):
-            r.append(_field(part))
-        else:
-            r.append(_instr(f" {part} "))
+        r.append(_field(part) if part in ("begin", "end") else _instr(f" {part} "))
         p.append(r)
 
-    # " of "
     r2 = OxmlElement("w:r")
     t2 = OxmlElement("w:t")
     t2.set(qn("xml:space"), "preserve")
@@ -132,18 +138,13 @@ def _add_page_number_field(paragraph):
     r2.append(t2)
     p.append(r2)
 
-    # NUMPAGES field
     for part in ("begin", "NUMPAGES", "end"):
         r = OxmlElement("w:r")
-        if part in ("begin", "end"):
-            r.append(_field(part))
-        else:
-            r.append(_instr(f" {part} "))
+        r.append(_field(part) if part in ("begin", "end") else _instr(f" {part} "))
         p.append(r)
 
 
 def _add_bottom_border(paragraph):
-    """Add a bottom border line under a paragraph (divider)."""
     pPr  = paragraph._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
     bot  = OxmlElement("w:bottom")
@@ -155,7 +156,9 @@ def _add_bottom_border(paragraph):
     pPr.append(pBdr)
 
 
-# ── Pipe-table parser ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  PIPE TABLE → WORD TABLE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_table_line(line: str) -> bool:
     return "|" in line
@@ -164,7 +167,6 @@ def _is_separator(line: str) -> bool:
     return bool(re.match(r"^\s*[\|\-\s:]+$", line)) and "-" in line
 
 def _parse_pipe_table(lines: List[str]) -> List[List[str]]:
-    """Parse pipe-formatted markdown table into list of rows (list of cell strings)."""
     rows = []
     for line in lines:
         if _is_separator(line):
@@ -173,7 +175,6 @@ def _parse_pipe_table(lines: List[str]) -> List[List[str]]:
             continue
         parts = line.split("|")
         cells = [c.strip() for c in parts]
-        # Strip empty leading/trailing from "| a | b |" format
         if cells and cells[0] == "":
             cells = cells[1:]
         if cells and cells[-1] == "":
@@ -184,66 +185,182 @@ def _parse_pipe_table(lines: List[str]) -> List[List[str]]:
 
 
 def _build_word_table(doc: Document, rows: List[List[str]]):
-    """Insert a styled Word table into the document."""
     if not rows:
         return
 
     col_count = max(len(r) for r in rows)
-
-    table = doc.add_table(rows=len(rows), cols=col_count)
+    table     = doc.add_table(rows=len(rows), cols=col_count)
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
-
-    # Column widths — distribute across 6.5 inches (page width minus margins)
-    page_width_twips = 9360  # ≈ 6.5 inches in twips
-    col_width = page_width_twips // col_count
+    col_width = 9360 // col_count
 
     for ri, row_data in enumerate(rows):
-        is_header = ri == 0
-        tr = table.rows[ri]
-
+        is_header = (ri == 0)
+        tr        = table.rows[ri]
         for ci in range(col_count):
-            cell = tr.cells[ci]
+            cell      = tr.cells[ci]
             cell_text = row_data[ci] if ci < len(row_data) else ""
-
-            # Shading
             if is_header:
                 _cell_shade(cell, ACCENT)
             elif ri % 2 == 0:
                 _cell_shade(cell, LGRAY)
-
             _cell_borders(cell)
             _cell_margins(cell)
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-
-            # Set column width
             cell.width = Twips(col_width)
-
-            # Text
-            p = cell.paragraphs[0]
+            p   = cell.paragraphs[0]
             p.paragraph_format.space_after  = Pt(0)
             p.paragraph_format.space_before = Pt(0)
             run = p.add_run(cell_text)
             _set_run_font(run, size_pt=10, bold=is_header,
                           color=WHITE if is_header else DARK)
 
-    # Spacer after table
     sp = doc.add_paragraph()
     sp.paragraph_format.space_after = Pt(6)
 
 
-# ── Section content parser ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  FLOWCHART → REAL PNG IMAGE
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _render_section_content(doc: Document, content: str):
-    """Parse content string and add paragraphs/tables to doc."""
+def _build_flowchart_image(doc: Document, mermaid_text: str, section_name: str = ""):
+    """
+    Render Mermaid flowchart as a real PNG image and embed in the Word doc.
+    Falls back to a styled text box if flowchart_renderer.py is not installed.
+    """
+    if FLOWCHART_RENDERER_AVAILABLE:
+        try:
+            png_bytes    = mermaid_to_png_bytes(mermaid_text, title=section_name, dpi=180)
+            image_stream = io.BytesIO(png_bytes)
+
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.space_before = Pt(8)
+            p.paragraph_format.space_after  = Pt(4)
+            p.add_run().add_picture(image_stream, width=Inches(6.2))
+
+            cap = doc.add_paragraph()
+            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cap.paragraph_format.space_after = Pt(10)
+            _set_run_font(
+                cap.add_run(
+                    f"Figure: {section_name} — Process Flow Diagram"
+                    if section_name else "Figure: Process Flow Diagram"
+                ),
+                size_pt=8, italic=True, color=GRAY
+            )
+            return
+        except Exception:
+            pass
+
+    # Fallback
+    _build_flowchart_text_fallback(doc, mermaid_text, section_name)
+
+
+def _extract_mermaid_steps(mermaid_text: str) -> List[str]:
+    steps, seen = [], set()
+    pattern = re.compile(r'\w+[\[\({]+([^\]\)\}]+)[\]\)}]+')
+    for line in mermaid_text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("flowchart") or line.startswith("graph"):
+            continue
+        for match in pattern.finditer(line):
+            label = match.group(1).strip()
+            if label and label not in seen and len(label) > 2:
+                seen.add(label)
+                steps.append(label)
+    return steps
+
+
+def _build_flowchart_text_fallback(doc: Document, mermaid_text: str, section_name: str = ""):
+    steps = _extract_mermaid_steps(mermaid_text)
+    box   = doc.add_table(rows=1, cols=1)
+    box.alignment = WD_TABLE_ALIGNMENT.LEFT
+    cell  = box.cell(0, 0)
+    _cell_shade(cell, FLOW_BG)
+    _cell_borders(cell, FLOW_BD)
+    _cell_margins(cell, top=160, bottom=160, left=200, right=200)
+
+    title_p = cell.paragraphs[0]
+    title_p.paragraph_format.space_after = Pt(6)
+    _set_run_font(title_p.add_run("Process Flow Diagram"),
+                  size_pt=11, bold=True, color=ACCENT)
+
+    sub_p = cell.add_paragraph()
+    sub_p.paragraph_format.space_after = Pt(10)
+    _set_run_font(sub_p.add_run(
+        f"Process flow for {section_name}. "
+        f"View the interactive diagram in DocForge AI."
+        if section_name else "View the interactive diagram in DocForge AI."
+    ), size_pt=9, italic=True, color=GRAY)
+
+    if steps:
+        for idx, step in enumerate(steps):
+            if idx > 0:
+                arrow_p = cell.add_paragraph()
+                arrow_p.paragraph_format.space_after  = Pt(1)
+                arrow_p.paragraph_format.left_indent  = Inches(0.2)
+                _set_run_font(arrow_p.add_run("↓"), size_pt=10, color=FLOW_BD)
+            step_p = cell.add_paragraph()
+            step_p.paragraph_format.space_after = Pt(2)
+            step_p.paragraph_format.left_indent = Inches(0.2)
+            _set_run_font(step_p.add_run(f"  {idx+1}.  "), size_pt=10, bold=True, color=FLOW_BD)
+            _set_run_font(step_p.add_run(step), size_pt=10, color=DARK)
+    else:
+        _set_run_font(cell.add_paragraph().add_run("Steps defined in the flowchart."),
+                      size_pt=10, italic=True, color=GRAY)
+
+    sp = doc.add_paragraph()
+    sp.paragraph_format.space_after = Pt(8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION CONTENT RENDERER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_section_content(doc: Document, content: str, section_name: str = ""):
+    """
+    Parse section content and add the correct Word elements.
+
+    Priority order:
+      1. ```mermaid...```  → real PNG flowchart image
+      2. Pipe tables       → Word table
+      3. Numbered list     → indented numbered paragraph
+      4. Bullet list       → indented bullet paragraph
+      5. Empty line        → spacer
+      6. Plain text        → paragraph
+    """
+    # Safety net: auto-wrap bare flowchart blocks if LLM dropped the fences
+    if re.search(r'flowchart\s+(?:TD|LR|BT|RL)', content) and "```mermaid" not in content:
+        content = re.sub(
+            r'(flowchart\s+(?:TD|LR|BT|RL).*?)(\n\n|\Z)',
+            lambda m: "```mermaid\n" + m.group(1).rstrip() + "\n```" + m.group(2),
+            content,
+            flags=re.DOTALL
+        )
+
+    mermaid_pattern = re.compile(r"```mermaid(.*?)```", re.DOTALL)
+    parts = mermaid_pattern.split(content)
+
+    for idx, part in enumerate(parts):
+        if idx % 2 == 1:
+            _build_flowchart_image(doc, part.strip(), section_name)
+        else:
+            _render_plain_content(doc, part)
+
+
+def _render_plain_content(doc: Document, content: str):
     lines = content.split("\n")
-    i = 0
+    i     = 0
+
     while i < len(lines):
         line = lines[i]
 
-        # Collect a pipe-table block
+        # Pipe table block
         if _is_table_line(line):
             table_lines = []
-            while i < len(lines) and (_is_table_line(lines[i]) or _is_separator(lines[i])):
+            while i < len(lines) and (
+                _is_table_line(lines[i]) or _is_separator(lines[i])
+            ):
                 table_lines.append(lines[i])
                 i += 1
             rows = _parse_pipe_table(table_lines)
@@ -253,7 +370,12 @@ def _render_section_content(doc: Document, content: str):
 
         stripped = line.strip()
 
-        # Empty line → small spacer
+        # Skip stray backtick fences
+        if stripped.startswith("```"):
+            i += 1
+            continue
+
+        # Empty line → spacer
         if not stripped:
             sp = doc.add_paragraph()
             sp.paragraph_format.space_after = Pt(4)
@@ -264,10 +386,10 @@ def _render_section_content(doc: Document, content: str):
         num_match = re.match(r"^(\d+)[.)]\s+(.+)$", stripped)
         if num_match:
             p = doc.add_paragraph()
-            p.paragraph_format.left_indent  = Inches(0.25)
-            p.paragraph_format.space_after  = Pt(4)
-            run = p.add_run(f"{num_match.group(1)}. {num_match.group(2)}")
-            _set_run_font(run, size_pt=11, color=DARK)
+            p.paragraph_format.left_indent = Inches(0.25)
+            p.paragraph_format.space_after = Pt(4)
+            _set_run_font(p.add_run(f"{num_match.group(1)}. {num_match.group(2)}"),
+                          size_pt=11, color=DARK)
             i += 1
             continue
 
@@ -275,36 +397,41 @@ def _render_section_content(doc: Document, content: str):
         bullet_match = re.match(r"^[-•]\s+(.+)$", stripped)
         if bullet_match:
             p = doc.add_paragraph()
-            p.paragraph_format.left_indent         = Inches(0.25)
-            p.paragraph_format.first_line_indent   = Inches(-0.15)
-            p.paragraph_format.space_after         = Pt(4)
-            run_dot = p.add_run("•  ")
-            _set_run_font(run_dot, size_pt=11, color=ACCENT)
-            run = p.add_run(bullet_match.group(1))
-            _set_run_font(run, size_pt=11, color=DARK)
+            p.paragraph_format.left_indent       = Inches(0.25)
+            p.paragraph_format.first_line_indent = Inches(-0.15)
+            p.paragraph_format.space_after       = Pt(4)
+            _set_run_font(p.add_run("•  "), size_pt=11, color=ACCENT)
+            _set_run_font(p.add_run(bullet_match.group(1)), size_pt=11, color=DARK)
             i += 1
             continue
 
-        # Plain text paragraph
-        p = doc.add_paragraph()
+        # Clean leftover markdown symbols
+        cleaned = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", stripped)
+        cleaned = re.sub(r"#{1,6}\s*", "", cleaned).strip()
+
+        if not cleaned:
+            i += 1
+            continue
+
+        # Plain paragraph
+        p   = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(6)
-        run = p.add_run(stripped)
-        _set_run_font(run, size_pt=11, color=DARK)
+        _set_run_font(p.add_run(cleaned), size_pt=11, color=DARK)
         i += 1
 
 
-# ── Header / Footer helpers ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  HEADER & FOOTER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _add_header(section, company_name: str, doc_type: str):
     header = section.header
     header.is_linked_to_previous = False
-    # Clear default empty paragraph
     for p in header.paragraphs:
         p.clear()
     p = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = p.add_run(f"{company_name}  |  {doc_type}")
-    _set_run_font(run, size_pt=8, color=GRAY)
+    _set_run_font(p.add_run(f"{company_name}  |  {doc_type}"), size_pt=8, color=GRAY)
 
 
 def _add_footer(section):
@@ -314,19 +441,16 @@ def _add_footer(section):
         p.clear()
     p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    # Style the runs via XML field codes
-    for run in p.runs:
-        _set_run_font(run, size_pt=8, color=GRAY)
-    # Add Page N of M via field codes
     _add_page_number_field(p)
-    # Style all runs in that paragraph
     for run in p.runs:
-        run.font.size  = Pt(8)
+        run.font.size      = Pt(8)
         run.font.color.rgb = GRAY
-        run.font.name  = "Arial"
+        run.font.name      = "Arial"
 
 
-# ── Public API ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  PUBLIC API
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_docx(
     doc_type: str,
@@ -334,91 +458,91 @@ def build_docx(
     company_name: str,
     industry: str,
     region: str,
-    sections: List[Dict],   # [{"name": str, "content": str}]
+    sections: List[Dict],
 ) -> bytes:
     """
-    Build a professional .docx file and return raw bytes.
-    Drop-in replacement for the Node.js generate_docx.js pipeline.
+    Build a professional .docx document and return raw bytes.
 
     Args:
-        doc_type:     Document type name (e.g. "Budget Report")
-        department:   Department name
-        company_name: Company name
-        industry:     Industry string
-        region:       Region string
-        sections:     List of dicts with "name" and "content" keys
+        doc_type:     e.g. "Content Strategy Document"
+        department:   e.g. "Marketing"
+        company_name: e.g. "Turabit Technologies"
+        industry:     e.g. "Technology / SaaS"
+        region:       e.g. "India"
+        sections:     [{"name": "Section Name", "content": "..."}]
+                      Content supports: plain text, pipe tables, mermaid blocks,
+                      bullet lists, numbered lists.
 
     Returns:
-        bytes: Raw .docx file content, ready for st.download_button()
+        bytes: Raw .docx — pass to st.download_button() directly.
     """
     doc = Document()
 
-    # ── Page setup: Letter size, 1-inch margins ────────────────────────────────
+    # Page setup: US Letter, 1-inch margins
     for section in doc.sections:
-        section.page_width      = Twips(12240)   # 8.5 inches
-        section.page_height     = Twips(15840)   # 11 inches
-        section.top_margin      = Inches(1)
-        section.bottom_margin   = Inches(1)
-        section.left_margin     = Inches(1)
-        section.right_margin    = Inches(1)
+        section.page_width    = Twips(12240)
+        section.page_height   = Twips(15840)
+        section.top_margin    = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin   = Inches(1)
+        section.right_margin  = Inches(1)
         _add_header(section, company_name, doc_type)
         _add_footer(section)
 
-    # ── Default font ───────────────────────────────────────────────────────────
-    style = doc.styles["Normal"]
-    style.font.name = "Arial"
-    style.font.size = Pt(11)
+    # Default font
+    doc.styles["Normal"].font.name = "Arial"
+    doc.styles["Normal"].font.size = Pt(11)
 
-    # ── Title ──────────────────────────────────────────────────────────────────
+    # Document title
     title_p = doc.add_paragraph()
-    title_p.paragraph_format.space_after  = Pt(10)
     title_p.paragraph_format.space_before = Pt(0)
-    title_run = title_p.add_run(doc_type)
-    _set_run_font(title_run, size_pt=20, bold=True, color=ACCENT)
+    title_p.paragraph_format.space_after  = Pt(8)
+    _set_run_font(title_p.add_run(doc_type), size_pt=22, bold=True, color=ACCENT)
 
-    # ── Subtitle line ──────────────────────────────────────────────────────────
+    # Subtitle
     sub_p = doc.add_paragraph()
-    sub_p.paragraph_format.space_after = Pt(12)
-    sub_run = sub_p.add_run(f"{company_name}  ·  {department}  ·  {region}")
-    _set_run_font(sub_run, size_pt=10, color=GRAY)
+    sub_p.paragraph_format.space_after = Pt(6)
+    _set_run_font(
+        sub_p.add_run(f"{company_name}  ·  {department}  ·  {industry}  ·  {region}"),
+        size_pt=10, color=GRAY
+    )
 
-    # ── Divider ────────────────────────────────────────────────────────────────
+    # Divider
     div_p = doc.add_paragraph()
-    div_p.paragraph_format.space_after = Pt(14)
+    div_p.paragraph_format.space_after = Pt(16)
     _add_bottom_border(div_p)
 
-    # ── Sections ───────────────────────────────────────────────────────────────
+    # Sections
     for idx, sec in enumerate(sections):
-        name    = sec.get("name", "")
+        name    = sec.get("name", "").strip()
         content = sec.get("content", "").strip()
 
         if not content:
             continue
 
-        # Inter-section spacer (not before first)
         if idx > 0:
-            sp = doc.add_paragraph()
-            sp.paragraph_format.space_after = Pt(8)
+            gap = doc.add_paragraph()
+            gap.paragraph_format.space_after = Pt(6)
 
-        # Section heading
+        # Section heading with underline
         h = doc.add_paragraph()
-        h.paragraph_format.space_before = Pt(14)
-        h.paragraph_format.space_after  = Pt(6)
-        h_run = h.add_run(name)
-        _set_run_font(h_run, size_pt=13, bold=True, color=ACCENT)
+        h.paragraph_format.space_before = Pt(12)
+        h.paragraph_format.space_after  = Pt(5)
+        _set_run_font(h.add_run(name), size_pt=13, bold=True, color=ACCENT)
+        _add_bottom_border(h)
 
         # Section body
-        _render_section_content(doc, content)
+        _render_section_content(doc, content, section_name=name)
 
-    # ── Footer note at end of document ─────────────────────────────────────────
+    # End note
     doc.add_paragraph().paragraph_format.space_after = Pt(20)
     note_p = doc.add_paragraph()
     note_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    note_run = note_p.add_run(
-        f"{doc_type}  ·  Generated by DocForge AI  ·  Confidential")
-    _set_run_font(note_run, size_pt=8, color=GRAY)
+    _set_run_font(
+        note_p.add_run(f"{doc_type}  ·  Generated by DocForge AI  ·  Confidential"),
+        size_pt=8, color=GRAY
+    )
 
-    # ── Serialize to bytes ─────────────────────────────────────────────────────
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)

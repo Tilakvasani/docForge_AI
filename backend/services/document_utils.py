@@ -1,6 +1,6 @@
 """
-DocForge AI — document_utils.py  v2.0
-  1. markdown_to_plain_text()     — strip markdown, preserve table lines
+DocForge AI — document_utils.py  v2.1
+  1. markdown_to_plain_text()     — strip markdown, preserve table lines + mermaid blocks
   2. DOC_WORD_TARGETS             — industry-standard total word counts
   3. get_words_per_section()      — per-section target words
   4. SECTIONS_NEEDING_TABLES      — patterns for sections that require a table
@@ -13,31 +13,70 @@ from typing import Dict, List
 # ─── Markdown → Plain Text ────────────────────────────────────────────────────
 
 def markdown_to_plain_text(md: str) -> str:
-    """Strip all markdown. Does NOT touch lines containing | (table lines)."""
+    """
+    Strip markdown formatting.
+    NEVER touches:
+      - Lines containing | (pipe table lines)
+      - Lines inside ```mermaid ... ``` blocks
+      - Lines starting with ``` (fence markers)
+    """
+    # ── Guard 1: pipe table lines — return untouched ──────────────────────────
     if '|' in md:
-        return md.rstrip()   # preserve table lines untouched
+        return md.rstrip()
+
+    # ── Guard 2: mermaid fence line or content inside a mermaid block ─────────
+    stripped = md.strip()
+    if stripped.startswith('```mermaid') or stripped == '```':
+        return md.rstrip()
+
+    # ── Guard 3: bare flowchart/graph declaration lines ───────────────────────
+    if stripped.startswith('flowchart') or stripped.startswith('graph '):
+        return md.rstrip()
+
+    # ── Guard 4: mermaid node/edge lines (contain --> or -->) ─────────────────
+    if '-->' in md or '--->' in md:
+        return md.rstrip()
+
     t = md
-    t = re.sub(r'^---+\s*$', '', t, flags=re.MULTILINE)
-    t = re.sub(r'^\*\*\*+\s*$', '', t, flags=re.MULTILINE)
+
+    # Strip HTML tags
     t = re.sub(r'<[^>]+>', '', t)
+
+    # Strip markdown links [text](url) → text
     t = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', t)
-    t = re.sub(r'`{3}.*?`{3}', '', t, flags=re.DOTALL)
+
+    # ── CRITICAL: skip stripping ```code``` blocks ────────────────────────────
+    # Old code had: re.sub(r'`{3}.*?`{3}', '', t, flags=re.DOTALL)
+    # That was destroying mermaid fences. We do NOT strip triple-backtick blocks
+    # here because _clean_preserve_flowcharts handles them upstream.
+    # Only strip single backtick inline code:
     t = re.sub(r'`([^`]+)`', r'\1', t)
+
+    # Strip bold/italic
     t = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', t)
-    t = re.sub(r'\*\*(.+?)\*\*', r'\1', t)
-    t = re.sub(r'\*(.+?)\*', r'\1', t)
-    t = re.sub(r'__(.+?)__', r'\1', t)
-    t = re.sub(r'_(.+?)_', r'\1', t)
+    t = re.sub(r'\*\*(.+?)\*\*',     r'\1', t)
+    t = re.sub(r'\*(.+?)\*',         r'\1', t)
+    t = re.sub(r'__(.+?)__',         r'\1', t)
+    t = re.sub(r'_(.+?)_',           r'\1', t)
+
+    # Strip heading markers
     t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
+
+    # Strip horizontal rules
+    t = re.sub(r'^---+\s*$',    '', t, flags=re.MULTILINE)
+    t = re.sub(r'^\*\*\*+\s*$', '', t, flags=re.MULTILINE)
+
+    # Normalise bullets
     t = re.sub(r'^\s*[-*+]\s+', '  - ', t, flags=re.MULTILINE)
     t = re.sub(r'^\s*(\d+)\.\s+', r'\1. ', t, flags=re.MULTILINE)
+
+    # Collapse excessive blank lines
     t = re.sub(r'\n{3,}', '\n\n', t)
+
     return '\n'.join(line.rstrip() for line in t.split('\n')).strip()
 
 
 # ─── Sections that need tables ────────────────────────────────────────────────
-# Pattern format: "doc_type_keyword|section_keyword" (both lowercased for matching)
-# If EITHER keyword appears in "{doc_type}|{section_name}".lower(), a table is generated
 
 SECTIONS_NEEDING_TABLES: List[str] = [
     # Commission Report
@@ -111,8 +150,7 @@ SECTIONS_NEEDING_TABLES: List[str] = [
 ]
 
 
-# ─── Industry-Standard Total Word Counts ─────────────────────────────────────
-# These are the TOTAL document word targets — calibrated to real industry norms
+# ─── Industry-Standard Total Word Counts ──────────────────────────────────────
 
 DOC_WORD_TARGETS: Dict[str, int] = {
     # HR
@@ -240,13 +278,13 @@ DEFAULT_TOTAL_WORDS = 500
 
 
 def get_words_per_section(doc_type: str, num_sections: int) -> int:
-    """Return target words per section. No artificial minimum — respect actual doc length."""
+    """Return target words per section."""
     total = DOC_WORD_TARGETS.get(doc_type, DEFAULT_TOTAL_WORDS)
     per   = total // max(num_sections, 1)
-    return max(20, min(320, per))   # min 20 (e.g. cert signature), max 320
+    return max(20, min(320, per))
 
 
-# ─── Plain Text Document Assembler ───────────────────────────────────────────
+# ─── Plain Text Document Assembler ────────────────────────────────────────────
 
 def build_plain_text_document(
     doc_type: str,
@@ -264,5 +302,4 @@ def build_plain_text_document(
         if not content:
             continue
         lines += [sec.upper(), "-" * len(sec), "", content, "", ""]
-
     return "\n".join(lines).strip()

@@ -1,11 +1,7 @@
 """
-DocForge AI — streamlit_app.py  v4.0
-All live UI functions working:
-  ✅ Step 2: section grid updates live per section, counter updates live
-  ✅ Step 3: no stray progress bar, section heading appears once
-  ✅ Step 4: live section counter, auto-assemble after writing, no second button
-  ✅ Step 5: manual edit textarea key is dynamic per section (no stale content)
-  ✅ Step 6: docx bytes pre-generated, single download button (no double-click)
+DocForge AI — streamlit_app.py  v5.0
+Steps: 1 Select → 2 Questions → 3 Answer → 4 Review & Edit → 5 Export
+Step 4 (Generate Content) is removed — generation runs inside Step 3's button.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -87,21 +83,27 @@ with st.sidebar:
     st.markdown("---")
 
     if st.session_state.active_tab == "generate":
-        steps = [(1,"Select Document"),(2,"Generate Questions"),
-                 (3,"Answer Questions"),(4,"Generate Content"),
-                 (5,"Review & Edit"),(6,"Export")]
+        steps = [
+            (1, "Select Document"),
+            (2, "Generate Questions"),
+            (3, "Answer Questions"),
+            (4, "Review & Edit"),
+            (5, "Export"),
+        ]
         cur = st.session_state.step
         for n, lbl in steps:
-            if   n < cur:  ic,co,w = "✅","#22c55e","400"
-            elif n == cur: ic,co,w = "▶️","#667eea","700"
-            else:          ic,co,w = "⭕","#94a3b8","400"
-            st.markdown(f'<div style="color:{co};font-weight:{w};padding:3px 0">'
-                        f'{ic} Step {n}: {lbl}</div>', unsafe_allow_html=True)
+            if   n < cur:  ic, co, w = "✅", "#22c55e", "400"
+            elif n == cur: ic, co, w = "▶️", "#667eea", "700"
+            else:          ic, co, w = "⭕", "#94a3b8", "400"
+            st.markdown(
+                f'<div style="color:{co};font-weight:{w};padding:3px 0">'
+                f'{ic} Step {n}: {lbl}</div>', unsafe_allow_html=True)
         st.markdown("---")
+
         ctx = st.session_state.company_ctx
         if ctx:
             st.markdown("**🏢 Company**")
-            st.caption(ctx.get("company_name","—"))
+            st.caption(ctx.get("company_name", "—"))
             st.caption(f"{ctx.get('industry','—')} · {ctx.get('region','—')}")
         if st.session_state.selected_doc_type:
             st.markdown("**📄 Document**")
@@ -122,9 +124,10 @@ with st.sidebar:
 
 # ─── Header ───────────────────────────────────────────────────────────────────
 
-st.markdown('<div class="main-header"><h2 style="margin:0">📄 DocForge AI</h2>'
-            '<p style="margin:4px 0 0;opacity:.85">AI-Powered Enterprise Document Generator</p>'
-            '</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="main-header"><h2 style="margin:0">📄 DocForge AI</h2>'
+    '<p style="margin:4px 0 0;opacity:.85">AI-Powered Enterprise Document Generator</p>'
+    '</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -163,7 +166,7 @@ if st.session_state.active_tab == "library":
         st.markdown(f"**{len(filtered)} documents**")
         for doc in filtered:
             with st.container():
-                st.markdown(f'<div class="lib-card">', unsafe_allow_html=True)
+                st.markdown('<div class="lib-card">', unsafe_allow_html=True)
                 c1, c2, c3 = st.columns([3, 1, 1])
                 with c1:
                     st.markdown(f"**{doc['title']}**")
@@ -172,7 +175,10 @@ if st.session_state.active_tab == "library":
                     st.caption(f"🏢 {doc['department']}")
                     st.caption(f"📅 {doc['created_at']}")
                 with c3:
-                    status_color = {"Generated":"🟢","Draft":"🟡","Reviewed":"🔵","Archived":"⚫"}.get(doc["status"],"⚪")
+                    status_color = {
+                        "Generated": "🟢", "Draft": "🟡",
+                        "Reviewed": "🔵", "Archived": "⚫"
+                    }.get(doc["status"], "⚪")
                     st.caption(f"{status_color} {doc['status']}")
                     if doc.get("notion_url"):
                         st.link_button("Open →", doc["notion_url"])
@@ -188,7 +194,7 @@ elif st.session_state.active_tab == "generate":
     # ─── Step 1: Select Document ───────────────────────────────────────────────
 
     if st.session_state.step == 1:
-        st.markdown('<span class="step-badge">Step 1 of 6</span>', unsafe_allow_html=True)
+        st.markdown('<span class="step-badge">Step 1 of 5</span>', unsafe_allow_html=True)
         st.markdown("## 🚀 Get Started")
         st.markdown("Enter your company details and choose the document to generate.")
         st.markdown("---")
@@ -206,20 +212,21 @@ elif st.session_state.active_tab == "generate":
         st.markdown("### 🏢 Company Info")
         c1, c2 = st.columns(2)
         with c1:
-            company_name = st.text_input("Company Name *",
-                value=st.session_state.company_ctx.get("company_name",""),
+            company_name = st.text_input(
+                "Company Name *",
+                value=st.session_state.company_ctx.get("company_name", ""),
                 placeholder="e.g. Turabit Technologies")
             industry = st.selectbox("Industry", [
-                "Technology / SaaS","Finance / Banking","Healthcare","Manufacturing",
-                "Retail / E-Commerce","Legal Services","Marketing / Media",
-                "Logistics / Supply Chain","Education","Other"])
+                "Technology / SaaS", "Finance / Banking", "Healthcare",
+                "Manufacturing", "Retail / E-Commerce", "Legal Services",
+                "Marketing / Media", "Logistics / Supply Chain", "Education", "Other"])
         with c2:
-            company_size = st.selectbox("Company Size",[
-                "1-10 employees","11-50 employees","51-200 employees",
-                "201-500 employees","500+ employees"], index=2)
-            region = st.selectbox("Region",[
-                "India","United States","United Kingdom","UAE / Middle East",
-                "Canada","Australia","Europe","Other"])
+            company_size = st.selectbox("Company Size", [
+                "1-10 employees", "11-50 employees", "51-200 employees",
+                "201-500 employees", "500+ employees"], index=2)
+            region = st.selectbox("Region", [
+                "India", "United States", "United Kingdom", "UAE / Middle East",
+                "Canada", "Australia", "Europe", "Other"])
 
         st.markdown("---")
         st.markdown("### 📂 Select Document")
@@ -238,18 +245,20 @@ elif st.session_state.active_tab == "generate":
                 st.error("Please enter your company name.")
             else:
                 with st.spinner("Loading document sections..."):
-                    safe = (selected_doc_type.replace("/","%2F")
-                            .replace("(","%28").replace(")","%29"))
+                    safe = (selected_doc_type.replace("/", "%2F")
+                            .replace("(", "%28").replace(")", "%29"))
                     data = api_get(f"/sections/{safe}")
                 if data:
                     st.session_state.company_ctx = {
-                        "company_name": company_name.strip(), "industry": industry,
-                        "company_size": company_size, "region": region}
+                        "company_name": company_name.strip(),
+                        "industry":     industry,
+                        "company_size": company_size,
+                        "region":       region,
+                    }
                     st.session_state.selected_dept     = selected_dept
                     st.session_state.selected_dept_id  = dept_data["doc_id"]
                     st.session_state.selected_doc_type = selected_doc_type
                     st.session_state.doc_sec_id        = data["doc_sec_id"]
-                    # Deduplicate sections preserving order
                     seen, deduped = set(), []
                     for s in data["doc_sec"]:
                         if s not in seen:
@@ -262,16 +271,17 @@ elif st.session_state.active_tab == "generate":
     # ─── Step 2: Generate Questions ───────────────────────────────────────────
 
     elif st.session_state.step == 2:
-        st.markdown('<span class="step-badge">Step 2 of 6</span>', unsafe_allow_html=True)
-        st.markdown(f"## ❓ Generate Questions")
-        st.markdown(f"**{st.session_state.selected_doc_type}** · {len(st.session_state.sections)} sections")
-        st.markdown("*Smart count: 0–3 questions per section. Table sections get data-focused questions.*")
+        st.markdown('<span class="step-badge">Step 2 of 5</span>', unsafe_allow_html=True)
+        st.markdown("## ❓ Generate Questions")
+        st.markdown(
+            f"**{st.session_state.selected_doc_type}** · "
+            f"{len(st.session_state.sections)} sections")
+        st.markdown("*Smart count: 0–3 questions per section based on section type.*")
         st.markdown("---")
 
-        sections  = st.session_state.sections
-        total     = len(sections)
+        sections = st.session_state.sections
+        total    = len(sections)
 
-        # Live-updatable slots
         grid_slot    = st.empty()
         counter_slot = st.empty()
 
@@ -280,12 +290,16 @@ elif st.session_state.active_tab == "generate":
             cols = st.columns(3)
             for i, s in enumerate(sections):
                 if s in generated:
-                    badge = " 📊" if generated[s].get("is_table") else ""
-                    cols[i%3].markdown(f'<div class="s-done">✅ {s[:33]}{badge}</div>',
-                                       unsafe_allow_html=True)
+                    sec_type = generated[s].get("section_type", "text")
+                    badge = {"table": " 📊", "flowchart": " 🔀", "raci": " 👥",
+                             "signature": " ✍️"}.get(sec_type, "")
+                    cols[i % 3].markdown(
+                        f'<div class="s-done">✅ {s[:33]}{badge}</div>',
+                        unsafe_allow_html=True)
                 else:
-                    cols[i%3].markdown(f'<div class="s-pend">⭕ {s[:35]}</div>',
-                                       unsafe_allow_html=True)
+                    cols[i % 3].markdown(
+                        f'<div class="s-pend">⭕ {s[:35]}</div>',
+                        unsafe_allow_html=True)
 
         def render_counter():
             done = len(st.session_state.section_questions)
@@ -305,7 +319,7 @@ elif st.session_state.active_tab == "generate":
                 for i, sec in enumerate(sections):
                     generated = st.session_state.section_questions
                     if sec in generated:
-                        bar.progress((i+1)/total); continue
+                        bar.progress((i + 1) / total); continue
                     status.markdown(f"⏳ **{sec}**...")
                     res = api_post("/questions/generate", {
                         "doc_sec_id":      st.session_state.doc_sec_id,
@@ -313,81 +327,160 @@ elif st.session_state.active_tab == "generate":
                         "section_name":    sec,
                         "doc_type":        st.session_state.selected_doc_type,
                         "department":      st.session_state.selected_dept,
-                        "company_context": st.session_state.company_ctx})
+                        "company_context": st.session_state.company_ctx,
+                    })
                     if res:
                         st.session_state.section_questions[sec] = {
-                            "sec_id":    res["sec_id"],
-                            "questions": res["questions"],
-                            "is_table":  res.get("is_table", False),
+                            "sec_id":       res["sec_id"],
+                            "questions":    res["questions"],
+                            "section_type": res.get("section_type", "text"),
                         }
-                    # Update grid + counter live
                     with grid_slot.container():
                         render_grid()
                     render_counter()
-                    bar.progress((i+1)/total)
+                    bar.progress((i + 1) / total)
                 bar.empty(); status.markdown("✅ Done!"); st.rerun()
 
         c1, c2 = st.columns([1, 3])
         with c1:
-            if st.button("← Back"): st.session_state.step = 1; st.rerun()
+            if st.button("← Back"):
+                st.session_state.step = 1; st.rerun()
         with c2:
-            done = len(st.session_state.section_questions)
-            if done == total:
+            if len(st.session_state.section_questions) == total:
                 if st.button("Start Answering →", type="primary", use_container_width=True):
                     st.session_state.step = 3; st.rerun()
 
 
-    # ─── Step 3: Answer Questions ─────────────────────────────────────────────
+    # ─── Step 3: Answer Questions + Generate Document ─────────────────────────
 
     elif st.session_state.step == 3:
-        sections  = st.session_state.sections
-        ans_map   = st.session_state.section_answers
-        skipped   = st.session_state.skipped_sections
-        q_map     = st.session_state.section_questions
+        sections = st.session_state.sections
+        ans_map  = st.session_state.section_answers
+        skipped  = st.session_state.skipped_sections
+        q_map    = st.session_state.section_questions
 
         unanswered = [s for s in sections if s not in ans_map and s not in skipped]
 
+        # ── All sections answered — show Generate button ───────────────────────
         if not unanswered:
-            st.markdown('<span class="step-badge">Step 3 of 6</span>', unsafe_allow_html=True)
+            st.markdown('<span class="step-badge">Step 3 of 5</span>', unsafe_allow_html=True)
             st.markdown("## ✅ All Sections Done!")
             st.markdown(f"**{len(ans_map)} answered · {len(skipped)} skipped**")
             if skipped:
                 st.warning(f"⚠️ Skipped: **{', '.join(skipped)}**")
+            st.markdown("---")
+
             c1, c2 = st.columns([1, 3])
             with c1:
-                if st.button("← Back"): st.session_state.step = 2; st.rerun()
+                if st.button("← Back"):
+                    st.session_state.step = 2; st.rerun()
             with c2:
-                if st.button("Generate Document →", type="primary", use_container_width=True):
-                    st.session_state.step = 4; st.rerun()
+                if st.button("🤖 Generate Document →", type="primary", use_container_width=True):
+                    active = [s for s in sections if s not in skipped]
+                    total  = len(active)
+
+                    st.markdown("---")
+                    bar    = st.progress(0)
+                    status = st.empty()
+                    ids    = []
+
+                    for i, sec in enumerate(active):
+                        # Skip already-generated sections
+                        if sec in st.session_state.section_contents:
+                            ids.append(q_map.get(sec, {}).get("sec_id", 0))
+                            bar.progress((i + 1) / total)
+                            continue
+
+                        status.markdown(f"✍️ Writing **{sec}**...")
+                        q_data = q_map.get(sec, {})
+                        sec_id = q_data.get("sec_id")
+
+                        res = api_post("/section/generate", {
+                            "sec_id":          sec_id,
+                            "doc_sec_id":      st.session_state.doc_sec_id,
+                            "doc_id":          st.session_state.selected_dept_id,
+                            "section_name":    sec,
+                            "doc_type":        st.session_state.selected_doc_type,
+                            "department":      st.session_state.selected_dept,
+                            "company_context": st.session_state.company_ctx,
+                            "num_sections":    total,
+                        }, timeout=120)
+
+                        if res:
+                            st.session_state.section_contents[sec] = res["content"]
+                            ids.append(sec_id)
+
+                        bar.progress((i + 1) / total)
+
+                    st.session_state.sec_ids_ordered = ids
+                    status.markdown("✅ All sections written!")
+
+                    # Assemble full document
+                    lines = []
+                    for sec in active:
+                        c = st.session_state.section_contents.get(sec, "").strip()
+                        if c:
+                            lines += [sec.upper(), "-" * len(sec), "", c, "", ""]
+                    full_doc = "\n".join(lines).strip()
+
+                    # Save to DB
+                    pri_sec  = ids[-1] if ids else 0
+                    save_res = api_post("/document/save", {
+                        "doc_id":          st.session_state.selected_dept_id,
+                        "doc_sec_id":      st.session_state.doc_sec_id,
+                        "sec_id":          pri_sec,
+                        "gen_doc_sec_dec": list(st.session_state.section_contents.values()),
+                        "gen_doc_full":    full_doc,
+                    })
+                    st.session_state.gen_id        = save_res.get("gen_id", 0) if save_res else 0
+                    st.session_state.full_document = full_doc
+
+                    # Jump straight to Review & Edit
+                    st.session_state.step = 4
+                    st.rerun()
+
+        # ── Still answering sections ───────────────────────────────────────────
         else:
             current  = unanswered[0]
             done_cnt = len(ans_map) + len(skipped)
             total    = len(sections)
 
-            st.markdown('<span class="step-badge">Step 3 of 6</span>', unsafe_allow_html=True)
+            st.markdown('<span class="step-badge">Step 3 of 5</span>', unsafe_allow_html=True)
             st.markdown("## ✍️ Answer Questions")
             st.markdown(f"**{done_cnt} / {total} done** · {len(unanswered)} remaining")
+            st.progress(done_cnt / total)
             st.markdown("---")
 
             q_data    = q_map.get(current, {})
             questions = q_data.get("questions", [])
             sec_id    = q_data.get("sec_id")
-            is_table  = q_data.get("is_table", False)
+            sec_type  = q_data.get("section_type", "text")
 
-            if is_table:
-                st.markdown(f"### 📊 {current}")
-                st.info("This section will contain a **data table**. Your answers will populate it.")
-            else:
-                st.markdown(f"### 📌 {current}")
+            # Section type badge
+            type_labels = {
+                "table":     "📊 This section will be a **data table**. Your answers populate the rows.",
+                "flowchart": "🔀 This section will be a **process flowchart**. Describe the steps.",
+                "raci":      "👥 This section will be a **RACI matrix**. Describe the roles involved.",
+                "signature": "✍️ This section is a **sign-off block**. Auto-generated.",
+                "text":      "",
+            }
+            type_msg = type_labels.get(sec_type, "")
+
+            st.markdown(f"### 📌 {current}")
+            if type_msg:
+                st.info(type_msg)
 
             user_answers = []
             if not questions:
-                st.info("No questions — content will be auto-generated.")
+                st.info("No questions needed — content will be auto-generated professionally.")
             else:
                 st.caption("Leave blank = auto-fill with professional content")
                 for i, q in enumerate(questions):
-                    a = st.text_area(f"**Q{i+1}:** {q}", key=f"ans_{current}_{i}",
-                                     height=90, placeholder="Your answer (or leave blank)...")
+                    a = st.text_area(
+                        f"**Q{i+1}:** {q}",
+                        key=f"ans_{current}_{i}",
+                        height=90,
+                        placeholder="Your answer (or leave blank for auto-fill)...")
                     user_answers.append(a)
 
             st.markdown("---")
@@ -396,21 +489,29 @@ elif st.session_state.active_tab == "generate":
                 if st.button("⏭️ Skip", use_container_width=True):
                     if sec_id:
                         api_post("/answers/save", {
-                            "sec_id": sec_id, "doc_sec_id": st.session_state.doc_sec_id,
-                            "doc_id": st.session_state.selected_dept_id,
-                            "section_name": current, "questions": questions,
-                            "answers": ["not answered"] * max(len(questions), 1)})
-                    st.session_state.skipped_sections.add(current); st.rerun()
+                            "sec_id":      sec_id,
+                            "doc_sec_id":  st.session_state.doc_sec_id,
+                            "doc_id":      st.session_state.selected_dept_id,
+                            "section_name": current,
+                            "questions":   questions,
+                            "answers":     ["not answered"] * max(len(questions), 1),
+                        })
+                    st.session_state.skipped_sections.add(current)
+                    st.rerun()
             with c2:
                 if st.button("Save & Next →", type="primary", use_container_width=True):
                     filled = [a.strip() if a.strip() else "not answered" for a in user_answers]
                     if sec_id:
                         api_post("/answers/save", {
-                            "sec_id": sec_id, "doc_sec_id": st.session_state.doc_sec_id,
-                            "doc_id": st.session_state.selected_dept_id,
-                            "section_name": current, "questions": questions,
-                            "answers": filled or ["not answered"]})
-                    st.session_state.section_answers[current] = filled; st.rerun()
+                            "sec_id":      sec_id,
+                            "doc_sec_id":  st.session_state.doc_sec_id,
+                            "doc_id":      st.session_state.selected_dept_id,
+                            "section_name": current,
+                            "questions":   questions,
+                            "answers":     filled or ["not answered"],
+                        })
+                    st.session_state.section_answers[current] = filled
+                    st.rerun()
 
             # Progress summary at bottom
             if ans_map or skipped:
@@ -421,109 +522,22 @@ elif st.session_state.active_tab == "generate":
                         st.markdown("**✅ Answered**")
                         for s in sections:
                             if s in ans_map:
-                                st.markdown(f'<div class="s-done">✅ {s}</div>',
-                                            unsafe_allow_html=True)
+                                st.markdown(
+                                    f'<div class="s-done">✅ {s}</div>',
+                                    unsafe_allow_html=True)
                 with c2:
                     if skipped:
                         st.markdown("**⏭️ Skipped**")
                         for s in skipped:
-                            st.markdown(f'<div class="s-skip">⏭️ {s}</div>',
-                                        unsafe_allow_html=True)
+                            st.markdown(
+                                f'<div class="s-skip">⏭️ {s}</div>',
+                                unsafe_allow_html=True)
 
 
-    # ─── Step 4: Generate Content ─────────────────────────────────────────────
+    # ─── Step 4: Review & Edit ────────────────────────────────────────────────
 
     elif st.session_state.step == 4:
-        st.markdown('<span class="step-badge">Step 4 of 6</span>', unsafe_allow_html=True)
-        st.markdown("## ⚙️ Generate Document Content")
-        st.markdown("---")
-
-        sections  = st.session_state.sections
-        skipped   = st.session_state.skipped_sections
-        active    = [s for s in sections if s not in skipped]
-        q_map     = st.session_state.section_questions
-        contents  = st.session_state.section_contents
-        total     = len(active)
-        done      = len(contents)
-
-        counter_slot = st.empty()
-        counter_slot.markdown(f"**{done} / {total} sections written** · {len(skipped)} excluded")
-
-        if done < total:
-            if st.button("🤖 Write All Sections", type="primary", use_container_width=True):
-                bar = st.progress(0); status = st.empty(); ids = []
-
-                for i, sec in enumerate(active):
-                    if sec in st.session_state.section_contents:
-                        ids.append(q_map.get(sec, {}).get("sec_id", 0))
-                        bar.progress((i+1)/total); continue
-
-                    status.markdown(f"✍️ **{sec}**...")
-                    q_data = q_map.get(sec, {}); sec_id = q_data.get("sec_id")
-
-                    res = api_post("/section/generate", {
-                        "sec_id":          sec_id,
-                        "doc_sec_id":      st.session_state.doc_sec_id,
-                        "doc_id":          st.session_state.selected_dept_id,
-                        "section_name":    sec,
-                        "doc_type":        st.session_state.selected_doc_type,
-                        "department":      st.session_state.selected_dept,
-                        "company_context": st.session_state.company_ctx,
-                        "num_sections":    total,
-                    }, timeout=120)
-
-                    if res:
-                        st.session_state.section_contents[sec] = res["content"]
-                        ids.append(sec_id)
-
-                    # Live counter update
-                    counter_slot.markdown(
-                        f"**{len(st.session_state.section_contents)} / {total} sections written**"
-                        f" · {len(skipped)} excluded")
-                    bar.progress((i+1)/total)
-
-                st.session_state.sec_ids_ordered = ids
-                bar.empty()
-                status.markdown("✅ All sections written!")
-
-                # Auto-assemble immediately — no second button needed
-                ctx    = st.session_state.company_ctx
-                lines  = []
-                for sec in active:
-                    c = st.session_state.section_contents.get(sec, "").strip()
-                    if c:
-                        lines += [sec.upper(), "-" * len(sec), "", c, "", ""]
-                full_doc = "\n".join(lines).strip()
-
-                pri_sec = ids[-1] if ids else 0
-                save_res = api_post("/document/save", {
-                    "doc_id":          st.session_state.selected_dept_id,
-                    "doc_sec_id":      st.session_state.doc_sec_id,
-                    "sec_id":          pri_sec,
-                    "gen_doc_sec_dec": list(st.session_state.section_contents.values()),
-                    "gen_doc_full":    full_doc,
-                })
-                st.session_state.gen_id       = save_res.get("gen_id", 0) if save_res else 0
-                st.session_state.full_document = full_doc
-                st.rerun()
-
-        if st.session_state.full_document:
-            st.success(f"✅ Document assembled — **{len(active)} sections** · gen_id: {st.session_state.gen_id}")
-            with st.expander("👁️ Preview", expanded=False):
-                st.text(st.session_state.full_document[:2000] + (
-                    "\n\n...(truncated)" if len(st.session_state.full_document) > 2000 else ""))
-            c1, c2 = st.columns([1, 3])
-            with c1:
-                if st.button("← Back"): st.session_state.step = 3; st.rerun()
-            with c2:
-                if st.button("Review & Edit →", type="primary", use_container_width=True):
-                    st.session_state.step = 5; st.rerun()
-
-
-    # ─── Step 5: Review & Edit ────────────────────────────────────────────────
-
-    elif st.session_state.step == 5:
-        st.markdown('<span class="step-badge">Step 5 of 6</span>', unsafe_allow_html=True)
+        st.markdown('<span class="step-badge">Step 4 of 5</span>', unsafe_allow_html=True)
         st.markdown("## 🔍 Review & Edit")
         st.markdown("---")
 
@@ -543,19 +557,23 @@ elif st.session_state.active_tab == "generate":
         with cl:
             st.markdown("### 📋 Sections")
             sel = st.radio("", active, label_visibility="collapsed", key="sec_radio")
-        with cr:
-            cur = contents.get(sel, "")
 
-            if is_tbl := st.session_state.section_questions.get(sel, {}).get("is_table"):
-                st.markdown(f"### 📊 {sel}")
-            else:
-                st.markdown(f"### ✏️ {sel}")
+        with cr:
+            cur      = contents.get(sel, "")
+            sec_type = st.session_state.section_questions.get(sel, {}).get("section_type", "text")
+
+            type_icons = {
+                "table": "📊", "flowchart": "🔀",
+                "raci": "👥", "signature": "✍️", "text": "✏️"
+            }
+            st.markdown(f"### {type_icons.get(sec_type, '✏️')} {sel}")
 
             with st.expander("📄 Current Content", expanded=True):
                 st.text(cur or "(no content)")
 
             st.markdown("---")
-            instr = st.text_area("🤖 AI edit instruction",
+            instr = st.text_area(
+                "🤖 AI edit instruction",
                 placeholder="e.g. Make more formal · Add detail · Shorten · Legal tone",
                 height=65, key="edit_instr")
 
@@ -568,34 +586,42 @@ elif st.session_state.active_tab == "generate":
                         with st.spinner("Editing..."):
                             res = api_post("/section/edit", {
                                 "gen_id":           st.session_state.gen_id or 0,
-                                "sec_id":           st.session_state.section_questions.get(sel,{}).get("sec_id",0),
+                                "sec_id":           st.session_state.section_questions.get(sel, {}).get("sec_id", 0),
                                 "section_name":     sel,
+                                "doc_type":         st.session_state.selected_doc_type,
                                 "current_content":  cur,
-                                "edit_instruction": instr}, timeout=120)
+                                "edit_instruction": instr,
+                            }, timeout=120)
                         if res:
                             st.session_state.section_contents[sel] = res["updated_content"]
-                            rebuild_doc(); st.success("✅ Updated!"); st.rerun()
+                            rebuild_doc()
+                            st.success("✅ Updated!")
+                            st.rerun()
             with c2:
-                # Dynamic key per section — prevents stale content bug
-                manual = st.text_area("📝 Manual edit:", value=cur,
-                                      height=200, key=f"manual_{sel}")
+                manual = st.text_area(
+                    "📝 Manual edit:",
+                    value=cur, height=200,
+                    key=f"manual_{sel}")
                 if st.button("💾 Save Manual", use_container_width=True, key=f"save_{sel}"):
                     st.session_state.section_contents[sel] = manual
-                    rebuild_doc(); st.success("✅ Saved!"); st.rerun()
+                    rebuild_doc()
+                    st.success("✅ Saved!")
+                    st.rerun()
 
         st.markdown("---")
         c1, c2 = st.columns([1, 3])
         with c1:
-            if st.button("← Back"): st.session_state.step = 4; st.rerun()
+            if st.button("← Back"):
+                st.session_state.step = 3; st.rerun()
         with c2:
             if st.button("Export →", type="primary", use_container_width=True):
-                st.session_state.step = 6; st.rerun()
+                st.session_state.step = 5; st.rerun()
 
 
-    # ─── Step 6: Export ───────────────────────────────────────────────────────
+    # ─── Step 5: Export ───────────────────────────────────────────────────────
 
-    elif st.session_state.step == 6:
-        st.markdown('<span class="step-badge">Step 6 of 6</span>', unsafe_allow_html=True)
+    elif st.session_state.step == 5:
+        st.markdown('<span class="step-badge">Step 5 of 5</span>', unsafe_allow_html=True)
         st.markdown("## 💾 Export")
         st.markdown("---")
 
@@ -607,8 +633,9 @@ elif st.session_state.active_tab == "generate":
         contents = st.session_state.section_contents
 
         if not full_doc:
-            st.error("No document found — go back to Step 4.")
-            if st.button("← Step 4"): st.session_state.step = 4; st.rerun()
+            st.error("No document found — go back to Step 3.")
+            if st.button("← Step 3"):
+                st.session_state.step = 3; st.rerun()
             st.stop()
 
         st.success(f"✅ **{doc_type}** ready for export!")
@@ -631,18 +658,20 @@ elif st.session_state.active_tab == "generate":
                     "doc_type":        doc_type,
                     "department":      st.session_state.selected_dept,
                     "gen_doc_full":    full_doc,
-                    "company_context": ctx})
+                    "company_context": ctx,
+                })
             if res:
-                url = res.get("notion_url","")
+                url = res.get("notion_url", "")
                 st.success("✅ Published to Notion!")
                 if url:
                     st.link_button("🔗 Open in Notion", url)
 
         st.markdown("---")
 
-        # ── Downloads — pre-generate bytes so single button click works ────────
+        # ── Downloads ──────────────────────────────────────────────────────────
         st.markdown("### 📥 Download")
-        safe = doc_type.replace(" ","_").replace("/","-").replace("(","").replace(")","")
+        safe = (doc_type.replace(" ", "_").replace("/", "-")
+                        .replace("(", "").replace(")", ""))
 
         c1, c2 = st.columns(2)
 
@@ -651,9 +680,8 @@ elif st.session_state.active_tab == "generate":
             if not DOCX_AVAILABLE:
                 st.warning("docx_builder.py not found.")
             else:
-                # Pre-generate docx bytes on step load — ready for immediate download
-                if "docx_bytes_cache" not in st.session_state or \
-                   st.session_state.get("docx_cache_doc") != doc_type:
+                if ("docx_bytes_cache" not in st.session_state or
+                        st.session_state.get("docx_cache_doc") != doc_type):
                     try:
                         sections_data = [
                             {"name": sec, "content": contents.get(sec, "")}
@@ -662,9 +690,9 @@ elif st.session_state.active_tab == "generate":
                         st.session_state.docx_bytes_cache = build_docx(
                             doc_type=doc_type,
                             department=st.session_state.selected_dept,
-                            company_name=ctx.get("company_name","Company"),
-                            industry=ctx.get("industry",""),
-                            region=ctx.get("region",""),
+                            company_name=ctx.get("company_name", "Company"),
+                            industry=ctx.get("industry", ""),
+                            region=ctx.get("region", ""),
                             sections=sections_data,
                         )
                         st.session_state.docx_cache_doc = doc_type
@@ -684,7 +712,6 @@ elif st.session_state.active_tab == "generate":
 
         with c2:
             st.markdown("**📃 Plain Text (.txt)**")
-
             st.download_button(
                 "⬇️ Download .txt",
                 data=full_doc,

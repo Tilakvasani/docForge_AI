@@ -1,17 +1,36 @@
 """
-DocForge AI — notion_service.py
-- Publishes plain-text documents to Notion with metadata callout block at top
-- gen_doc_full contains ONLY section content (no metadata)
-- Notion page gets: metadata callout + section headings + content
-- Library fetch for sidebar
+DocForge AI — notion_service.py  v3.0
+════════════════════════════════════════════════════════════════
+Flowchart rendering strategy:
+  - Mermaid blocks → PNG via flowchart_renderer.py
+  - PNG uploaded to Imgur (anonymous, free, permanent URL)
+  - Notion image block embeds the Imgur URL → renders as real visual
+  - Fallback: if upload fails → numbered step list callout
+
+Setup (one time):
+  1. Go to https://api.imgur.com/oauth2/addclient
+  2. Register → "Anonymous usage without user authorization"
+  3. Add IMGUR_CLIENT_ID=your_client_id to your .env file
+  4. If not set → falls back to step-list rendering (no image)
 """
+
+import re
+import base64
 import httpx
 import asyncio
+from typing import Optional
 from backend.core.config import settings
 from backend.core.logger import logger
 from backend.schemas.document_schema import NotionPublishRequest
 
-NOTION_API_URL = "https://api.notion.com/v1"
+try:
+    from flowchart_renderer import mermaid_to_png_bytes
+    FLOWCHART_RENDERER_AVAILABLE = True
+except ImportError:
+    FLOWCHART_RENDERER_AVAILABLE = False
+
+NOTION_API_URL  = "https://api.notion.com/v1"
+IMGUR_UPLOAD_URL = "https://api.imgur.com/3/image"
 
 DEPT_MAP = {
     "HR": "HR", "Human Resources": "HR",
@@ -23,6 +42,10 @@ DEPT_MAP = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  NOTION HEADERS
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _headers() -> dict:
     return {
         "Authorization": f"Bearer {settings.NOTION_API_KEY}",
@@ -31,17 +54,60 @@ def _headers() -> dict:
     }
 
 
-def _txt(content: str, bold: bool = False) -> dict:
-    """Shorthand for a rich_text text object."""
-    obj = {"type": "text", "text": {"content": content}}
-    if bold:
-        obj["annotations"] = {"bold": True}
-    return obj
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMGUR UPLOAD — PNG bytes → public image URL
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _upload_png_to_imgur(png_bytes: bytes, title: str = "") -> Optional[str]:
+    """
+    Upload PNG to Imgur anonymously and return the direct image URL.
+    Returns None if IMGUR_CLIENT_ID is not set or upload fails.
+    """
+    client_id = getattr(settings, "IMGUR_CLIENT_ID", None)
+    if not client_id:
+        logger.warning("IMGUR_CLIENT_ID not configured — flowchart will render as step list")
+        return None
+
+    try:
+        b64 = base64.b64encode(png_bytes).decode("utf-8")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                IMGUR_UPLOAD_URL,
+                headers={"Authorization": f"Client-ID {client_id}"},
+                json={
+                    "image": b64,
+                    "type": "base64",
+                    "title": title or "DocForge AI Flowchart",
+                    "description": f"Process flow diagram — {title}",
+                }
+            )
+        if resp.status_code == 200:
+            url = resp.json().get("data", {}).get("link", "")
+            if url:
+                logger.info(f"Imgur upload OK: {url}")
+                return url
+        logger.warning(f"Imgur upload failed {resp.status_code}: {resp.text[:200]}")
+        return None
+    except Exception as e:
+        logger.warning(f"Imgur upload exception: {e}")
+        return None
 
 
-def _para(content: str, bold: bool = False) -> dict:
+# ─────────────────────────────────────────────────────────────────────────────
+#  NOTION BLOCK HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _txt(content: str, bold=False, italic=False, code=False, color="default") -> dict:
+    return {
+        "type": "text",
+        "text": {"content": content},
+        "annotations": {"bold": bold, "italic": italic, "code": code, "color": color}
+    }
+
+
+def _para(content: str, bold=False) -> dict:
     return {"object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": [_txt(content, bold)]}}
+            "paragraph": {"rich_text": [_txt(content, bold=bold)]}}
 
 
 def _heading2(content: str) -> dict:
@@ -53,8 +119,22 @@ def _divider() -> dict:
     return {"object": "block", "type": "divider", "divider": {}}
 
 
-def _callout(lines: list[str]) -> dict:
-    """Build a grey callout block with metadata lines."""
+def _image_block(url: str, caption: str = "") -> dict:
+    """Notion external image block — renders as a real visual image."""
+    block = {
+        "object": "block",
+        "type": "image",
+        "image": {
+            "type": "external",
+            "external": {"url": url},
+        }
+    }
+    if caption:
+        block["image"]["caption"] = [_txt(caption, italic=True)]
+    return block
+
+
+def _callout(lines: list, emoji: str = "📋", color: str = "gray_background") -> dict:
     rich = []
     for i, line in enumerate(lines):
         if ':' in line:
@@ -65,33 +145,26 @@ def _callout(lines: list[str]) -> dict:
             rich.append(_txt(line + ("\n" if i < len(lines) - 1 else "")))
     return {
         "object": "block", "type": "callout",
-        "callout": {
-            "rich_text": rich,
-            "icon": {"type": "emoji", "emoji": "📋"},
-            "color": "gray_background",
-        }
+        "callout": {"rich_text": rich,
+                    "icon": {"type": "emoji", "emoji": emoji},
+                    "color": color}
     }
 
 
-def _table_to_notion(table_lines: list[str]) -> dict | None:
-    """Convert pipe-format table lines to a Notion table block."""
+def _table_to_notion(table_lines: list) -> Optional[dict]:
     rows = []
     for line in table_lines:
         if all(c in '-|: ' for c in line):
-            continue   # skip separator row
+            continue
         if '|' not in line:
             continue
         cells = [c.strip() for c in line.strip().strip('|').split('|')]
         if cells:
             rows.append(cells)
-
     if not rows:
         return None
-
     col_count = max(len(r) for r in rows)
-    # Pad shorter rows
     rows = [r + [''] * (col_count - len(r)) for r in rows]
-
     return {
         "object": "block", "type": "table",
         "table": {
@@ -99,114 +172,209 @@ def _table_to_notion(table_lines: list[str]) -> dict | None:
             "has_column_header": True,
             "has_row_header": False,
             "children": [
-                {
-                    "object": "block", "type": "table_row",
-                    "table_row": {
-                        "cells": [[_txt(cell)] for cell in row]
-                    }
-                }
+                {"object": "block", "type": "table_row",
+                 "table_row": {"cells": [[_txt(cell)] for cell in row]}}
                 for row in rows
             ]
         }
     }
 
 
-def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list[dict]:
-    """
-    Convert plain-text document (sections only, no metadata) to Notion blocks.
-    Structure expected:
-      SECTION NAME
-      -----------
-      content text...
+# ─────────────────────────────────────────────────────────────────────────────
+#  MERMAID → NOTION BLOCKS
+# ─────────────────────────────────────────────────────────────────────────────
 
-      NEXT SECTION
-      ------------
-      content...
-    """
-    blocks = [meta_callout, _divider()]
-    lines  = plain_text.split('\n')
-    i      = 0
-
-    while i < len(lines):
-        line     = lines[i]
-        stripped = line.strip()
-
-        if not stripped:
-            i += 1
+def _parse_mermaid_steps(mermaid_text: str) -> list:
+    steps, seen = [], set()
+    rounded_re  = re.compile(r'\w+\(\[([^\]\)]+)\]\)')
+    diamond_re  = re.compile(r'\w+\{([^\}]+)\}')
+    rect_re     = re.compile(r'\w+\[([^\]]+)\]')
+    for line in mermaid_text.strip().split('\n'):
+        line = line.strip()
+        if not line or line.startswith('flowchart') or line.startswith('graph'):
             continue
+        for m in rounded_re.finditer(line):
+            lbl = m.group(1).strip()
+            if lbl not in seen:
+                seen.add(lbl)
+                steps.append({'label': lbl, 'is_terminal': True, 'is_decision': False})
+        for m in diamond_re.finditer(line):
+            lbl = m.group(1).strip()
+            if lbl not in seen:
+                seen.add(lbl)
+                steps.append({'label': lbl, 'is_terminal': False, 'is_decision': True})
+        for m in rect_re.finditer(line):
+            lbl = m.group(1).strip()
+            if lbl not in seen:
+                seen.add(lbl)
+                steps.append({'label': lbl, 'is_terminal': False, 'is_decision': False})
+    return steps
 
-        # Section heading: ALL CAPS line followed by a dash-only line
-        next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
-        is_heading = (stripped.isupper() and len(stripped) > 2
-                      and next_line and all(c == '-' for c in next_line))
 
-        if is_heading:
-            blocks.append(_heading2(stripped))
-            i += 2  # skip heading + dash line
-            continue
-
-        # Pure dash separator line — skip (already handled above or standalone)
-        if all(c == '-' for c in stripped):
-            i += 1
-            continue
-
-        # Table block: collect all contiguous pipe lines
-        if '|' in stripped:
-            table_lines = []
-            while i < len(lines) and ('|' in lines[i] or
-                  (lines[i].strip() and all(c in '-|: ' for c in lines[i]))):
-                table_lines.append(lines[i])
-                i += 1
-            tbl = _table_to_notion(table_lines)
-            if tbl:
-                blocks.append(tbl)
-            continue
-
-        # Numbered list line
-        import re
-        num_match = re.match(r'^(\d+)[.)]\s+(.+)$', stripped)
-        if num_match:
-            blocks.append({
-                "object": "block", "type": "numbered_list_item",
-                "numbered_list_item": {"rich_text": [_txt(num_match.group(2))]}
-            })
-            i += 1
-            continue
-
-        # Bullet line
-        bullet_match = re.match(r'^[-•]\s+(.+)$', stripped)
-        if bullet_match:
+def _mermaid_fallback_blocks(mermaid_text: str, section_name: str = "") -> list:
+    """Fallback: render flowchart as step-list callout when image upload unavailable."""
+    blocks = [{
+        "object": "block", "type": "callout",
+        "callout": {
+            "rich_text": [
+                _txt("Process Flow Diagram", bold=True),
+                _txt(f" — {section_name}" if section_name else ""),
+            ],
+            "icon": {"type": "emoji", "emoji": "🔀"},
+            "color": "blue_background",
+        }
+    }]
+    step_num = 1
+    for step in _parse_mermaid_steps(mermaid_text):
+        label = step['label']
+        if step['is_terminal']:
+            icon = "🟢" if step_num == 1 else "🏁"
             blocks.append({
                 "object": "block", "type": "bulleted_list_item",
-                "bulleted_list_item": {"rich_text": [_txt(bullet_match.group(1))]}
+                "bulleted_list_item": {"rich_text": [_txt(f"{icon}  {label}", bold=True)]}
             })
-            i += 1
+        elif step['is_decision']:
+            blocks.append({
+                "object": "block", "type": "numbered_list_item",
+                "numbered_list_item": {"rich_text": [_txt(f"❓ Decision: {label}", bold=True)]}
+            })
+            step_num += 1
+        else:
+            blocks.append({
+                "object": "block", "type": "numbered_list_item",
+                "numbered_list_item": {"rich_text": [_txt(label)]}
+            })
+            step_num += 1
+    blocks.append(_divider())
+    return blocks
+
+
+async def _mermaid_to_notion_blocks(mermaid_text: str, section_name: str = "") -> list:
+    """
+    Convert Mermaid flowchart to Notion blocks.
+    Tries: render PNG → upload to Imgur → Notion image block
+    Falls back to: numbered step list callout
+    """
+    if FLOWCHART_RENDERER_AVAILABLE:
+        try:
+            png_bytes = mermaid_to_png_bytes(mermaid_text, title=section_name, dpi=180)
+            img_url   = await _upload_png_to_imgur(png_bytes, title=section_name)
+            if img_url:
+                caption = f"Figure: {section_name} — Process Flow Diagram" if section_name else "Process Flow Diagram"
+                return [
+                    _divider(),
+                    _image_block(img_url, caption=caption),
+                    _divider(),
+                ]
+        except Exception as e:
+            logger.warning(f"Flowchart image pipeline failed: {e}")
+
+    return _mermaid_fallback_blocks(mermaid_text, section_name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PLAIN TEXT → NOTION BLOCKS  (async for image uploads)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
+    blocks          = [meta_callout, _divider()]
+    mermaid_pattern = re.compile(r'```mermaid(.*?)```', re.DOTALL)
+    segments        = mermaid_pattern.split(plain_text)
+    current_section = ""
+
+    for seg_idx, segment in enumerate(segments):
+
+        # Mermaid block → image or fallback
+        if seg_idx % 2 == 1:
+            blocks.extend(await _mermaid_to_notion_blocks(segment.strip(), current_section))
             continue
 
-        # Regular paragraph — collect until blank line or heading
-        para_lines = []
+        # Regular text
+        lines = segment.split('\n')
+        i     = 0
         while i < len(lines):
-            cur = lines[i].strip()
-            if not cur:
-                break
-            # Stop if next looks like a heading
-            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
-            if cur.isupper() and nxt and all(c == '-' for c in nxt):
-                break
-            para_lines.append(cur)
-            i += 1
+            line     = lines[i]
+            stripped = line.strip()
 
-        if para_lines:
-            text = ' '.join(para_lines)
-            # Chunk at 1900 chars for Notion's limit
-            for chunk in [text[j:j+1900] for j in range(0, len(text), 1900)]:
-                blocks.append(_para(chunk))
+            if not stripped:
+                i += 1
+                continue
+
+            # Section heading (ALL CAPS + dash line)
+            next_line  = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            is_heading = (stripped.isupper() and len(stripped) > 2
+                          and next_line and all(c == '-' for c in next_line))
+            if is_heading:
+                current_section = stripped
+                blocks.append(_heading2(stripped))
+                i += 2
+                continue
+
+            # Standalone dash separator
+            if all(c == '-' for c in stripped) and len(stripped) > 2:
+                i += 1
+                continue
+
+            # Pipe table
+            if '|' in stripped:
+                table_lines = []
+                while i < len(lines) and (
+                    '|' in lines[i] or
+                    (lines[i].strip() and all(c in '-|: ' for c in lines[i]))
+                ):
+                    table_lines.append(lines[i])
+                    i += 1
+                tbl = _table_to_notion(table_lines)
+                if tbl:
+                    blocks.append(tbl)
+                continue
+
+            # Numbered list
+            num_match = re.match(r'^(\d+)[.)]\s+(.+)$', stripped)
+            if num_match:
+                blocks.append({
+                    "object": "block", "type": "numbered_list_item",
+                    "numbered_list_item": {"rich_text": [_txt(num_match.group(2))]}
+                })
+                i += 1
+                continue
+
+            # Bullet list
+            bullet_match = re.match(r'^[-•]\s+(.+)$', stripped)
+            if bullet_match:
+                blocks.append({
+                    "object": "block", "type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": [_txt(bullet_match.group(1))]}
+                })
+                i += 1
+                continue
+
+            # Regular paragraph
+            para_lines = []
+            while i < len(lines):
+                cur = lines[i].strip()
+                if not cur:
+                    break
+                if '|' in cur or cur.startswith('```'):
+                    break
+                nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                if cur.isupper() and nxt and all(c == '-' for c in nxt):
+                    break
+                para_lines.append(cur)
+                i += 1
+            if para_lines:
+                text = ' '.join(para_lines)
+                for chunk in [text[j:j + 1900] for j in range(0, len(text), 1900)]:
+                    blocks.append(_para(chunk))
 
     return blocks
 
 
-async def _post_blocks_in_batches(page_id: str, blocks: list[dict]):
-    """Append blocks to a Notion page in batches of 100 (API limit)."""
+# ─────────────────────────────────────────────────────────────────────────────
+#  BATCH BLOCK APPENDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _post_blocks_in_batches(page_id: str, blocks: list):
     async with httpx.AsyncClient(timeout=30) as client:
         for start in range(0, len(blocks), 100):
             batch = blocks[start:start + 100]
@@ -224,6 +392,10 @@ async def _post_blocks_in_batches(page_id: str, blocks: list[dict]):
                 logger.error(f"Block append error {resp.status_code}: {resp.text[:200]}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  PUBLISH TO NOTION
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def publish_to_notion(request: NotionPublishRequest) -> dict:
     ctx        = request.company_context or {}
     company    = ctx.get("company_name", "Company")
@@ -233,10 +405,10 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
     title      = f"{request.doc_type} — {company}"
     dept       = DEPT_MAP.get(request.department, "Operations")
     word_count = len(request.gen_doc_full.split())
+    fc_count   = len(re.findall(r'```mermaid', request.gen_doc_full))
 
-    logger.info(f"Publishing to Notion: '{title}' | dept={dept} | words={word_count}")
+    logger.info(f"Publishing: '{title}' | dept={dept} | words={word_count} | flowcharts={fc_count}")
 
-    # Build metadata callout (shown in Notion, NOT in downloaded doc)
     meta_lines = [
         f"Organization: {company}",
         f"Department: {request.department}",
@@ -247,12 +419,13 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
         "Classification: Internal Use Only",
         "Generated by: DocForge AI",
     ]
-    meta_callout = _callout([l for l in meta_lines if l.split(': ', 1)[-1].strip()])
+    meta_callout = _callout(
+        [l for l in meta_lines if l.split(': ', 1)[-1].strip()],
+        emoji="📋", color="gray_background"
+    )
 
-    # Convert plain text to Notion blocks
-    all_blocks = _plain_text_to_blocks(request.gen_doc_full, meta_callout)
+    all_blocks = await _plain_text_to_blocks(request.gen_doc_full, meta_callout)
 
-    # Step 1: Create page with properties only (no children — avoids 100-block limit on create)
     payload = {
         "parent":     {"database_id": settings.NOTION_DATABASE_ID},
         "properties": {
@@ -285,16 +458,18 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
     page_id = data.get("id", "")
     url     = data.get("url", "")
 
-    # Step 2: Append content blocks in batches of 100
     if all_blocks:
         await _post_blocks_in_batches(page_id, all_blocks)
 
-    logger.info(f"Published: {url}")
+    logger.info(f"Published: {url} | blocks={len(all_blocks)}")
     return {"notion_url": url, "notion_page_id": page_id}
 
 
-async def fetch_library_from_notion() -> list[dict]:
-    """Fetch all pages from the Notion database for the library tab."""
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIBRARY FETCH
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def fetch_library_from_notion() -> list:
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{NOTION_API_URL}/databases/{settings.NOTION_DATABASE_ID}/query",
@@ -302,7 +477,6 @@ async def fetch_library_from_notion() -> list[dict]:
             json={"sorts": [{"property": "Created At", "direction": "descending"}],
                   "page_size": 50},
         )
-
     if resp.status_code != 200:
         logger.error(f"Library fetch error: {resp.status_code}")
         return []
@@ -329,5 +503,4 @@ async def fetch_library_from_notion() -> list[dict]:
             "notion_url": page.get("url", ""),
             "created_at": page.get("created_time", "")[:10],
         })
-
     return library
