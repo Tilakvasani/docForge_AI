@@ -472,8 +472,225 @@ DOC_STRUCTURE_METADATA = {
     },
 }
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  QUESTION GENERATION PROMPTS
+#  HELPER UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHASE 1 — QUESTION GENERATION PROMPT
+#  Called when sections are fetched from DB and sent to LLM to generate
+#  contextual questions section by section. Questions saved back to DB.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PHASE_1_QUESTION_GEN_PROMPT = """You are DocForge AI — an expert enterprise documentation specialist.
+
+Your task: Generate smart, targeted questions for ONE SECTION of a professional business document.
+These questions will be shown to the user in the UI. Their answers will be used to generate a
+complete industry-standard document.
+
+DOCUMENT TYPE: {doc_type}
+DEPARTMENT: {department}
+INDUSTRY: {industry}
+COMPANY SIZE: {company_size}
+
+CURRENT SECTION: {section_name}
+SECTION PURPOSE: {section_purpose}
+
+REQUIREMENTS:
+1. Generate exactly {question_count} questions for this section.
+2. Questions must be specific to {doc_type} — not generic.
+3. Ask for concrete details: names, dates, numbers, percentages, policies, procedures.
+4. Use plain, professional English. No jargon.
+5. Each question should unlock a different piece of information needed for this section.
+6. Order questions from most important to least important.
+7. Do NOT ask for information already covered in previous sections: {completed_sections}
+
+OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no preamble:
+{{
+  "section": "{section_name}",
+  "questions": [
+    {{
+      "key": "unique_snake_case_key",
+      "label": "Clear question text shown to user",
+      "input_type": "text|textarea|date|number|select",
+      "placeholder": "Example answer to guide the user",
+      "required": true
+    }}
+  ]
+}}"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHASE 2 — FULL DOCUMENT GENERATION PROMPT
+#  Called after ALL section answers are collected from the user.
+#  All Q&A data + user inputs are combined and sent to LLM in one call.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PHASE_2_DOCUMENT_GEN_PROMPT = """You are DocForge AI — an enterprise documentation specialist with 20+ years of experience
+creating industry-standard business documents across all departments and industries.
+
+════════════════════════════════════════════════════════════
+DOCUMENT BRIEF
+════════════════════════════════════════════════════════════
+Document Type   : {doc_type}
+Department      : {department}
+Industry        : {industry}
+Company Name    : {company_name}
+Company Size    : {company_size}
+Document Purpose: {doc_purpose}
+Tone            : {tone}
+
+════════════════════════════════════════════════════════════
+USER-PROVIDED INFORMATION (Answers by Section)
+════════════════════════════════════════════════════════════
+{answers_block}
+
+════════════════════════════════════════════════════════════
+DOCUMENT SECTIONS TO GENERATE (from database)
+════════════════════════════════════════════════════════════
+{section_list}
+
+════════════════════════════════════════════════════════════
+STRUCTURAL REQUIREMENTS FOR THIS DOCUMENT TYPE
+════════════════════════════════════════════════════════════
+{structure_instructions}
+
+════════════════════════════════════════════════════════════
+GENERATION RULES — FOLLOW EXACTLY
+════════════════════════════════════════════════════════════
+FORMATTING:
+1. Start with a professional document header:
+   - Company name and logo placeholder: [COMPANY LOGO]
+   - Document title (bold, centered)
+   - Document reference number: DOC-{department_code}-[AUTO]
+   - Version, Date, Prepared By, Approved By
+   - Horizontal rule (---)
+
+2. Use ## for each section heading (exactly matching the section names from the database).
+3. Write 200–350 words per section — expand user answers into professional prose.
+   Do NOT copy user answers verbatim. Transform them into polished business language.
+4. Maintain consistent terminology throughout (e.g., always use the same job title,
+   company name, product name as provided).
+
+CONTENT QUALITY:
+5. Write as a subject matter expert, not as a template filler.
+6. Include specific details from user answers — dates, names, numbers, percentages.
+7. For any field marked "Not provided", use a realistic professional placeholder in [brackets].
+8. Legal and compliance language should be precise and unambiguous.
+9. Each section must flow logically into the next.
+
+TABLES & DIAGRAMS (only include what STRUCTURE REQUIREMENTS specifies):
+10. Tables: Use markdown table format with bold column headers. Include realistic data rows.
+11. Flowcharts: Use Mermaid.js ```mermaid code block. Direction: TD. Min 5 nodes.
+12. RACI: Full matrix covering all key activities for this document type.
+13. All tables must be complete — no empty cells, use "N/A" or "TBD" where appropriate.
+
+SIGN-OFF:
+14. Always end with an ## Approvals & Sign-off section with a signature table if required.
+15. The final line should be: *This document is confidential and intended solely for the
+    named recipients. Unauthorised distribution is prohibited.*
+
+Generate the complete, professional {doc_type} now:"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHASE 3A — SECTION ENHANCEMENT PROMPT
+#  Called when user clicks "Enhance" on a single section in the editor.
+#  Only that section's content is sent to the LLM.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PHASE_3A_SECTION_ENHANCE_PROMPT = """You are DocForge AI — an enterprise documentation specialist.
+
+Your task: ENHANCE a single section of an existing business document.
+
+DOCUMENT TYPE: {doc_type}
+DEPARTMENT: {department}
+SECTION NAME: {section_name}
+
+CURRENT SECTION CONTENT:
+\"\"\"
+{current_section_content}
+\"\"\"
+
+ENHANCEMENT INSTRUCTIONS:
+1. Preserve all factual information (names, dates, numbers, percentages).
+2. Improve professional tone and readability.
+3. Expand thin content to 200–350 words with industry-appropriate language.
+4. Add structure if missing: sub-headings, bullet points, or numbered lists where appropriate.
+5. Strengthen opening and closing sentences.
+6. Remove redundant phrases and tighten language.
+7. If this section should contain a table based on its context, add one.
+8. Do NOT change the meaning or intent of any statement.
+9. Do NOT add new facts that were not in the original.
+
+OUTPUT: Return ONLY the enhanced section content (starting from the section heading ##).
+Do not include any preamble, explanation, or surrounding context."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHASE 3B — SECTION EDIT PROMPT
+#  Called when user makes a specific edit instruction via text input.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PHASE_3B_SECTION_EDIT_PROMPT = """You are DocForge AI — an enterprise documentation specialist.
+
+Your task: EDIT a single section of a business document based on specific user instructions.
+
+DOCUMENT TYPE: {doc_type}
+DEPARTMENT: {department}
+SECTION NAME: {section_name}
+
+CURRENT SECTION CONTENT:
+\"\"\"
+{current_section_content}
+\"\"\"
+
+USER'S EDIT INSTRUCTION:
+\"{edit_instruction}\"
+
+EDITING RULES:
+1. Apply the edit instruction precisely and completely.
+2. Preserve all content that the instruction does NOT ask to change.
+3. Maintain the professional tone and document style.
+4. Keep section length appropriate (150–350 words unless instruction specifies otherwise).
+5. If the instruction is ambiguous, apply the most reasonable professional interpretation.
+
+OUTPUT: Return ONLY the edited section content (starting from the section heading ##).
+Do not include any preamble, explanation, or note about what was changed."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHASE 4 — FULL DOCUMENT RE-GENERATION (for credits/re-run)
+#  Same as Phase 2 but triggered by user requesting a full regeneration
+#  after edits. Passes current edited sections as context.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PHASE_4_REGEN_PROMPT = """You are DocForge AI — an enterprise documentation specialist.
+
+The user has requested a full document regeneration based on their edited sections.
+Regenerate the complete document using the edited content as the authoritative source of information.
+
+DOCUMENT TYPE: {doc_type}
+DEPARTMENT: {department}
+INDUSTRY: {industry}
+COMPANY NAME: {company_name}
+
+CURRENT EDITED SECTIONS (use these as the source of truth):
+{edited_sections_block}
+
+SECTIONS TO REGENERATE:
+{section_list}
+
+STRUCTURAL REQUIREMENTS:
+{structure_instructions}
+
+Apply all the same formatting, table, flowchart, and sign-off rules as the original generation.
+Improve consistency, tone, and flow across sections. Do NOT invent new facts.
+
+Generate the complete regenerated {doc_type} now:"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  QUESTION GENERATION PROMPTS  (moved from generator.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
 from langchain_core.prompts import PromptTemplate
@@ -600,7 +817,7 @@ Respond now:"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SECTION CONTENT GENERATION PROMPTS
+#  SECTION CONTENT GENERATION PROMPTS  (moved from generator.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Text ──────────────────────────────────────────────────────────────────────
@@ -790,7 +1007,7 @@ Write now:"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  EDIT PROMPT
+#  EDIT PROMPT  (moved from generator.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
 EDIT_PROMPT = PromptTemplate(
@@ -814,4 +1031,66 @@ OUTPUT RULES based on section type:
 
 Apply the edit instruction to the content above and return ONLY the updated content.
 Do not add explanations, preambles, or notes about what changed."""
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ADD SECTION PROMPT  (moved from generator.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ADD_SECTION_PROMPT = PromptTemplate(
+    input_variables=["doc_type", "department", "section_name",
+                     "company_name", "industry", "region",
+                     "existing_sections", "target_words"],
+    template="""You are a professional enterprise documentation writer.
+
+A new section called "{section_name}" needs to be added to an existing {doc_type}.
+
+Company: {company_name} | Dept: {department} | Industry: {industry} | Region: {region}
+
+Existing sections in this document (for context):
+{existing_sections}
+
+STRICT RULES:
+1. Write EXACTLY {target_words} words — hard limit
+2. PLAIN TEXT ONLY — no asterisks, no # symbols, no backticks
+3. Content must be directly relevant to "{section_name}" in a {doc_type}
+4. Match the tone and style of a {department} department document
+5. Do NOT include the section heading in your output
+6. Do NOT repeat content already covered in the existing sections
+
+Write the "{section_name}" section now:"""
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION RELEVANCE CHECK PROMPT
+#  Returns YES or NO — used to validate if a new section name makes sense
+#  for the given document type before generating content.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SECTION_RELEVANCE_PROMPT = PromptTemplate(
+    input_variables=["section_name", "doc_type", "department", "existing_sections"],
+    template="""You are an expert enterprise documentation specialist.
+
+A user wants to add a new section called "{section_name}" to a {doc_type} document
+in the {department} department.
+
+Existing sections already in the document:
+{existing_sections}
+
+TASK: Decide if "{section_name}" is a valid, relevant section for this document.
+
+A section is VALID if:
+- It is relevant to the purpose of a {doc_type}
+- It belongs in the {department} department context
+- It is not completely unrelated (e.g. "Recipe for pasta" in an HR policy is invalid)
+- It is not a duplicate of an existing section
+
+A section is INVALID if:
+- It has nothing to do with {doc_type} or {department}
+- It is gibberish or random text
+- It duplicates an existing section exactly
+
+Respond with ONLY one word: YES or NO"""
 )

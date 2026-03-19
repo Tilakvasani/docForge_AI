@@ -260,10 +260,3 @@ def mermaid_to_png_bytes(mermaid_text: str, title: str = "", dpi: int = 180) -> 
     plt.close(fig)
     buf.seek(0)
     return buf.read()
-
-
-def extract_and_render_flowcharts(content: str, section_name: str = "") -> List[bytes]:
-    """Find all mermaid blocks in content and render each to PNG bytes."""
-    pattern = re.compile(r'```mermaid(.*?)```', re.DOTALL)
-    return [mermaid_to_png_bytes(m.group(1), title=section_name)
-            for m in pattern.finditer(content)]

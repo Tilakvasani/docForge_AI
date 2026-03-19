@@ -4,7 +4,6 @@ DocForge AI — document_utils.py  v2.1
   2. DOC_WORD_TARGETS             — industry-standard total word counts
   3. get_words_per_section()      — per-section target words
   4. SECTIONS_NEEDING_TABLES      — patterns for sections that require a table
-  5. build_plain_text_document()  — assemble full plain-text doc
 """
 import re
 from typing import Dict, List
@@ -282,24 +281,3 @@ def get_words_per_section(doc_type: str, num_sections: int) -> int:
     total = DOC_WORD_TARGETS.get(doc_type, DEFAULT_TOTAL_WORDS)
     per   = total // max(num_sections, 1)
     return max(20, min(320, per))
-
-
-# ─── Plain Text Document Assembler ────────────────────────────────────────────
-
-def build_plain_text_document(
-    doc_type: str,
-    department: str,
-    company_name: str,
-    industry: str,
-    region: str,
-    active_sections: List[str],
-    section_contents: Dict[str, str],
-) -> str:
-    """Assemble plain-text document — sections only, no metadata header."""
-    lines = []
-    for sec in active_sections:
-        content = section_contents.get(sec, "").strip()
-        if not content:
-            continue
-        lines += [sec.upper(), "-" * len(sec), "", content, "", ""]
-    return "\n".join(lines).strip()

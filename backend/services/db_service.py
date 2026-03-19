@@ -46,17 +46,6 @@ async def get_all_departments() -> List[Dict]:
     return [dict(r) for r in rows]
 
 
-async def get_department_by_id(doc_id: int) -> Optional[Dict]:
-    """Get a single department row."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT doc_id, department, doc_types FROM depart WHERE doc_id = $1",
-            doc_id
-        )
-    return dict(row) if row else None
-
-
 # ─── TABLE: document_section ─────────────────────────────────────────────────
 
 async def get_sections_by_doc_type(doc_type: str) -> Optional[Dict]:
@@ -66,17 +55,6 @@ async def get_sections_by_doc_type(doc_type: str) -> Optional[Dict]:
         row = await conn.fetchrow(
             "SELECT doc_sec_id, doc_type, doc_sec FROM document_section WHERE doc_type = $1",
             doc_type
-        )
-    return dict(row) if row else None
-
-
-async def get_sections_by_id(doc_sec_id: int) -> Optional[Dict]:
-    """Get document_section row by primary key."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT doc_sec_id, doc_type, doc_sec FROM document_section WHERE doc_sec_id = $1",
-            doc_sec_id
         )
     return dict(row) if row else None
 
@@ -159,28 +137,6 @@ async def get_qa_by_sec_id(sec_id: int) -> Optional[Dict]:
     return result
 
 
-async def get_all_qa_for_document(doc_sec_id: int, doc_id: int) -> List[Dict]:
-    """Fetch all Q&A rows for a full document (all sections)."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT sec_id, doc_sec_id, doc_id, doc_sec_que_ans
-            FROM section_que_ans
-            WHERE doc_sec_id = $1 AND doc_id = $2
-            ORDER BY sec_id
-            """,
-            doc_sec_id, doc_id
-        )
-    result = []
-    for row in rows:
-        r = dict(row)
-        if isinstance(r["doc_sec_que_ans"], str):
-            r["doc_sec_que_ans"] = json.loads(r["doc_sec_que_ans"])
-        result.append(r)
-    return result
-
-
 # ─── TABLE: gen_doc ───────────────────────────────────────────────────────────
 
 async def save_generated_document(
@@ -241,19 +197,3 @@ async def get_generated_document(gen_id: int) -> Optional[Dict]:
             gen_id
         )
     return dict(row) if row else None
-
-
-async def get_all_generated_documents(doc_id: Optional[int] = None) -> List[Dict]:
-    """Fetch all generated documents, optionally filtered by department doc_id."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if doc_id:
-            rows = await conn.fetch(
-                "SELECT gen_id, doc_id, doc_sec_id, sec_id, gen_doc_full FROM gen_doc WHERE doc_id = $1 ORDER BY gen_id DESC",
-                doc_id
-            )
-        else:
-            rows = await conn.fetch(
-                "SELECT gen_id, doc_id, doc_sec_id, sec_id, gen_doc_full FROM gen_doc ORDER BY gen_id DESC"
-            )
-    return [dict(r) for r in rows]

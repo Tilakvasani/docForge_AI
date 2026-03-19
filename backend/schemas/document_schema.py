@@ -11,14 +11,6 @@ class GenerateQuestionsRequest(BaseModel):
     company_context: Optional[Dict[str, str]] = {}
 
 
-class GenerateQuestionsResponse(BaseModel):
-    sec_id: int
-    doc_sec_id: int
-    doc_id: int
-    section_name: str
-    questions: List[str]
-
-
 class SaveAnswersRequest(BaseModel):
     sec_id: int
     doc_sec_id: int
@@ -26,12 +18,6 @@ class SaveAnswersRequest(BaseModel):
     section_name: str
     questions: List[str]
     answers: List[str]
-
-
-class SaveAnswersResponse(BaseModel):
-    sec_id: int
-    section_name: str
-    saved: bool
 
 
 class GenerateSectionRequest(BaseModel):
@@ -45,12 +31,6 @@ class GenerateSectionRequest(BaseModel):
     num_sections: Optional[int] = 10
 
 
-class GenerateSectionResponse(BaseModel):
-    sec_id: int
-    section_name: str
-    content: str
-
-
 class EditSectionRequest(BaseModel):
     gen_id: int
     sec_id: int
@@ -59,20 +39,9 @@ class EditSectionRequest(BaseModel):
     edit_instruction: str
 
 
-class EditSectionResponse(BaseModel):
-    sec_id: int
-    section_name: str
-    updated_content: str
-
-
 class NotionPublishRequest(BaseModel):
     gen_id: int
     doc_type: str
     department: str
     gen_doc_full: str
     company_context: Optional[Dict[str, str]] = {}
-
-
-class NotionPublishResponse(BaseModel):
-    notion_url: str
-    notion_page_id: str

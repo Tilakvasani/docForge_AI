@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Optional
 
 from backend.core.logger import logger
 from backend.services.db_service import (
@@ -10,6 +10,7 @@ from backend.services.db_service import (
 from backend.services.generator import (
     generate_questions, save_user_answers,
     generate_section_content, edit_section,
+    enhance_full_document, add_new_section,
 )
 from backend.services.notion_service import publish_to_notion, fetch_library_from_notion
 from backend.schemas.document_schema import (
@@ -28,6 +29,22 @@ class SaveDocRequest(BaseModel):
     sec_id: int
     gen_doc_sec_dec: List[str]
     gen_doc_full: str
+
+
+class EnhanceFullDocRequest(BaseModel):
+    doc_type: str
+    department: str
+    company_context: Dict = {}
+    sections: Dict[str, str]      # {section_name: current_content}
+    section_order: List[str]       # ordered list of section names
+
+
+class AddSectionRequest(BaseModel):
+    section_name: str
+    doc_type: str
+    department: str
+    company_context: Dict = {}
+    existing_sections: Dict[str, str]  # {section_name: content}
 
 
 # ── Departments & Sections ────────────────────────────────────────────────────
@@ -194,5 +211,26 @@ async def api_notion_library():
         logger.info("💾 [CACHE SET] notion_library (%d docs)", len(docs))
 
         return {"total": len(docs), "documents": docs, "cached": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── Enhance Full Document ─────────────────────────────────────────────────────
+
+@router.post("/document/enhance")
+async def api_enhance_full_document(req: EnhanceFullDocRequest):
+    try:
+        result = await enhance_full_document(req)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Add Section ───────────────────────────────────────────────────────────────
+
+@router.post("/section/add")
+async def api_add_section(req: AddSectionRequest):
+    try:
+        result = await add_new_section(req)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

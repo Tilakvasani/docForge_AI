@@ -35,7 +35,7 @@ from backend.schemas.document_schema import (
 )
 
 # Import DOC_STRUCTURE_METADATA + ALL prompts from templates.py (single source of truth)
-from prompts.templates import (
+from prompts.prompts import (
     DOC_STRUCTURE_METADATA,
     TEXT_QUESTIONS_PROMPT,
     TABLE_QUESTIONS_PROMPT,
@@ -47,6 +47,9 @@ from prompts.templates import (
     SECTION_RACI_PROMPT,
     SECTION_SIGNATURE_PROMPT,
     EDIT_PROMPT,
+    PHASE_3A_SECTION_ENHANCE_PROMPT,
+    ADD_SECTION_PROMPT,
+    SECTION_RELEVANCE_PROMPT,
 )
 
 
@@ -485,3 +488,115 @@ def _enforce_word_limit(text: str, target_words: int) -> str:
     if last_period > len(truncated) * 0.6:
         return truncated[:last_period + 1].strip()
     return truncated.strip()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENHANCE FULL DOCUMENT  (section by section, returns all updated contents)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from langchain_core.prompts import PromptTemplate as _PT
+
+
+async def enhance_full_document(req) -> dict:
+    """
+    Enhance every section one by one using PHASE_3A_SECTION_ENHANCE_PROMPT.
+    Returns dict of {section_name: enhanced_content} for all sections.
+    """
+    enhanced = {}
+    for section_name, current_content in req.sections.items():
+        prompt_text = PHASE_3A_SECTION_ENHANCE_PROMPT.format(
+            doc_type=req.doc_type,
+            department=req.department,
+            section_name=section_name,
+            current_section_content=current_content,
+        )
+        chain = _PT.from_template("{prompt}") | get_llm(0.6) | StrOutputParser()
+        raw   = chain.invoke({"prompt": prompt_text}).strip()
+
+        if "```mermaid" in current_content or "```mermaid" in raw:
+            enhanced[section_name] = _clean_preserve_flowcharts(raw)
+        else:
+            enhanced[section_name] = _clean_preserve_tables(raw)
+
+        logger.info(f"Enhanced section '{section_name}'")
+
+    # Rebuild full document
+    doc_lines = []
+    for sec in req.section_order:
+        c = enhanced.get(sec, req.sections.get(sec, "")).strip()
+        if c:
+            doc_lines += [sec.upper(), "-" * len(sec), "", c, "", ""]
+    full_doc = "\n".join(doc_lines).strip()
+
+    logger.info(f"Full document enhanced — {len(full_doc.split())} words")
+    return {"sections": enhanced, "full_document": full_doc}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ADD SECTION  (LLM generates content for a brand new section)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def add_new_section(req) -> dict:
+    """
+    First checks if the section name is relevant to the document type.
+    If not relevant → returns {"relevant": False, "message": "..."}.
+    If relevant → generates content using ADD_SECTION_PROMPT from templates.py.
+    """
+    ctx          = req.company_context or {}
+    company_name = ctx.get("company_name", "the company")
+    industry     = ctx.get("industry", "general")
+    region       = ctx.get("region", "not specified")
+
+    # Build context block from existing sections (first 60 words each)
+    existing_block = "\n".join(
+        f"- {name}: {' '.join(content.split()[:60])}..."
+        for name, content in req.existing_sections.items()
+        if content.strip()
+    ) or "No existing sections yet."
+
+    existing_names = "\n".join(f"- {name}" for name in req.existing_sections)
+
+    # ── Step 1: Relevance check ───────────────────────────────────────────────
+    relevance_chain = SECTION_RELEVANCE_PROMPT | get_llm(0.0) | StrOutputParser()
+    relevance_raw   = relevance_chain.invoke({
+        "section_name":      req.section_name,
+        "doc_type":          req.doc_type,
+        "department":        req.department,
+        "existing_sections": existing_names,
+    }).strip().upper()
+
+    is_relevant = relevance_raw.startswith("YES")
+
+    if not is_relevant:
+        logger.warning(f"Section '{req.section_name}' rejected as irrelevant for '{req.doc_type}'")
+        return {
+            "relevant": False,
+            "message":  (
+                f"'{req.section_name}' is not a valid section for a {req.doc_type}. "
+                f"Please enter a section name that is relevant to this document."
+            ),
+        }
+
+    # ── Step 2: Generate content ──────────────────────────────────────────────
+    target_words = get_words_per_section(req.doc_type, len(req.existing_sections) + 1)
+
+    gen_chain = ADD_SECTION_PROMPT | get_llm(0.7) | StrOutputParser()
+    raw       = gen_chain.invoke({
+        "doc_type":          req.doc_type,
+        "department":        req.department,
+        "section_name":      req.section_name,
+        "company_name":      company_name,
+        "industry":          industry,
+        "region":            region,
+        "existing_sections": existing_block,
+        "target_words":      target_words,
+    }).strip()
+
+    content = _clean_preserve_tables(raw)
+    content = _enforce_word_limit(content, target_words)
+
+    logger.info(f"New section '{req.section_name}' generated — {len(content.split())} words")
+    return {
+        "relevant":     True,
+        "section_name": req.section_name,
+        "content":      content,
+    }

@@ -710,30 +710,16 @@ if st.session_state.active_tab == "library":
 
         for doc in filtered:
             sc = {"Generated":"#ff6b00","Draft":"#f59e0b","Reviewed":"#60a5fa","Archived":"#3a3a5a"}.get(doc.get("status",""),"#3a3a5a")
-            version    = doc.get("version", 1) or 1
-            word_count = doc.get("word_count", 0) or 0
-            ver_color  = "#ea580c" if version == 1 else "#7c3aed" if version == 2 else "#0891b2"
             a,b,c = st.columns([4,2,1])
             with a:
-                st.markdown(
-                    f'<div class="lib-card">'
-                    f'<div class="lib-title">{doc.get("title","—")}'
-                    f'<span style="margin-left:8px;background:{ver_color}22;color:{ver_color};'
-                    f'border:1px solid {ver_color}44;border-radius:999px;padding:1px 9px;'
-                    f'font-size:0.68rem;font-weight:700">v{version}</span></div>'
-                    f'<div class="lib-meta">{doc.get("doc_type","—")} · {doc.get("industry","—")}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True)
+                st.markdown(f'<div class="lib-card"><div class="lib-title">{doc.get("title","—")}</div>'
+                            f'<div class="lib-meta">{doc.get("doc_type","—")} · {doc.get("industry","—")}</div></div>',
+                            unsafe_allow_html=True)
             with b:
-                wc_display = f"{word_count:,} words" if word_count else "—"
-                st.markdown(
-                    f'<div class="lib-card">'
-                    f'<div class="lib-meta">🏢 {doc.get("department","—")}</div>'
-                    f'<div class="lib-meta">📅 {doc.get("created_at","—")}</div>'
-                    f'<div class="lib-meta" style="color:{sc}">● {doc.get("status","—")}</div>'
-                    f'<div class="lib-meta">📝 {wc_display}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True)
+                st.markdown(f'<div class="lib-card"><div class="lib-meta">🏢 {doc.get("department","—")}</div>'
+                            f'<div class="lib-meta">📅 {doc.get("created_at","—")}</div>'
+                            f'<div class="lib-meta" style="color:{sc}">● {doc.get("status","—")}</div></div>',
+                            unsafe_allow_html=True)
             with c:
                 if doc.get("notion_url"):
                     st.link_button("Open →", doc["notion_url"], use_container_width=True)
@@ -1171,28 +1157,151 @@ elif st.session_state.active_tab == "generate":
                     unsafe_allow_html=True)
 
         def rebuild_doc():
-            lines=[]
-            for sec in active:
-                c=contents.get(sec,"").strip()
-                if c: lines+=[sec.upper(),"-"*len(sec),"",c,"",""]
+            lines = []
+            cur_active = [s for s in st.session_state.sections if s not in get_skipped()]
+            for sec in cur_active:
+                c = st.session_state.section_contents.get(sec, "").strip()
+                if c:
+                    lines += [sec.upper(), "-" * len(sec), "", c, "", ""]
             st.session_state.full_document = "\n".join(lines).strip()
 
-        left, right = st.columns([1,2])
+        # ── Top action bar: Enhance All + Add Section + Remove Section ────────
+        ta1, ta2, ta3 = st.columns(3)
+
+        with ta1:
+            if st.button("✨ Enhance Full Document", type="primary", use_container_width=True):
+                cur_active = [s for s in st.session_state.sections if s not in get_skipped()]
+                total = len(cur_active)
+                enhance_status = st.empty()
+                enhance_status.info(f"Enhancing {total} sections one by one...")
+                with st.spinner("Enhancing full document..."):
+                    res = api_post("/document/enhance", {
+                        "doc_type":        st.session_state.selected_doc_type,
+                        "department":      st.session_state.selected_dept,
+                        "company_context": st.session_state.company_ctx,
+                        "sections":        {s: contents.get(s, "") for s in cur_active},
+                        "section_order":   cur_active,
+                    }, timeout=300)
+                if res:
+                    for sec, content in res.get("sections", {}).items():
+                        if content:
+                            st.session_state.section_contents[sec] = content
+                    st.session_state.full_document    = res.get("full_document", "")
+                    st.session_state.docx_bytes_cache = None
+                    enhance_status.empty()
+                    st.success(f"✨ All {total} sections enhanced!")
+                    st.rerun()
+
+        with ta2:
+            if st.button("➕ Add Section", use_container_width=True):
+                st.session_state["_show_add_section"] = not st.session_state.get("_show_add_section", False)
+                st.session_state["_show_remove_section"] = False
+                st.rerun()
+
+        with ta3:
+            if st.button("🗑️ Remove Section", use_container_width=True):
+                st.session_state["_show_remove_section"] = not st.session_state.get("_show_remove_section", False)
+                st.session_state["_show_add_section"] = False
+                st.rerun()
+
+        # ── Add Section panel ─────────────────────────────────────────────────
+        if st.session_state.get("_show_add_section"):
+            st.markdown(
+                '<div class="df-card" style="border-color:#fed7aa;background:#fff7ed">' +
+                '<div class="df-card-title">➕ Add New Section</div>',
+                unsafe_allow_html=True)
+            new_sec_name = st.text_input(
+                "Section Name",
+                placeholder="e.g. Risk Assessment, Escalation Policy, Revision History...",
+                key="new_sec_input")
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                if st.button("⚡ Generate Section", type="primary", use_container_width=True):
+                    if not new_sec_name.strip():
+                        st.warning("Enter a section name.")
+                    elif new_sec_name.strip() in st.session_state.sections:
+                        st.warning("Section already exists.")
+                    else:
+                        cur_active = [s for s in st.session_state.sections if s not in get_skipped()]
+                        with st.spinner(f"Generating '{new_sec_name}'..."):
+                            res = api_post("/section/add", {
+                                "section_name":      new_sec_name.strip(),
+                                "doc_type":          st.session_state.selected_doc_type,
+                                "department":        st.session_state.selected_dept,
+                                "company_context":   st.session_state.company_ctx,
+                                "existing_sections": {s: contents.get(s, "") for s in cur_active},
+                            }, timeout=120)
+                        if res:
+                            if not res.get("relevant", True):
+                                st.error(f"⚠️ {res.get('message', 'Section is not relevant to this document.')}")
+                            else:
+                                new_name = res["section_name"]
+                                st.session_state.sections.append(new_name)
+                                st.session_state.section_contents[new_name] = res["content"]
+                                st.session_state.section_questions[new_name] = {"section_type": "text"}
+                                st.session_state.docx_bytes_cache = None
+                                rebuild_doc()
+                                st.session_state["_show_add_section"] = False
+                                st.success(f"✅ '{new_name}' added!")
+                                st.rerun()
+            with ac2:
+                if st.button("Cancel", use_container_width=True, key="cancel_add"):
+                    st.session_state["_show_add_section"] = False
+                    st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── Remove Section panel ──────────────────────────────────────────────
+        if st.session_state.get("_show_remove_section"):
+            cur_active = [s for s in st.session_state.sections if s not in get_skipped()]
+            st.markdown(
+                '<div class="df-card" style="border-color:#fecaca;background:#fef2f2">' +
+                '<div class="df-card-title" style="color:#dc2626">🗑️ Remove Section</div>',
+                unsafe_allow_html=True)
+            sec_to_remove = st.selectbox(
+                "Select section to remove",
+                cur_active,
+                key="remove_sec_select",
+                label_visibility="collapsed")
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                if st.button("🗑️ Confirm Remove", type="primary", use_container_width=True):
+                    if sec_to_remove in st.session_state.sections:
+                        st.session_state.sections.remove(sec_to_remove)
+                        st.session_state.section_contents.pop(sec_to_remove, None)
+                        st.session_state.section_questions.pop(sec_to_remove, None)
+                        st.session_state.section_answers.pop(sec_to_remove, None)
+                        st.session_state.docx_bytes_cache = None
+                        rebuild_doc()
+                        st.session_state["_show_remove_section"] = False
+                        st.success(f"🗑️ '{sec_to_remove}' removed.")
+                        st.rerun()
+            with rc2:
+                if st.button("Cancel", use_container_width=True, key="cancel_remove"):
+                    st.session_state["_show_remove_section"] = False
+                    st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+        # ── Section editor ────────────────────────────────────────────────────
+        active = [s for s in st.session_state.sections if s not in get_skipped()]
+
+        left, right = st.columns([1, 2])
 
         with left:
-            st.markdown('<div style="font-size:0.68rem;color:#ea580c;font-weight:700;'
+            st.markdown('<div style="font-size:0.68rem;color:#ea580c;font-weight:700;' +
                         'letter-spacing:0.08em;margin-bottom:8px">SECTIONS</div>',
                         unsafe_allow_html=True)
             sel = st.radio("", active, label_visibility="collapsed", key="sec_radio")
 
         with right:
             cur      = contents.get(sel, "")
-            sec_type = st.session_state.section_questions.get(sel,{}).get("section_type","text")
-            icon     = TYPE_ICON.get(sec_type,"✏️")
+            sec_type = st.session_state.section_questions.get(sel, {}).get("section_type", "text")
+            icon     = TYPE_ICON.get(sec_type, "✏️")
 
             st.markdown(
-                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:0.75rem">'
-                f'<span style="font-size:0.95rem;font-weight:700;color:#111827">{icon} {sel}</span>'
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:0.75rem">' +
+                f'<span style="font-size:0.95rem;font-weight:700;color:#111827">{icon} {sel}</span>' +
                 f'{tbadge(sec_type)}</div>',
                 unsafe_allow_html=True)
 
@@ -1202,9 +1311,8 @@ elif st.session_state.active_tab == "generate":
                 elif not cur:
                     st.markdown('<div style="color:#9ca3af;font-style:italic;padding:1rem">(empty)</div>', unsafe_allow_html=True)
                 else:
-                    # Render as nicely formatted document-style HTML
                     _lines = cur.split("\n")
-                    _html = '<div style="font-family:Georgia,serif;font-size:0.88rem;color:#1f2937;line-height:1.8;padding:1.2rem 1.5rem;background:#fafafa;border-radius:10px;border:1px solid #e5e7eb;">' 
+                    _html = '<div style="font-family:Georgia,serif;font-size:0.88rem;color:#1f2937;line-height:1.8;padding:1.2rem 1.5rem;background:#fafafa;border-radius:10px;border:1px solid #e5e7eb;">'
                     for _line in _lines:
                         if not _line.strip():
                             _html += '<div style="height:6px"></div>'
@@ -1217,20 +1325,20 @@ elif st.session_state.active_tab == "generate":
                 placeholder="e.g. Make more formal · Add detail · Shorten · Change tone",
                 height=60, key="edit_instr", label_visibility="collapsed")
 
-            ec1,ec2 = st.columns(2)
+            ec1, ec2 = st.columns(2)
             with ec1:
                 if st.button("🤖 Apply AI Edit", type="primary", use_container_width=True):
                     if not instr.strip():
                         st.warning("Enter an instruction.")
                     else:
                         with st.spinner("Editing..."):
-                            res = api_post("/section/edit",{
-                                "gen_id":          st.session_state.gen_id or 0,
-                                "sec_id":          st.session_state.section_questions.get(sel,{}).get("sec_id",0),
-                                "section_name":    sel,
-                                "doc_type":        st.session_state.selected_doc_type,
-                                "current_content": cur,
-                                "edit_instruction":instr,
+                            res = api_post("/section/edit", {
+                                "gen_id":           st.session_state.gen_id or 0,
+                                "sec_id":           st.session_state.section_questions.get(sel, {}).get("sec_id", 0),
+                                "section_name":     sel,
+                                "doc_type":         st.session_state.selected_doc_type,
+                                "current_content":  cur,
+                                "edit_instruction": instr,
                             }, timeout=120)
                         if res:
                             st.session_state.section_contents[sel] = res["updated_content"]
@@ -1250,8 +1358,8 @@ elif st.session_state.active_tab == "generate":
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
         if st.button("Export →", type="primary", use_container_width=True):
-            st.session_state.step=5; st.rerun()
-
+            st.session_state.step = 5
+            st.rerun()
 
     # ── STEP 5 ────────────────────────────────────────────────────────────────
     elif st.session_state.step == 5:
@@ -1316,9 +1424,8 @@ elif st.session_state.active_tab == "generate":
                         "company_context": ctx,
                     })
                 if res:
-                    url     = res.get("notion_url","")
-                    version = res.get("version", 1)
-                    st.success(f"✅ Published to Notion as v{version}!")
+                    url = res.get("notion_url","")
+                    st.success("✅ Published to Notion!")
                     if url: st.link_button("🔗 Open in Notion", url, use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
