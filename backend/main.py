@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.core.logger import logger
 from backend.api.routes import router
+from backend.services.rag.rag_routes import router as rag_router
 from backend.services.db_service import get_pool, close_pool
 from backend.services.redis_service import cache
 from backend.core.config import settings
@@ -22,6 +23,20 @@ async def lifespan(app: FastAPI):
     redis_url = getattr(settings, "REDIS_URL", "redis://localhost:6379")
     await cache.connect(redis_url)
 
+    # ── RAG auto-ingest on startup ────────────────────────────────────────
+    try:
+        from backend.services.rag.ingest_service import ingest_from_notion
+        logger.info("Starting RAG auto-ingest...")
+        result = await ingest_from_notion(force=False)
+        if result.get("skipped"):
+            logger.info("RAG ingest skipped — recently ingested (%s chunks cached)",
+                        result.get("total_chunks", 0))
+        else:
+            logger.info("RAG ingest complete: %d docs, %d chunks",
+                        result.get("total_docs", 0), result.get("total_chunks", 0))
+    except Exception as e:
+        logger.warning("RAG auto-ingest failed (non-fatal): %s", e)
+
     yield
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
@@ -34,7 +49,8 @@ app = FastAPI(title="DocForge AI", version="3.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.include_router(router, prefix="/api")
+app.include_router(router,     prefix="/api")
+app.include_router(rag_router, prefix="/api")
 
 
 @app.get("/health")

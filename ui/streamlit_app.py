@@ -1,5 +1,5 @@
 """
-DocForge AI — streamlit_app.py  v7.0
+DocForge AI × CiteRAG Lab — streamlit_app.py  v8.0
 Premium dark UI with amber/orange glow aesthetic.
 Bug fixes:
   - Answer textarea values stored in session state via on_change → never disappear
@@ -20,490 +20,13 @@ except ImportError:
 
 API_URL = "http://localhost:8000/api"
 
-st.set_page_config(page_title="DocForge AI", page_icon="⚡",
+st.set_page_config(page_title="DocForge AI × CiteRAG Lab", page_icon="⚡",
                    layout="wide", initial_sidebar_state="expanded")
 
-# ─── CSS ──────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
 
-* { font-family: 'Inter', sans-serif !important; }
+# ─── no custom CSS ───────────────────────────────────────────────────────────
 
-/* ── Base — Light theme ── */
-[data-testid="stAppViewContainer"] {
-    background: #f5f6fa;
-    min-height: 100vh;
-}
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #ffffff 0%, #f8f9fc 100%);
-    border-right: 1px solid #e8eaf0;
-}
-[data-testid="stSidebar"] * { color: #374151 !important; }
-#MainMenu, footer, header { visibility: hidden; }
-[data-testid="stMainBlockContainer"] { padding-top: 1rem; }
 
-/* ── Sidebar brand ── */
-.sb-brand {
-    padding: 1.2rem 0 0.5rem;
-    border-bottom: 1px solid #e8eaf0;
-    margin-bottom: 1rem;
-}
-.sb-brand-name {
-    font-size: 1.2rem; font-weight: 800;
-    background: linear-gradient(135deg, #1f2937, #ea580c);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    letter-spacing: -0.02em;
-}
-.sb-brand-sub {
-    font-size: 0.65rem; color: #9ca3af !important;
-    letter-spacing: 0.1em; text-transform: uppercase; margin-top: 2px;
-}
-
-/* ── Sidebar steps ── */
-.sb-step {
-    display: flex; align-items: center; gap: 10px;
-    padding: 8px 12px; border-radius: 8px;
-    font-size: 0.8rem; margin-bottom: 3px; cursor: default;
-}
-.sb-done   { color: #ea580c !important; }
-.sb-active { background: rgba(234,88,12,0.08); border: 1px solid rgba(234,88,12,0.2);
-             color: #ea580c !important; font-weight: 700; }
-.sb-pend   { color: #d1d5db !important; }
-.sb-dot    { width: 20px; height: 20px; border-radius: 50%; display: flex;
-             align-items: center; justify-content: center; font-size: 0.7rem;
-             font-weight: 800; flex-shrink: 0; }
-.sb-dot-done   { background: rgba(234,88,12,0.12); color: #ea580c !important; }
-.sb-dot-active { background: linear-gradient(135deg,#ea580c,#f97316);
-                 color: white !important; box-shadow: 0 2px 8px rgba(234,88,12,0.35); }
-.sb-dot-pend   { background: #f3f4f6; color: #d1d5db !important; }
-
-/* ── Sidebar info block ── */
-.sb-info {
-    background: #f8f9fc;
-    border: 1px solid #e8eaf0;
-    border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
-}
-.sb-info-lbl { font-size: 0.65rem; color: #ea580c !important; font-weight: 700;
-               letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 3px; }
-.sb-info-val { font-size: 0.82rem; color: #111827 !important; }
-.sb-info-sub { font-size: 0.72rem; color: #6b7280 !important; margin-top: 1px; }
-
-/* ── Header ── */
-.df-header {
-    background: linear-gradient(135deg, #fff7ed 0%, #ffffff 100%);
-    border: 1px solid #fed7aa;
-    border-radius: 16px;
-    padding: 1.5rem 2rem;
-    margin-bottom: 2rem;
-    position: relative;
-    overflow: hidden;
-}
-.df-header::before {
-    content: '';
-    position: absolute; top: -50%; left: -10%;
-    width: 400px; height: 400px;
-    background: radial-gradient(circle, rgba(234,88,12,0.04) 0%, transparent 70%);
-    pointer-events: none;
-}
-.df-hrow { display: flex; align-items: center; gap: 1rem; }
-.df-icon { font-size: 2.4rem; filter: drop-shadow(0 0 12px rgba(255,107,0,0.6)); }
-.df-title { font-size: 1.8rem; font-weight: 900; letter-spacing: -0.03em;
-    background: linear-gradient(135deg, #1f2937 0%, #ea580c 100%);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-.df-sub { font-size: 0.8rem; color: #6b7280; margin-top: 2px; }
-.df-ver {
-    margin-left: auto;
-    background: rgba(234,88,12,0.08);
-    border: 1px solid rgba(234,88,12,0.25);
-    border-radius: 999px; padding: 4px 14px;
-    font-size: 0.72rem; font-weight: 700;
-    color: #ea580c; letter-spacing: 0.05em;
-}
-
-/* ── Step pill ── */
-.step-pill {
-    display: inline-flex; align-items: center; gap: 8px;
-    background: #fff7ed;
-    border: 1px solid #fed7aa;
-    border-radius: 999px; padding: 6px 18px;
-    font-size: 0.78rem; font-weight: 700;
-    color: #ea580c; margin-bottom: 1.25rem;
-    letter-spacing: 0.03em;
-}
-
-/* ── Card ── */
-.df-card {
-    background: #ffffff;
-    border: 1px solid #e8eaf0;
-    border-radius: 14px;
-    padding: 1.4rem 1.6rem;
-    margin-bottom: 1rem;
-    position: relative;
-    overflow: hidden;
-    transition: border-color 0.2s;
-}
-.df-card:hover { border-color: #fed7aa; }
-.df-card-glow::before {
-    content: '';
-    position: absolute; top: 0; left: 0; right: 0; height: 2px;
-    background: linear-gradient(90deg, transparent, #f97316, transparent);
-    border-radius: 14px 14px 0 0;
-}
-.df-card-title {
-    font-size: 0.68rem; font-weight: 700; letter-spacing: 0.1em;
-    color: #ea580c; text-transform: uppercase; margin-bottom: 1rem;
-}
-
-/* ── Stats ── */
-.stat-row { display: grid; gap: 1rem; margin-bottom: 1.25rem; }
-.stat-box {
-    background: #ffffff;
-    border: 1px solid #e8eaf0;
-    border-radius: 12px; padding: 1rem 1.25rem;
-    text-align: center; transition: all 0.2s;
-}
-.stat-box:hover {
-    border-color: #fed7aa;
-    background: #fff7ed;
-}
-.stat-num  { font-size: 2rem; font-weight: 900; color: #ea580c;
-             line-height: 1; }
-.stat-lbl  { font-size: 0.7rem; color: #9ca3af; margin-top: 4px;
-             text-transform: uppercase; letter-spacing: 0.06em; }
-
-/* ── Section grid ── */
-.sec-done {
-    background: #fff7ed;
-    border: 1px solid #fed7aa;
-    border-radius: 8px; padding: 7px 10px; margin-bottom: 5px;
-    font-size: 0.78rem; color: #ea580c;
-    display: flex; align-items: center; gap: 6px;
-}
-.sec-pend {
-    background: #f9fafb;
-    border: 1px solid #e5e7eb;
-    border-radius: 8px; padding: 7px 10px; margin-bottom: 5px;
-    font-size: 0.78rem; color: #9ca3af;
-    display: flex; align-items: center; gap: 6px;
-}
-.sec-answered {
-    background: #f0fdf4;
-    border: 1px solid #bbf7d0;
-    border-radius: 8px; padding: 7px 10px; margin-bottom: 5px;
-    font-size: 0.78rem; color: #4ade80;
-    display: flex; align-items: center; gap: 6px;
-}
-
-/* ── Type badges ── */
-.tbadge {
-    display: inline-block; border-radius: 5px;
-    padding: 1px 7px; font-size: 0.68rem; font-weight: 700;
-    margin-left: 4px; vertical-align: middle;
-}
-.tb-table     { background: rgba(59,130,246,0.15); color: #60a5fa; }
-.tb-flowchart { background: rgba(34,197,94,0.12);  color: #4ade80; }
-.tb-raci      { background: rgba(167,139,250,0.15); color: #a78bfa; }
-.tb-signature { background: rgba(244,114,182,0.12); color: #f472b6; }
-
-/* ── Content box ── */
-.content-box {
-    background: #f8f9fc;
-    border: 1px solid #e5e7eb;
-    border-radius: 10px; padding: 1rem 1.1rem;
-    font-family: 'Monaco','Menlo','Courier New',monospace !important;
-    font-size: 0.76rem; color: #374151; line-height: 1.65;
-    max-height: 600px; overflow-y: auto;
-    white-space: pre-wrap; word-break: break-word;
-}
-
-/* ── Answer display ── */
-.answer-chip {
-    background: #fff7ed;
-    border: 1px solid #fed7aa;
-    border-radius: 8px; padding: 8px 12px; margin-bottom: 8px;
-}
-.answer-q { font-size: 0.72rem; color: #ea580c; font-weight: 700;
-            margin-bottom: 3px; }
-.answer-a { font-size: 0.82rem; color: #374151; line-height: 1.5; }
-
-/* ── Library ── */
-.lib-card {
-    background: #ffffff;
-    border: 1px solid #e8eaf0;
-    border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 8px;
-    transition: all 0.2s;
-}
-.lib-card:hover {
-    border-color: #fed7aa;
-    background: #fff7ed;
-}
-.lib-title { font-size: 0.9rem; font-weight: 600; color: #111827; }
-.lib-meta  { font-size: 0.73rem; color: #6b7280; margin-top: 3px; }
-
-/* ── Progress ── */
-.stProgress > div > div { background: linear-gradient(90deg,#ea580c,#f97316) !important; }
-
-/* ── Fix black progress bar track ── */
-.stProgress > div {
-    background: #fee2e2 !important;
-    border-radius: 999px !important;
-    height: 6px !important;
-}
-.stProgress > div > div {
-    border-radius: 999px !important;
-    height: 6px !important;
-}
-
-/* ── Fix black selectbox ── */
-[data-baseweb="select"] > div {
-    background: #ffffff !important;
-    border: 1px solid #d1d5db !important;
-    border-radius: 10px !important;
-    color: #111827 !important;
-}
-[data-baseweb="select"] > div:focus-within {
-    border-color: #f97316 !important;
-    box-shadow: 0 0 0 3px rgba(249,115,22,0.12) !important;
-}
-/* Dropdown popup container */
-[data-baseweb="popover"],
-[data-baseweb="popover"] > div,
-[data-baseweb="popover"] ul,
-[data-baseweb="popover"] li {
-    background: #ffffff !important;
-    color: #111827 !important;
-}
-[data-baseweb="popover"] {
-    border: 1px solid #e5e7eb !important;
-    border-radius: 10px !important;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.1) !important;
-    overflow: hidden !important;
-}
-[data-baseweb="menu"] {
-    background: #ffffff !important;
-}
-[data-baseweb="option"],
-[role="option"] {
-    background: #ffffff !important;
-    color: #111827 !important;
-}
-[data-baseweb="option"]:hover,
-[role="option"]:hover {
-    background: #fff7ed !important;
-    color: #ea580c !important;
-    cursor: pointer;
-}
-[aria-selected="true"],
-[aria-selected="true"][data-baseweb="option"],
-[aria-selected="true"][role="option"] {
-    background: #fff7ed !important;
-    color: #ea580c !important;
-    font-weight: 600 !important;
-}
-/* Streamlit selectbox list container */
-.stSelectbox [data-baseweb="select"] span {
-    color: #111827 !important;
-}
-div[data-testid="stSelectbox"] > div > div {
-    background: #ffffff !important;
-    color: #111827 !important;
-}
-/* Selectbox search input cursor */
-[data-baseweb="select"] input {
-    caret-color: #ea580c !important;
-    color: #111827 !important;
-}
-/* Placeholder inside selectbox */
-[data-baseweb="select"] [data-testid="stSelectboxVirtualDropdown"] {
-    color: #9ca3af !important;
-}
-
-/* ── Fix radio buttons — show text, hide native circle ── */
-[data-testid="stRadio"] > div {
-    gap: 4px !important;
-    flex-direction: column !important;
-}
-/* Hide blank label ONLY inside radio widgets */
-[data-testid="stRadio"] [data-testid="stWidgetLabel"] {
-    display: none !important;
-    height: 0 !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    min-height: 0 !important;
-}
-[data-testid="stRadio"] label {
-    background: #f9fafb !important;
-    border: 1px solid #e5e7eb !important;
-    border-radius: 8px !important;
-    padding: 8px 14px !important;
-    color: #374151 !important;
-    cursor: pointer !important;
-    transition: all 0.15s !important;
-    width: 100% !important;
-    display: flex !important;
-    align-items: center !important;
-}
-[data-testid="stRadio"] label:hover {
-    border-color: #f97316 !important;
-    background: #fff7ed !important;
-    color: #ea580c !important;
-}
-[data-testid="stRadio"] label[data-checked="true"] {
-    background: #fff7ed !important;
-    border-color: #ea580c !important;
-    color: #ea580c !important;
-    font-weight: 600 !important;
-}
-/* Hide native radio circle, show text */
-[data-testid="stRadio"] label > div:first-child {
-    display: none !important;
-}
-[data-testid="stRadio"] label p {
-    color: #111827 !important;
-    font-size: 0.82rem !important;
-    margin: 0 !important;
-    line-height: 1.3 !important;
-}
-/* Sidebar radio — keep normal */
-[data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child {
-    display: flex !important;
-}
-[data-testid="stSidebar"] [data-testid="stRadio"] label {
-    background: transparent !important;
-    border: none !important;
-    padding: 4px 8px !important;
-}
-
-/* ── Fix download button ── */
-[data-testid="stDownloadButton"] button {
-    background: #ffffff !important;
-    border: 1px solid #d1d5db !important;
-    color: #374151 !important;
-    border-radius: 10px !important;
-}
-[data-testid="stDownloadButton"] button:hover {
-    border-color: #f97316 !important;
-    color: #ea580c !important;
-    background: #fff7ed !important;
-}
-
-/* ── Fix expander ── */
-[data-testid="stExpander"] {
-    background: #ffffff !important;
-    border: 1px solid #e5e7eb !important;
-    border-radius: 10px !important;
-}
-[data-testid="stExpander"] summary {
-    color: #374151 !important;
-}
-
-/* ── Buttons ── */
-.stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, #ff6b00, #ff4500) !important;
-    border: none !important; color: white !important;
-    font-weight: 700 !important; border-radius: 10px !important;
-    box-shadow: 0 4px 15px rgba(255,107,0,0.3) !important;
-    letter-spacing: 0.02em !important;
-}
-.stButton > button[kind="primary"]:hover {
-    background: linear-gradient(135deg, #ff8c00, #ff6b00) !important;
-    box-shadow: 0 6px 20px rgba(255,107,0,0.45) !important;
-    transform: translateY(-1px);
-}
-.stButton > button {
-    border-radius: 10px !important;
-    background: #ffffff !important;
-    border: 1px solid #d1d5db !important;
-    color: #374151 !important;
-}
-.stButton > button:hover {
-    border-color: #f97316 !important;
-    color: #ea580c !important;
-    background: #fff7ed !important;
-}
-
-/* ── Inputs ── */
-.stTextInput input, 
-.stTextArea textarea {
-    background: #ffffff !important;
-    border: 1px solid #d1d5db !important;
-    border-radius: 10px !important;
-    color: #111827 !important;
-    font-size: 0.85rem !important;
-    caret-color: #000000 !important;
-    cursor: text !important;
-}
-.stTextInput input::placeholder,
-.stTextArea textarea::placeholder {
-    color: #9ca3af !important;
-    opacity: 1 !important;
-}
-/* Fix placeholder text in selectbox */
-[data-baseweb="select"] [data-testid="stMarkdownContainer"] p,
-[data-baseweb="select"] span,
-[data-baseweb="select"] input::placeholder {
-    color: #6b7280 !important;
-    opacity: 1 !important;
-}
-
-.stTextInput input:focus, .stTextArea textarea:focus {
-    border-color: #f97316 !important;
-    box-shadow: 0 0 0 3px rgba(249,115,22,0.12) !important;
-    caret-color: #000000 !important;   /* ✅ BLACK cursor */
-    cursor: text !important;
-}
-.stSelectbox > div > div {
-    background: #ffffff !important;
-    border: 1px solid #d1d5db !important;
-    border-radius: 10px !important;
-    color: #111827 !important;
-    caret-color: #ea580c !important;
-    cursor: pointer !important;
-}
-/* Selectbox placeholder text */
-.stSelectbox > div > div > div[data-baseweb="select"] span[aria-hidden="true"],
-[data-baseweb="select"] [data-testid="stMarkdownContainer"] p,
-[data-baseweb="placeholder"] {
-    color: #9ca3af !important;
-}
-
-label { color: #374151 !important; font-size: 0.78rem !important;
-        font-weight: 600 !important; letter-spacing: 0.02em !important; }
-/* Ensure all widget labels are visible */
-[data-testid="stWidgetLabel"] p,
-[data-testid="stWidgetLabel"] label {
-    color: #374151 !important;
-    opacity: 1 !important;
-    visibility: visible !important;
-}
-
-/* ── Alerts ── */
-.stSuccess { background: #f0fdf4 !important;
-             border-color: #bbf7d0 !important; color: #15803d !important; }
-.stError   { background: #fef2f2 !important;
-             border-color: #fecaca !important; color: #dc2626 !important; }
-.stInfo    { background: #fff7ed !important;
-             border-color: #fed7aa !important; color: #ea580c !important; }
-.stInfo p, .stInfo div, [data-testid="stNotification"] p {
-    color: #ea580c !important;
-    font-weight: 500 !important;
-}
-.stWarning { background: #fffbeb !important;
-             border-color: #fde68a !important; color: #d97706 !important; }
-.stWarning p, .stWarning div { color: #d97706 !important; font-weight: 500 !important; }
-.stSuccess p, .stSuccess div { color: #15803d !important; font-weight: 500 !important; }
-.stError p, .stError div { color: #dc2626 !important; font-weight: 500 !important; }
-hr { border-color: #e5e7eb !important; }
-
-/* ── Expander ── */
-.streamlit-expanderHeader {
-    background: #f8f9fc !important;
-    border-radius: 8px !important;
-    color: #374151 !important;
-}
-</style>
-""", unsafe_allow_html=True)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -551,7 +74,11 @@ def init_session():
         section_questions={}, section_answers={},
         section_contents={},
         sec_ids_ordered=[], gen_id=None, full_document="",
-        active_tab="generate",
+        active_tab="ask",
+        # RAG Ask tab — chat-based
+        rag_chats={},
+        rag_active_chat=None,
+        rag_session_id=None,
         docx_bytes_cache=None, docx_cache_doc=None,
         _library_data=None,
         # BUG FIX: store answer widget values here so they persist across reruns
@@ -567,99 +94,221 @@ init_session()
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("""
-    <div class="sb-brand">
-        <div class="sb-brand-name">⚡ DocForge AI</div>
-        <div class="sb-brand-sub">Enterprise Document Generator</div>
-    </div>""", unsafe_allow_html=True)
+    st.markdown("### ⚡ DocForge × CiteRAG")
+    st.caption("Generate · Ask · Discover")
+    st.divider()
 
-    tab = st.radio("", ["⚡ Generate", "📚 Library"],
+    tab = st.radio("Navigation", ["💬 CiteRAG Lab", "⚡ DocForge AI", "📚 Library"],
                    label_visibility="collapsed", key="main_tab")
-    st.session_state.active_tab = "library" if "Library" in tab else "generate"
+    if "DocForge" in tab:
+        st.session_state.active_tab = "generate"
+    elif "Library" in tab:
+        st.session_state.active_tab = "library"
+    else:
+        st.session_state.active_tab = "ask"
 
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    st.divider()
 
     if st.session_state.active_tab == "generate":
         steps = [(1,"Setup"),(2,"Questions"),(3,"Answers"),(4,"Review"),(5,"Export")]
         cur   = st.session_state.step
         for n, lbl in steps:
-            if n < cur:
-                dot_cls, step_cls, dot_txt = "sb-dot-done",  "sb-done",   "✓"
-            elif n == cur:
-                dot_cls, step_cls, dot_txt = "sb-dot-active","sb-active", str(n)
-            else:
-                dot_cls, step_cls, dot_txt = "sb-dot-pend",  "sb-pend",   str(n)
-            st.markdown(
-                f'<div class="sb-step {step_cls}">'
-                f'<div class="sb-dot {dot_cls}">{dot_txt}</div>'
-                f'<span>Step {n} — {lbl}</span></div>',
-                unsafe_allow_html=True)
-
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-
+            icon = "✅" if n < cur else "🔵" if n == cur else "⚪"
+            st.markdown(f"{icon} **Step {n}** — {lbl}" if n == cur else f"{icon} Step {n} — {lbl}")
+        st.divider()
         ctx = st.session_state.company_ctx
         if ctx.get("company_name"):
-            st.markdown(
-                f'<div class="sb-info">'
-                f'<div class="sb-info-lbl">🏢 Company</div>'
-                f'<div class="sb-info-val">{ctx["company_name"]}</div>'
-                f'<div class="sb-info-sub">{ctx.get("industry","—")} · {ctx.get("region","—")}</div>'
-                f'</div>', unsafe_allow_html=True)
-
+            st.caption(f"🏢 {ctx['company_name']}")
         if st.session_state.selected_doc_type:
-            st.markdown(
-                f'<div class="sb-info">'
-                f'<div class="sb-info-lbl">📄 Document</div>'
-                f'<div class="sb-info-val">{st.session_state.selected_doc_type}</div>'
-                f'<div class="sb-info-sub">{st.session_state.selected_dept or ""}</div>'
-                f'</div>', unsafe_allow_html=True)
-
+            st.caption(f"📄 {st.session_state.selected_doc_type}")
         if st.session_state.sections:
-            done_n   = len(st.session_state.section_contents)
-            total_n  = len(st.session_state.sections)
-            active_n = total_n
-            pct = int(done_n / active_n * 100)
-            sb_progress_slot = st.empty()
-            sb_progress_slot.markdown(
-                f'<div class="sb-info">'
-                f'<div class="sb-info-lbl">📊 Progress</div>'
-                f'<div class="sb-info-val">{done_n}/{active_n} sections · {pct}%</div>'
-                f'<div style="background:#fee2e2;border-radius:999px;height:4px;margin-top:6px">'
-                f'<div style="background:linear-gradient(90deg,#ea580c,#f97316);height:4px;'
-                f'border-radius:999px;width:{pct}%"></div></div>'
-                f'</div>', unsafe_allow_html=True)
-            st.session_state._sb_progress_slot = sb_progress_slot
-
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-        if st.button("↺  Start Over", use_container_width=True):
+            done_n  = len(st.session_state.section_contents)
+            total_n = len(st.session_state.sections)
+            st.progress(done_n / total_n if total_n else 0,
+                        text=f"{done_n}/{total_n} sections")
+        st.divider()
+        if st.button("↺ Start Over", use_container_width=True):
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
 
+    elif st.session_state.active_tab == "ask":
+        import time as _st2, uuid as _su2
+        if not st.session_state.rag_chats:
+            _c0 = _su2.uuid4().hex[:8]
+            st.session_state.rag_chats[_c0] = {
+                "title": "New chat", "messages": [], "created": _st2.time()
+            }
+            st.session_state.rag_active_chat = _c0
+
+        if st.button("＋ New Chat", use_container_width=True,
+                     key="sb_new_chat", type="primary"):
+            _cn = _su2.uuid4().hex[:8]
+            st.session_state.rag_chats[_cn] = {
+                "title": "New chat", "messages": [], "created": _st2.time()
+            }
+            st.session_state.rag_active_chat = _cn
+            st.rerun()
+
+        _sorted = sorted(st.session_state.rag_chats.items(),
+                         key=lambda x: x[1].get("created", 0), reverse=True)
+        for _cid, _chat in _sorted:
+            _active = _cid == st.session_state.rag_active_chat
+            _title  = _chat["title"][:22] + ("…" if len(_chat["title"]) > 22 else "")
+            _nm     = len([m for m in _chat["messages"] if m["role"] == "user"])
+            btn_label = f"{'▶ ' if _active else ''}{_title}"
+            _c1, _c2 = st.columns([5, 1])
+            with _c1:
+                if st.button(btn_label, key=f"chat_{_cid}",
+                             use_container_width=True,
+                             type="primary" if _active else "secondary"):
+                    st.session_state.rag_active_chat = _cid
+                    st.rerun()
+            with _c2:
+                if st.button("🗑", key=f"del_{_cid}", help="Delete chat"):
+                    del st.session_state.rag_chats[_cid]
+                    if st.session_state.rag_active_chat == _cid:
+                        if st.session_state.rag_chats:
+                            st.session_state.rag_active_chat = next(iter(st.session_state.rag_chats))
+                        else:
+                            st.session_state.rag_active_chat = None
+                    st.rerun()
+            if not _active:
+                st.caption(f"{_nm} msg(s)")
+
 
 # ─── Header ───────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="df-header">
-    <div class="df-hrow">
-        <div class="df-icon">⚡</div>
-        <div>
-            <div class="df-title">DocForge AI</div>
-            <div class="df-sub">AI-Powered Enterprise Document Generator</div>
-        </div>
-        <div class="df-ver">GPT-4.1-mini</div>
-    </div>
-</div>""", unsafe_allow_html=True)
+_tab_sub = {
+    "ask":      "Ask questions · Get cited answers · Compare documents",
+    "generate": "AI-Powered Enterprise Document Generation",
+    "library":  "Browse & explore your generated documents",
+}.get(st.session_state.active_tab, "")
+if st.session_state.active_tab != "ask":
+    _tab_title = {"generate":"⚡ DocForge AI","library":"📚 Library"
+                  }.get(st.session_state.active_tab, "")
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        st.subheader(_tab_title)
+        st.caption(_tab_sub)
+    st.divider()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LIBRARY
-# ═══════════════════════════════════════════════════════════════════════════════
-if st.session_state.active_tab == "library":
-    ch, cb = st.columns([4,1])
-    with ch: st.markdown("### 📚 Document Library")
-    with cb:
-        if st.button("↺ Refresh", use_container_width=True):
-            st.session_state["_library_data"] = None
+if st.session_state.active_tab == "ask":
+    import uuid as _uuid, time as _time_mod
+
+    # Ensure chat exists
+    if not st.session_state.rag_chats:
+        _c0 = _uuid.uuid4().hex[:8]
+        st.session_state.rag_chats[_c0] = {
+            "title": "New chat", "messages": [], "created": _time_mod.time()
+        }
+        st.session_state.rag_active_chat = _c0
+
+    if not st.session_state.rag_active_chat or             st.session_state.rag_active_chat not in st.session_state.rag_chats:
+        st.session_state.rag_active_chat = next(iter(st.session_state.rag_chats))
+
+    active_id   = st.session_state.rag_active_chat
+    active_chat = st.session_state.rag_chats[active_id]
+    messages    = active_chat["messages"]
+
+    # Compact chat title
+    st.caption(f"💬 {active_chat.get('title','New chat')}")
+
+    # Empty state
+    if not messages:
+        st.write("")
+        c1, c2, c3 = st.columns([1, 2, 1])
+        with c2:
+            st.markdown("### ⚡ CiteRAG Lab")
+            st.caption("Ask · Cite · Compare · Discover")
+            st.write("")
+            examples = [
+                "🔍 What is the notice period in the employment contract?",
+                "⚖️ Compare SOW vs NDA confidentiality clauses",
+                "📋 Create a compliant incident response summary",
+                "📄 Summarise the leave policy and entitlements",
+            ]
+            for i, ex in enumerate(examples):
+                if st.button(ex, key=f"ex_{i}", use_container_width=True):
+                    # Pre-fill question
+                    st.session_state._prefill_q = ex.split(" ", 1)[1]
+                    st.rerun()
+
+    # Messages
+    for msg in messages:
+        role      = msg["role"]
+        text      = msg["content"]
+        citations = msg.get("citations", [])
+        confidence = msg.get("confidence", "")
+
+        if role == "user":
+            with st.chat_message("user"):
+                st.write(text)
+        else:
+            with st.chat_message("assistant"):
+                label = f"CiteRAG Lab · {confidence.upper()}" if confidence else "CiteRAG Lab"
+                st.caption(label)
+                if msg.get("tool_used") == "compare" and msg.get("side_a"):
+                    ca, cb = st.columns(2)
+                    with ca:
+                        st.markdown(f"**{msg.get('doc_a','Doc A')}**")
+                        st.write(msg["side_a"])
+                    with cb:
+                        st.markdown(f"**{msg.get('doc_b','Doc B')}**")
+                        st.write(msg["side_b"])
+                    if msg.get("summary"):
+                        st.info(f"**Summary:** {msg['summary']}")
+                else:
+                    st.write(text)
+                if citations:
+                    st.caption("📄 " + " · ".join(citations))
+
+    # Input
+    _prefill = st.session_state.pop("_prefill_q", "")
+    user_q = st.chat_input("Ask anything about your documents...")
+
+    if user_q or _prefill:
+        question = (user_q or _prefill).strip()
+        if not messages:
+            st.session_state.rag_chats[active_id]["title"] = (
+                question[:40] + ("…" if len(question) > 40 else ""))
+        st.session_state.rag_chats[active_id]["messages"].append(
+            {"role": "user", "content": question})
+        with st.spinner("Thinking..."):
+            res = api_post("/rag/ask", {
+                "question":   question,
+                "session_id": active_id,
+                "top_k":      5,
+            }, timeout=120)
+        if res:
+            ai_msg = {
+                "role":       "assistant",
+                "content":    res.get("answer", "No answer returned."),
+                "citations":  res.get("citations", []),
+                "confidence": res.get("confidence", ""),
+                "tool_used":  res.get("tool_used", ""),
+            }
+            if res.get("tool_used") == "compare":
+                ai_msg.update({
+                    "side_a":  res.get("side_a",""),
+                    "side_b":  res.get("side_b",""),
+                    "summary": res.get("summary",""),
+                    "doc_a":   res.get("doc_a","Document A"),
+                    "doc_b":   res.get("doc_b","Document B"),
+                })
+        else:
+            ai_msg = {
+                "role":    "assistant",
+                "content": "Could not reach the RAG service. Make sure the backend is running.",
+                "citations": [],
+            }
+        st.session_state.rag_chats[active_id]["messages"].append(ai_msg)
+        st.rerun()
+
+
+elif st.session_state.active_tab == "library":
+    if st.button("↺ Refresh", use_container_width=True):
+        st.session_state["_library_data"] = None
 
     if st.session_state.get("_library_data") is None:
         with st.spinner("Loading from Notion..."):
@@ -725,8 +374,7 @@ elif st.session_state.active_tab == "generate":
 
         depts = st.session_state.departments
         if not depts:
-            st.error("❌ Backend not reachable — run: `uvicorn backend.main:app --reload`")
-            st.stop()
+            st.warning("⚠️ Backend not reachable — run: uvicorn backend.main:app --reload")
 
         st.markdown('<div class="df-card df-card-glow"><div class="df-card-title">🏢 Company Information</div>',
                     unsafe_allow_html=True)
