@@ -523,42 +523,46 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def fetch_library_from_notion() -> list:
+    library, cursor = [], None
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{NOTION_API_URL}/databases/{settings.NOTION_DATABASE_ID}/query",
-            headers=_headers(),
-            json={"sorts": [{"property": "Created At", "direction": "descending"}],
-                  "page_size": 50},
-        )
-    if resp.status_code != 200:
-        logger.error(f"Library fetch error: {resp.status_code}")
-        return []
+        while True:
+            body = {
+                "sorts": [{"property": "Created At", "direction": "descending"}],
+                "page_size": 100,
+            }
+            if cursor:
+                body["start_cursor"] = cursor
+            resp = await client.post(
+                f"{NOTION_API_URL}/databases/{settings.NOTION_DATABASE_ID}/query",
+                headers=_headers(), json=body,
+            )
+            if resp.status_code != 200:
+                logger.error(f"Library fetch error: {resp.status_code}")
+                break
+            data = resp.json()
+            for page in data.get("results", []):
+                props = page.get("properties", {})
 
-    library = []
-    for page in resp.json().get("results", []):
-        props = page.get("properties", {})
+                def get_text(k, _props=props):
+                    p     = _props.get(k, {})
+                    items = p.get("title", []) if p.get("type") == "title" else p.get("rich_text", [])
+                    return "".join(i.get("text", {}).get("content", "") for i in items)
 
-        def get_text(k):
-            p     = props.get(k, {})
-            items = p.get("title", []) if p.get("type") == "title" else p.get("rich_text", [])
-            return "".join(i.get("text", {}).get("content", "") for i in items)
+                def get_select(k, _props=props):
+                    sel = _props.get(k, {}).get("select")
+                    return sel.get("name", "") if sel else ""
 
-        def get_select(k):
-            sel = props.get(k, {}).get("select")
-            return sel.get("name", "") if sel else ""
-
-        def get_number(k):
-            return props.get(k, {}).get("number") or 0
-
-        library.append({
-            "title":      get_text("Title"),
-            "doc_type":   get_text("Doc Type"),
-            "department": get_select("Department"),
-            "industry":   get_text("Industry"),
-            "status":     get_select("Status"),
-            "notion_url": page.get("url", ""),
-            "created_at": page.get("created_time", "")[:10],
-            "version":    get_number("Version"),
-            "word_count": get_number("Word Count"),
-        })
+                library.append({
+                    "title":      get_text("Title"),
+                    "doc_type":   get_text("Doc Type"),
+                    "department": get_select("Department"),
+                    "industry":   get_text("Industry"),
+                    "status":     get_select("Status"),
+                    "notion_url": page.get("url", ""),
+                    "created_at": page.get("created_time", "")[:10],
+                })
+            cursor = data.get("next_cursor")
+            if not data.get("has_more") or not cursor:
+                break
+    logger.info(f"Library fetched: {len(library)} documents")
     return library
