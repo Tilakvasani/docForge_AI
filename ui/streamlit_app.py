@@ -656,7 +656,7 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════════════════════
 if st.session_state.active_tab == "library":
     ch, cb = st.columns([4,1])
-    with ch: st.markdown("### 📚 Document Library")
+    with ch: st.markdown("<h3 style='color:rgb(234 88 12)'>📚 Document Library</h3>",unsafe_allow_html=True)
     with cb:
         if st.button("↺ Refresh", use_container_width=True):
             st.session_state["_library_data"] = None
@@ -696,9 +696,27 @@ if st.session_state.active_tab == "library":
             sc = {"Generated":"#ff6b00","Draft":"#f59e0b","Reviewed":"#60a5fa","Archived":"#3a3a5a"}.get(doc.get("status",""),"#3a3a5a")
             a,b,c = st.columns([4,2,1])
             with a:
-                st.markdown(f'<div class="lib-card"><div class="lib-title">{doc.get("title","—")}</div>'
-                            f'<div class="lib-meta">{doc.get("doc_type","—")} · {doc.get("industry","—")}</div></div>',
-                            unsafe_allow_html=True)
+                title = doc.get("title", "—")
+                doc_type = doc.get("doc_type", "—")
+                industry = doc.get("industry", "—")
+
+                version_html = ""
+                if doc.get("version"):
+                    version_html = (
+                    f'&nbsp;<span style="background:rgba(234,88,12,0.1);'
+                    f'color:#ea580c;border:1px solid rgba(234,88,12,0.25);'
+                    f'border-radius:999px;padding:1px 8px;font-size:0.68rem;'
+                    f'font-weight:700;letter-spacing:0.04em">'
+                    f'v{int(doc["version"])}</span>'
+                    )
+
+                st.markdown(
+                f'<div class="lib-card">'
+                f'<div class="lib-title">{title}{version_html}</div>'
+                f'<div class="lib-meta">{doc_type} · {industry}</div>'
+                f'</div>',
+                unsafe_allow_html=True
+                )
             with b:
                 st.markdown(f'<div class="lib-card"><div class="lib-meta">🏢 {doc.get("department","—")}</div>'
                             f'<div class="lib-meta">📅 {doc.get("created_at","—")}</div>'
