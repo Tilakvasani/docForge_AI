@@ -252,16 +252,40 @@ def _get_collection():
 async def ingest_from_notion(force: bool = False) -> dict:
     """
     Full pipeline: Notion → Chunks → Embeddings → ChromaDB
-    Redis lock prevents re-ingest within 5 min.
+
+    Guard logic (priority order):
+    1. force=True          → always re-ingest everything
+    2. ChromaDB has chunks → skip completely (survives restarts, Redis loss)
+    3. Redis lock active   → skip (extra safety within same session)
+    4. Otherwise           → run full ingest
     """
+    collection = _get_collection()
+
+    # ── Guard 1: ChromaDB already has data (primary persistent guard) ──────────
+    if not force:
+        try:
+            existing_count = collection.count()
+            if existing_count > 0:
+                meta = await cache.get(KEY_INGEST_META) or {
+                    "total_chunks": existing_count,
+                    "message": "Chunks already in ChromaDB — skipped"
+                }
+                logger.info(
+                    "Ingest skipped — ChromaDB already has %d chunks (restart-safe)",
+                    existing_count
+                )
+                return {**meta, "skipped": True, "reason": "chromadb_has_data"}
+        except Exception as e:
+            logger.warning("Could not check ChromaDB count: %s", e)
+
+    # ── Guard 2: Redis lock (secondary guard within same session) ──────────────
     if not force and await cache.exists(KEY_INGEST_LOCK):
         meta = await cache.get(KEY_INGEST_META) or {}
-        logger.info("Ingest skipped — lock active")
-        return {**meta, "skipped": True}
+        logger.info("Ingest skipped — Redis lock active")
+        return {**meta, "skipped": True, "reason": "redis_lock"}
 
     logger.info("Starting ingest (force=%s)", force)
-    collection = _get_collection()
-    embedder   = _get_embedder()
+    embedder = _get_embedder()
 
     pages        = await _fetch_all_pages()
     total_chunks = 0
@@ -281,7 +305,7 @@ async def ingest_from_notion(force: bool = False) -> dict:
 
         page_id = meta["notion_page_id"]
 
-        # Delete stale chunks for this page
+        # Delete stale chunks for this page before re-inserting
         try:
             existing = collection.get(where={"notion_page_id": page_id})
             if existing["ids"]:

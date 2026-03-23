@@ -35,6 +35,9 @@ async def api_ingest(req: IngestRequest):
     try:
         from backend.services.rag.ingest_service import ingest_from_notion
         result = await ingest_from_notion(force=req.force)
+        # Safety rule 2: flush answer cache so stale answers never served
+        flushed = await cache.flush_pattern("docforge:rag:answer:*")
+        logger.info("Answer cache flushed after ingest (%d keys)", flushed)
         return result
     except Exception as e:
         logger.error("Ingest error: %s", e)
@@ -88,4 +91,5 @@ async def api_rag_status():
 async def api_flush_cache():
     count  = await cache.flush_pattern("docforge:rag:retrieval:*")
     count += await cache.flush_pattern("docforge:rag:session:*")
+    count += await cache.flush_pattern("docforge:rag:answer:*")
     return {"flushed": count}
