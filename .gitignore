@@ -1,13 +1,48 @@
-.env
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
-.DS_Store
+*.pyd
+*.pyw
+*.pyz
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.env
 .venv/
-myenv/
 venv/
+myenv/
+env/
+ENV/
+
+# ── Build / dist ──────────────────────────────────────────────────────────────
 *.egg-info/
 dist/
 build/
+
+# ── Testing ───────────────────────────────────────────────────────────────────
 .pytest_cache/
+.coverage
+htmlcov/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Project specific ──────────────────────────────────────────────────────────
 chroma_db/
+*.log
+logs/
+
+# ── Secrets (NEVER commit these) ─────────────────────────────────────────────
+.env
+.env.local
+.env.production
+.env.staging
+secrets.json
