@@ -12,10 +12,10 @@ from backend.core.logger import logger
 from backend.services.redis_service import cache
 
 COLLECTION_NAME = "rag_chunks"
-MIN_SCORE       = 0.10
+MIN_SCORE       = 0.20
 TTL_RETRIEVAL   = 600
 TTL_SESSION     = 1800
-TTL_ANSWER      = 3600   # 1 hour — final LLM answer cache
+TTL_ANSWER      = 3600
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -319,44 +319,70 @@ RULES:
 - Never say "I can only answer document questions" — answer everything the user asks"""
 
 
+# ── Singleton clients (created once, reused) ──────────────────────────────────
+# PERF: Previously _get_llm() / _get_embedder() / _get_collection() created a
+# new client object on EVERY call. Each construction triggers Azure SDK init
+# (env reads, connection pool setup). Singletons eliminate that overhead.
 
+_llm_instance = None
+_general_llm_instance = None
+_embedder_instance = None
+_collection_instance = None
 
-
-
-
-
-
-# ── Clients ───────────────────────────────────────────────────────────────────
 
 def _get_llm():
-    from langchain_openai import AzureChatOpenAI
-    return AzureChatOpenAI(
-        azure_endpoint=settings.AZURE_LLM_ENDPOINT,
-        api_key=settings.AZURE_OPENAI_LLM_KEY,
-        azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
-        api_version="2024-12-01-preview",
-        temperature=0.2,
-        max_tokens=3000,
-    )
+    global _llm_instance
+    if _llm_instance is None:
+        from langchain_openai import AzureChatOpenAI
+        _llm_instance = AzureChatOpenAI(
+            azure_endpoint=settings.AZURE_LLM_ENDPOINT,
+            api_key=settings.AZURE_OPENAI_LLM_KEY,
+            azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
+            api_version="2024-12-01-preview",
+            temperature=0.2,
+            max_tokens=3000,
+        )
+    return _llm_instance
+
+
+def _get_general_llm():
+    global _general_llm_instance
+    if _general_llm_instance is None:
+        from langchain_openai import AzureChatOpenAI
+        _general_llm_instance = AzureChatOpenAI(
+            azure_endpoint=settings.AZURE_LLM_ENDPOINT,
+            api_key=settings.AZURE_OPENAI_LLM_KEY,
+            azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
+            api_version="2024-12-01-preview",
+            temperature=0.7,
+            max_tokens=3000,
+        )
+    return _general_llm_instance
 
 
 def _get_embedder():
-    from langchain_openai import AzureOpenAIEmbeddings
-    return AzureOpenAIEmbeddings(
-        azure_endpoint=settings.AZURE_EMB_ENDPOINT,
-        api_key=settings.AZURE_OPENAI_EMB_KEY,
-        azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
-        api_version=settings.AZURE_EMB_API_VERSION,
-    )
+    global _embedder_instance
+    if _embedder_instance is None:
+        from langchain_openai import AzureOpenAIEmbeddings
+        _embedder_instance = AzureOpenAIEmbeddings(
+            azure_endpoint=settings.AZURE_EMB_ENDPOINT,
+            api_key=settings.AZURE_OPENAI_EMB_KEY,
+            azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
+            api_version=settings.AZURE_EMB_API_VERSION,
+        )
+    return _embedder_instance
 
 
 def _get_collection():
-    import chromadb
-    client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
+    global _collection_instance
+    if _collection_instance is None:
+        import chromadb
+        client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
+        _collection_instance = client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+    return _collection_instance
 
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
@@ -367,11 +393,6 @@ def _retrieval_key(query: str, filters: dict, top_k: int) -> str:
 
 
 def _answer_key(question: str, filters: dict) -> str:
-    """
-    Cache key for final LLM answer.
-    Includes filters so different departments/doc_types never share answers.
-    Safety rule 1: key = hash(question + filters), NOT just question.
-    """
     raw = json.dumps({"q": question.strip().lower(), "f": filters}, sort_keys=True)
     return f"docforge:rag:answer:{hashlib.md5(raw.encode()).hexdigest()}"
 
@@ -447,8 +468,6 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
     """
     Smart retrieval with query expansion.
     Searches with original + expanded queries, merges and deduplicates results.
-    Handles semantic mismatch: user says "pay" → finds "compensation",
-    user says "fire" → finds "termination/dismissal", etc.
     """
     key    = _retrieval_key(query, filters, top_k)
     cached = await cache.get(key)
@@ -470,12 +489,16 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
             variants = [v.strip() for v in expanded.splitlines() if v.strip()][:3]
             logger.info("Query expanded to: %s", variants)
 
-            # Search with each variant
             seen_ids = {c["notion_page_id"] + c["heading"] for c in all_chunks}
-            for variant in variants:
-                extra = await _retrieve_single(
-                    variant, filters, 4, embedder, collection)
-                for c in extra:
+            # PERF: run variant retrievals in parallel instead of sequential
+            variant_results = await asyncio.gather(
+                *[_retrieve_single(v, filters, 4, embedder, collection) for v in variants],
+                return_exceptions=True,
+            )
+            for extras in variant_results:
+                if isinstance(extras, Exception):
+                    continue
+                for c in extras:
                     uid = c["notion_page_id"] + c["heading"]
                     if uid not in seen_ids:
                         seen_ids.add(uid)
@@ -493,23 +516,36 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
 
     final = final[:top_k]
 
-    # Diversity check: if all chunks from same doc, try to get more variety
+    # Diversity check — trigger if ANY single doc contributes > 50% of chunks
     if final:
-        unique_titles = {c["doc_title"] for c in final}
-        if len(unique_titles) == 1:
-            logger.info("Low diversity: all %d chunks from '%s', expanding...",
-                        len(final), next(iter(unique_titles)))
+        doc_counts = {}
+        for c in final:
+            doc_counts[c["doc_title"]] = doc_counts.get(c["doc_title"], 0) + 1
+        dominant_doc = max(doc_counts, key=doc_counts.get)
+        dominant_pct = doc_counts[dominant_doc] / len(final)
+
+        if dominant_pct > 0.5:
+            unique_titles = {c["doc_title"] for c in final}
+            logger.info("Low diversity: '%s' = %.0f%% of chunks, expanding...",
+                        dominant_doc, dominant_pct * 100)
             diverse_queries = [
-                f"{query} employment contract",
-                f"{query} vendor agreement",
-                f"{query} sales NDA",
+                f"{query} employee handbook policy",
+                f"{query} employment contract terms",
+                f"{query} vendor agreement conditions",
+                f"{query} HR policy procedure",
             ]
             seen = {c["notion_page_id"] + c["heading"] for c in final}
-            for dq in diverse_queries:
-                extra = await _retrieve_single(dq, {}, 3, embedder, collection)
-                for c in extra:
+            # PERF: run diversity queries in parallel
+            diverse_results = await asyncio.gather(
+                *[_retrieve_single(dq, {}, 3, embedder, collection) for dq in diverse_queries],
+                return_exceptions=True,
+            )
+            for extras in diverse_results:
+                if isinstance(extras, Exception):
+                    continue
+                for c in extras:
                     uid = c["notion_page_id"] + c["heading"]
-                    if uid not in seen and c["doc_title"] not in unique_titles:
+                    if uid not in seen and c["doc_title"] != dominant_doc:
                         seen.add(uid)
                         unique_titles.add(c["doc_title"])
                         final.append(c)
@@ -517,7 +553,31 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
             logger.info("After diversity: %d chunks from %d docs",
                         len(final), len({c["doc_title"] for c in final}))
 
-    await cache.set(key, final, ttl=TTL_RETRIEVAL)
+    # Table recovery
+    _table_ref_phrases = [
+        "as per the table", "refer to the table", "table below",
+        "outlined below", "as follows", "see the table", "per the schedule",
+        "listed below", "as detailed below", "entitlement table",
+        "schedule below", "the following table",
+    ]
+    _table_refs_found = any(
+        phrase in c["content"].lower()
+        for c in final
+        for phrase in _table_ref_phrases
+    )
+    if _table_refs_found:
+        logger.info("Table reference detected — running targeted table recovery query")
+        _recovery_q = f"{query} table entitlement schedule days carry forward list"
+        seen_ids = {c["notion_page_id"] + c["heading"] for c in final}
+        extra = await _retrieve_single(_recovery_q, filters, 5, embedder, collection)
+        for c in extra:
+            uid = c["notion_page_id"] + c["heading"]
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                final.append(c)
+        final = sorted(final, key=lambda x: x["score"], reverse=True)[:top_k + 3]
+        logger.info("After table recovery: %d chunks", len(final))
+
     logger.info("Retrieved %d chunks (with expansion) for: %s", len(final), query[:50])
     return final
 
@@ -525,25 +585,21 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
 def _build_context(chunks: list) -> str:
     if not chunks:
         return "No relevant documents found."
-    # Only include chunks with score >= 0.20 to avoid noise
     quality = [c for c in chunks if c.get("score", 0) >= 0.20]
     if not quality:
-        quality = chunks[:5]  # fallback: take top 5 regardless of score
+        quality = chunks[:5]
     return "\n\n---\n\n".join(
         f"Source: {c['citation']}\n{c['content']}"
         for c in quality)
 
 
 def _citations(chunks: list) -> list:
-    """Only return citations for chunks actually used (top 8 by score max)."""
     seen, out = set(), []
-    # Sort by score and take only top chunks — these are what LLM actually used
     top_chunks = sorted(chunks, key=lambda x: x.get("score", 0), reverse=True)[:8]
     for c in top_chunks:
         cit     = c.get("citation", "")
         page_id = c.get("notion_page_id", "")
         url     = f"https://www.notion.so/{page_id}" if page_id else ""
-        # Deduplicate by doc_title + heading combo
         dedup_key = c.get("doc_title", "") + "§" + c.get("heading", "")
         if cit and dedup_key not in seen:
             seen.add(dedup_key)
@@ -564,7 +620,6 @@ def _classify_intent(question: str) -> str:
     """Smart rule-based intent detection for all question types."""
     q = question.lower().strip().rstrip("!?.")
 
-    # ── Greeting ──────────────────────────────────────────────────────────────
     if q in ["hey", "hi", "hello", "hiya", "yo", "sup", "howdy",
              "thanks", "thank you", "thx", "bye", "goodbye", "ok", "okay", "cool"]:
         return "GREETING"
@@ -579,7 +634,6 @@ def _classify_intent(question: str) -> str:
     if any(q.startswith(w) for w in ["who are you", "what are you", "what can you do"]):
         return "GREETING"
 
-    # ── General knowledge / code / creative (not in documents) ────────────────
     if any(p in q for p in ["who is the president", "what is the capital",
                               "prime minister of", "chief minister of", " cm of ",
                               "ceo of ", "history of ", "population of",
@@ -587,7 +641,6 @@ def _classify_intent(question: str) -> str:
                               "when was born", "tallest building"]):
         return "GENERAL"
 
-    # Code generation — "write a fibonacci", "write me a function", etc.
     _doc_words = ["policy", "contract", "letter", "offer", "document",
                   "clause", "agreement", "nda", "sow", "handbook",
                   "employee", "leave", "salary", "hr", "turabit"]
@@ -599,37 +652,29 @@ def _classify_intent(question: str) -> str:
             return "GENERAL"
 
     if any(p in q for p in [
-        # Code / algorithms
         "fibonacci", "factorial", "sorting algorithm", "binary search",
         "linked list", "data structure", "write code", "python code",
         "java code", "javascript code", " in python", " in java",
         " in javascript", " in c++", " in golang", " in typescript",
         "function that ", "algorithm for", "regex for", "sql query for",
         "write a program", "write a script", "write a class",
-        # Math
         "calculate ", "solve for", "integral of", "derivative of",
         "what is 2+", "what is 3+", "square root of",
-        # Creative writing
         "write a poem", "write a joke", "tell me a joke",
         "write a story", "write an essay", "write a haiku",
         "write an email to", "draft an email", "write a message to",
         "write a cover letter for", "write a resignation",
-        # General how-to (tech, not document related)
         "how to install", "how to setup", "how to configure",
         "how to use git", "how to deploy", "how to fix error",
-        # Conversational / opinion
         "what do you think about", "what is your opinion",
         "recommend a book", "suggest a movie", "best way to learn",
-        # General CS / tech concepts
         "what is machine learning", "what is artificial intelligence",
         "what is blockchain", "explain quantum", "what is photosynthesis",
         "how does the internet", "what is tcp/ip", "what is http",
         "what is rest api", "what is docker", "what is kubernetes",
-        # Template writing — write a generic template, not search documents
         "write a template", "write an nda template", "write a contract template",
         "draft a template", "create a template", "make a template",
         "write a sample contract", "write a sample agreement",
-        # Translation tasks
         "translate to ", "translate the ", "translate this ",
         "convert to hindi", "convert to spanish", "convert to french",
         " in hindi", " in spanish", " in french", " in german",
@@ -638,102 +683,80 @@ def _classify_intent(question: str) -> str:
         if not any(w in q for w in _doc_words):
             return "GENERAL"
 
-    # ── Analysis questions (complex reasoning over documents) ─────────────────
     if any(p in q for p in [
-        # Contradiction / conflict
         "contradict", "contradiction", "inconsisten", "conflict",
         "internal conflict", "mutually exclusive", "violat", "comply",
         "complying with", "clause violat", "obligation", "exclusive",
-        # Gaps / missing
         "missing", "what is missing", "gaps in", "incomplete",
         "not mentioned", "not covered", "absent", "omitted",
         "is there a lack", "is there an absence", "insufficiently",
         "are provisions", "are there missing", "lack of",
-        # Issues / problems
         "issue", "problem", "wrong", "weakness", "flaw",
         "loophole", "ambiguous", "unclear", "vague",
-        # Review / audit
         "review", "audit", "evaluate", "assess", "analyse", "analyze",
         "check", "verify", "examine",
-        # Improvement
         "improve", "recommendation", "suggest", "better",
-        # Completeness
         "complete", "correct", "accurate", "valid",
-        # Compliance
         "comply", "complian", "legal", "enforceable",
-        # Liability / fairness
         "expose one party", "excessive liability", "one-sided",
         "unfair clause", "disproportionate", "favor one party",
         "unintentionally favor",
-        # Terms / definitions
         "key terms properly", "properly defined", "subjective terms",
         "reasonable or promptly", "multiple interpretations",
         "could any clause", "are there vague", "vague terms",
         "defined consistently", "used consistently",
         "definitions used", "terms defined", "defined throughout",
         "defined across", "consistently defined", "consistently used",
-        # Duration / timeline
         "duration of confidentiality", "is the duration",
         "clearly defined for both", "timelines aligned",
         "deadlines aligned", "durations aligned",
-        # Exit / termination
         "fair exit", "exit mechanism", "notice periods create",
         "notice period create", "notice period conflict",
         "notice periods conflict", "do notice", "notice period risk",
         "triggered arbitrarily", "misused", "be bypassed",
-        # Enforcement / penalties
         "enforcement mechanisms", "strong enough",
         "sufficient to deter", "penalties sufficient",
         "penalties defined", "late fees", "tax responsibilities",
         "tax responsibility", "clearly assigned",
         "payment penalties", "properly defined",
-        # Structure
         "logical structure", "follow a logical", "hierarchy between",
         "clause hierarchy", "precedence rule", "scale well",
         "roles and responsibilities", "cross-references",
         "master agreement governing", "align with industry",
         "scale for future",
-        # IP / data
         "intellectual property rights", "ip rights",
         "data protection obligations", "regulatory compliance gaps",
-        # Fairness / balance
         "fair and enforceable", "clearly stated", "clearly defined",
         "one-sided", "favor one", "unintentionally",
         "proportionate", "balanced",
     ]):
         return "ANALYSIS"
 
-    # ── Compare two documents ─────────────────────────────────────────────────
     if any(w in q for w in ["compare", "difference between", " vs ",
                               "versus", "contrast", "which is better",
                               "how do they differ", "what's the difference"]):
         return "COMPARE"
 
-    # ── Full document request ─────────────────────────────────────────────────
     if any(p in q for p in ["full ", "complete ", "entire ", "whole ",
                               "give me the full", "show me the full",
                               "full offer", "full contract", "full letter",
                               "full handbook", "full document", "full policy"]):
         return "FULL_DOC"
 
-    # ── Summary / overview ────────────────────────────────────────────────────
     if any(w in q for w in ["summarise", "summarize", "summary", "overview",
                               "brief", "in short", "key points", "main points",
                               "highlight", "gist", "tldr", "tl;dr"]):
         return "SUMMARY"
 
-    # ── List questions ────────────────────────────────────────────────────────
     if any(p in q for p in ["list all", "list the", "all the ", "what are all",
                               "give me all", "show all", "what types of",
                               "what kind of", "enumerate", "what policies"]):
         return "LIST"
 
-    # ── Yes/No questions ──────────────────────────────────────────────────────
     if q.startswith(("is ", "are ", "does ", "do ", "has ", "have ",
                       "can ", "will ", "was ", "were ", "should ")):
         return "YESNO"
 
-    # ── Specific fact ─────────────────────────────────────────────────────────
     if any(p in q for p in ["how many", "how much", "how long", "how often",
                               "what is the", "when is", "when does", "who is",
                               "which", "notice period", "salary", "working hours",
@@ -741,7 +764,6 @@ def _classify_intent(question: str) -> str:
                               "percentage", "number of"]):
         return "SPECIFIC"
 
-    # ── Explanation ───────────────────────────────────────────────────────────
     if any(p in q for p in ["explain", "how does", "how do", "why is",
                               "why does", "what happens", "walk me through",
                               "tell me about", "describe", "elaborate",
@@ -749,7 +771,6 @@ def _classify_intent(question: str) -> str:
         return "EXPLAIN"
 
     return "SEARCH"
-
 
 
 # ── Casual responses ──────────────────────────────────────────────────────────
@@ -777,9 +798,49 @@ def _casual_response(question: str) -> str:
 
 async def tool_search(question: str, filters: dict,
                       session_id: str, top_k: int = 8) -> dict:
-    chunks  = await _retrieve(question, filters, top_k)
-    context = _build_context(chunks)
-    history = await _get_history(session_id)
+    chunks = await _retrieve(question, filters, top_k)
+
+    _hr_policy_signals = [
+        "leave", "policy", "handbook", "employee", "hr ", "salary",
+        "working hours", "holiday", "benefit", "attendance", "overtime",
+        "probation", "notice", "resignation", "reimbursement", "appraisal",
+    ]
+    q_lower = question.lower()
+    _is_hr_policy = any(sig in q_lower for sig in _hr_policy_signals)
+
+    if _is_hr_policy:
+        _hr_fallback_queries = [
+            f"{question} employee handbook turabit policy",
+            f"{question} HR policy leave entitlement days",
+            f"{question} employment contract terms conditions",
+        ]
+        seen       = {c["notion_page_id"] + c["heading"] for c in chunks}
+        embedder   = _get_embedder()
+        collection = _get_collection()
+        # PERF: run HR fallback queries in parallel
+        hr_results = await asyncio.gather(
+            *[_retrieve_single(fq, {}, 4, embedder, collection) for fq in _hr_fallback_queries],
+            return_exceptions=True,
+        )
+        for extras in hr_results:
+            if isinstance(extras, Exception):
+                continue
+            for c in extras:
+                uid = c["notion_page_id"] + c["heading"]
+                if uid not in seen:
+                    seen.add(uid)
+                    chunks.append(c)
+        chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)[:top_k + 4]
+        logger.info("HR second-pass: now %d chunks from %d docs",
+                    len(chunks), len({c["doc_title"] for c in chunks}))
+
+    # PERF: run context build and history fetch in parallel
+    context, history = await asyncio.gather(
+        asyncio.coroutine(lambda: _build_context(chunks))() if asyncio.iscoroutinefunction(_build_context)
+            else asyncio.get_event_loop().run_in_executor(None, _build_context, chunks),
+        _get_history(session_id),
+    )
+
     answer  = _get_llm().invoke(
         ANSWER_PROMPT.format(history=history, context=context, question=question)
     ).content.strip()
@@ -797,9 +858,12 @@ async def tool_search(question: str, filters: dict,
 async def tool_full_doc(question: str, filters: dict,
                         session_id: str) -> dict:
     """For full document requests — retrieve more chunks with higher top_k."""
-    chunks  = await _retrieve(question, filters, top_k=15)
+    # PERF: run retrieval and history in parallel
+    chunks_coro = _retrieve(question, filters, top_k=15)
+    history_coro = _get_history(session_id)
+    chunks, history = await asyncio.gather(chunks_coro, history_coro)
+
     context = _build_context(chunks)
-    history = await _get_history(session_id)
     prompt  = ANSWER_PROMPT.format(
         history=history, context=context, question=question)
     answer  = _get_llm().invoke(prompt).content.strip()
@@ -817,11 +881,15 @@ async def tool_full_doc(question: str, filters: dict,
 async def tool_refine(question: str, filters: dict,
                       session_id: str, top_k: int = 15) -> dict:
     """HyDE for summaries — generate hypothetical answer first for better retrieval."""
-    hyp     = _get_llm().invoke(
-        HYDE_PROMPT.format(question=question)).content.strip()
+    # PERF: run HyDE generation and history fetch in parallel
+    hyp_coro     = asyncio.get_event_loop().run_in_executor(
+        None, lambda: _get_llm().invoke(HYDE_PROMPT.format(question=question)).content.strip()
+    )
+    history_coro = _get_history(session_id)
+    hyp, history = await asyncio.gather(hyp_coro, history_coro)
+
     chunks  = await _retrieve(hyp, filters, top_k)
     context = _build_context(chunks)
-    # Use dedicated SUMMARY_PROMPT for structured, scannable output
     answer  = _get_llm().invoke(
         SUMMARY_PROMPT.format(context=context, question=question)
     ).content.strip()
@@ -839,28 +907,25 @@ async def tool_refine(question: str, filters: dict,
 async def tool_compare(question: str, doc_a: str, doc_b: str,
                        filters: dict, session_id: str, top_k: int = 6) -> dict:
 
-    # Retrieve separately with doc-specific filters
-    # Search with doc name embedded in query for better matching
     _boost = "contract agreement clause legal terms obligations"
     query_a = f"{question} {_boost} {doc_a}"
     query_b = f"{question} {_boost} {doc_b}"
 
-    chunks_a, chunks_b = await asyncio.gather(
+    # PERF: already parallel — also fetch history at the same time
+    chunks_a, chunks_b, history = await asyncio.gather(
         _retrieve(query_a, filters, top_k * 3),
         _retrieve(query_b, filters, top_k * 3),
+        _get_history(session_id),  # PERF: was fetched separately after retrieval
     )
 
     def filter_doc(chunks, title):
-        # Try exact title match first
         exact = [c for c in chunks if title.lower() in c["doc_title"].lower()]
         if exact:
             return exact[:top_k]
-        # Try partial word match
         words = [w for w in title.lower().split() if len(w) > 3]
         partial = [c for c in chunks if any(w in c["doc_title"].lower() for w in words)]
         if partial:
             return partial[:top_k]
-        # Last resort - top scoring chunks
         return sorted(chunks, key=lambda x: x["score"], reverse=True)[:top_k]
 
     chunks_a = filter_doc(chunks_a, doc_a)
@@ -919,15 +984,9 @@ async def tool_analysis(question: str, filters: dict,
                         session_id: str) -> dict:
     """
     For analysis questions — retrieve broad context then reason over it.
-    Key insight: never search for 'contradictions' in vector DB —
-    instead retrieve actual document content broadly, then let LLM analyze it.
     """
-    # Step 1: Build smart retrieval queries based on question type
-    # Key insight: for legal/contract questions, always boost with contract keywords
-    # For Q28 "notice periods" — force retrieval from contract termination sections
     q_lower = question.lower()
 
-    # Detect legal/contract questions and build targeted query
     legal_keywords = [
         "notice period", "termination", "liability", "indemnity", "clause",
         "contract", "agreement", "confidential", "penalty", "enforce",
@@ -940,35 +999,38 @@ async def tool_analysis(question: str, filters: dict,
     is_legal = any(kw in q_lower for kw in legal_keywords)
 
     if is_legal:
-        # For legal questions: retrieve from contract documents specifically
         contract_boost = "contract agreement clause legal terms obligations termination"
         primary_query = f"{question} {contract_boost}"
     else:
         primary_query = question
 
-    # Step 2: Retrieve broadly using subject keywords
-    chunks = await _retrieve(primary_query, filters, top_k=15)
+    # PERF: run primary retrieval and history fetch in parallel
+    chunks, history = await asyncio.gather(
+        _retrieve(primary_query, filters, top_k=15),
+        _get_history(session_id),  # PERF: fetched in parallel instead of after
+    )
 
-    # Step 3: For legal questions, also retrieve with specific contract focus
     if is_legal and len(chunks) < 10:
-        # Try alternative retrieval with pure legal terms
         legal_queries = [
             f"termination notice period contract agreement {question}",
             f"clause obligation legal contract {question}",
             f"employment vendor sales NDA agreement {question}",
         ]
         seen = {c["notion_page_id"] + c["heading"] for c in chunks}
-        for lq in legal_queries[:2]:
-            extra = await _retrieve(lq, {}, top_k=5)
-            for c in extra:
+        # PERF: run legal fallback queries in parallel
+        legal_results = await asyncio.gather(
+            *[_retrieve(lq, {}, top_k=5) for lq in legal_queries[:2]],
+            return_exceptions=True,
+        )
+        for extras in legal_results:
+            if isinstance(extras, Exception):
+                continue
+            for c in extras:
                 uid = c["notion_page_id"] + c["heading"]
                 if uid not in seen:
                     seen.add(uid)
                     chunks.append(c)
 
-    # Step 3: If still empty, retrieve everything available
-    # Always do a second pass for legal/cross-document analysis
-    # This ensures we get diverse document types not just the closest semantic match
     legal_contract_queries = [
         "employment contract termination confidentiality obligations",
         "vendor contract payment liability dispute resolution",
@@ -976,9 +1038,15 @@ async def tool_analysis(question: str, filters: dict,
         "service agreement indemnity force majeure clause",
     ]
     seen = {c["notion_page_id"] + c["heading"] for c in chunks}
-    for lq in legal_contract_queries:
-        extra = await _retrieve(lq, {}, top_k=4)
-        for c in extra:
+    # PERF: run all contract queries in parallel
+    contract_results = await asyncio.gather(
+        *[_retrieve(lq, {}, top_k=4) for lq in legal_contract_queries],
+        return_exceptions=True,
+    )
+    for extras in contract_results:
+        if isinstance(extras, Exception):
+            continue
+        for c in extras:
             uid = c["notion_page_id"] + c["heading"]
             if uid not in seen:
                 seen.add(uid)
@@ -992,9 +1060,15 @@ async def tool_analysis(question: str, filters: dict,
             "employment HR leave salary",
         ]
         seen2 = set()
-        for q in broad_queries:
-            extra = await _retrieve(q, {}, top_k=4)
-            for c in extra:
+        # PERF: run broad fallback queries in parallel
+        broad_results = await asyncio.gather(
+            *[_retrieve(q, {}, top_k=4) for q in broad_queries],
+            return_exceptions=True,
+        )
+        for extras in broad_results:
+            if isinstance(extras, Exception):
+                continue
+            for c in extras:
                 uid = c["notion_page_id"] + c["heading"]
                 if uid not in seen2:
                     seen2.add(uid)
@@ -1009,7 +1083,6 @@ async def tool_analysis(question: str, filters: dict,
             "confidence": "low",
         }
 
-    # Sort by score and take best 35 for rich context
     chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)
     context = _build_context(chunks[:20])
 
@@ -1033,15 +1106,16 @@ async def _rewrite_query(question: str) -> tuple[str, str]:
     Returns (rewritten_question, intent)
     Falls back to original question if LLM fails.
     """
-    # Skip rewrite for very short/simple questions (speed)
     q = question.strip().lower()
     if len(q.split()) <= 3:
         return question, _classify_intent(question)
 
     try:
-        raw = _get_llm().invoke(
-            REWRITE_PROMPT.format(question=question)
-        ).content.strip()
+        # PERF: run rewrite in executor so it doesn't block the event loop
+        raw = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _get_llm().invoke(REWRITE_PROMPT.format(question=question)).content.strip()
+        )
 
         rewritten = question
         intent    = "SEARCH"
@@ -1052,7 +1126,6 @@ async def _rewrite_query(question: str) -> tuple[str, str]:
             elif line.startswith("INTENT:"):
                 intent = line.replace("INTENT:", "").strip().upper()
 
-        # Validate intent
         valid = {"GREETING","GENERAL","COMPARE","FULL_DOC","SUMMARY",
                  "LIST","YESNO","SPECIFIC","EXPLAIN","ANALYSIS","SEARCH"}
         if intent not in valid:
@@ -1066,31 +1139,18 @@ async def _rewrite_query(question: str) -> tuple[str, str]:
         return question, _classify_intent(question)
 
 
-def _get_general_llm():
-    """Shared LLM client for GENERAL (ChatGPT-style) responses. Temperature 0.7."""
-    from langchain_openai import AzureChatOpenAI
-    return AzureChatOpenAI(
-        azure_endpoint=settings.AZURE_LLM_ENDPOINT,
-        api_key=settings.AZURE_OPENAI_LLM_KEY,
-        azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
-        api_version="2024-12-01-preview",
-        temperature=0.7,
-        max_tokens=3000,
-    )
-
-
 async def _call_general_llm(question: str, session_id: str) -> dict:
-    """
-    Shared handler for GENERAL (ChatGPT-style) queries.
-    Used by both the hard-guard and the GENERAL intent branch in answer().
-    """
     from langchain_core.messages import SystemMessage, HumanMessage
     history = await _get_history(session_id)
     user_content = f"{history}\n{question}".strip() if history else question
-    ans = _get_general_llm().invoke([
-        SystemMessage(content=_GENERAL_SYSTEM_PROMPT),
-        HumanMessage(content=user_content),
-    ]).content.strip()
+    # PERF: run in executor so it doesn't block event loop
+    ans = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: _get_general_llm().invoke([
+            SystemMessage(content=_GENERAL_SYSTEM_PROMPT),
+            HumanMessage(content=user_content),
+        ]).content.strip()
+    )
     await _save_turn(session_id, question, ans)
     return {
         "answer":     ans,
@@ -1113,9 +1173,6 @@ async def answer(
 ) -> dict:
     filters = filters or {}
 
-    # ── Cache check on ORIGINAL question — BEFORE rewrite (Fix 3) ────────────
-    # This means 2nd+ identical queries skip the 2s rewrite LLM call entirely
-    # Key includes filters so HR dept never gets Finance dept cached answer
     _q_lower = question.lower().strip()
     _skip_cache = any(_q_lower.startswith(w) for w in
                       ["hey", "hi", "hello", "thanks", "bye", "ok", "okay"])
@@ -1125,7 +1182,13 @@ async def answer(
         if _cached_orig is not None:
             logger.info("Answer cache HIT (pre-rewrite) for: %s", question[:50])
             return _cached_orig
-    # Catches code/math/creative queries that must NEVER hit RAG
+
+    # PERF: build the answer key once here so we don't recompute below
+    if not _skip_cache and not doc_a and not doc_b:
+        pass  # _akey_orig already set above
+    else:
+        _akey_orig = None
+
     _q = question.lower().strip()
     _doc_signals = ["policy", "contract", "agreement", "nda", "sow", "clause",
                     "document", "employee", "leave", "salary", "hr", "turabit",
@@ -1145,12 +1208,10 @@ async def answer(
         "what is machine learning", "what is deep learning", "what is ai",
         "what is blockchain", "explain quantum", "how does tcp",
         "how to install", "how to setup", "how to deploy",
-        # Fix 1 — template writing tasks
         "write a template", "write an nda template", "write a contract template",
         "write a non-disclosure agreement template", "write an agreement template",
         "draft a template", "create a template", "make a template",
         "write a sample contract", "write a sample agreement",
-        # Fix 2 — translation tasks
         "translate to ", "translate the ", "translate this ",
         "convert to hindi", "convert to spanish", "convert to french",
         "convert to gujarati", "convert to marathi", "convert to tamil",
@@ -1161,40 +1222,37 @@ async def answer(
         if not any(s in _q for s in _doc_signals):
             logger.info("Hard GENERAL guard triggered for: %s", question[:50])
             result = await _call_general_llm(question, session_id)
-            if not _skip_cache:
+            if _akey_orig:
                 await cache.set(_akey_orig, result, ttl=TTL_ANSWER)
             return result
 
     # Use rule-based for obvious cases (fast, no LLM call)
     quick_intent = _classify_intent(question)
+
+    # PERF: COMPARE intent never needs an LLM rewrite — the keyword match is definitive.
+    # Skips an entire LLM round-trip (~3-5s) for every compare query.
     if quick_intent == "GREETING":
         intent, rewritten = "GREETING", question
     elif quick_intent == "GENERAL":
         intent, rewritten = "GENERAL", question
+    elif quick_intent == "COMPARE":
+        intent, rewritten = "COMPARE", question   # PERF: was falling through to _rewrite_query
     elif quick_intent == "ANALYSIS":
-        # NEVER rewrite analysis questions — LLM rewrite can downgrade to YESNO/SPECIFIC
-        # Pass original question directly to tool_analysis which handles its own query building
         intent, rewritten = "ANALYSIS", question
     elif quick_intent in ("YESNO", "SPECIFIC"):
-        # For yes/no and specific: use LLM rewrite BUT preserve ANALYSIS if LLM upgrades it
         rewritten, llm_intent = await _rewrite_query(question)
-        # LLM can upgrade YESNO→ANALYSIS but never downgrade ANALYSIS
         intent = llm_intent if llm_intent != "YESNO" or quick_intent == "YESNO" else quick_intent
-        # If rewritten question now sounds analytical, force ANALYSIS
         if _classify_intent(rewritten) == "ANALYSIS":
             intent = "ANALYSIS"
-            rewritten = question  # Use original for analysis
+            rewritten = question
     else:
-        # Use LLM to understand and rewrite the question
         rewritten, intent = await _rewrite_query(question)
 
     logger.info("Intent: %s | Original: '%s' | Rewritten: '%s'",
                 intent, question[:50], rewritten[:50])
 
-    # Use rewritten question for all RAG operations
     question = rewritten
 
-    # 1. Greeting — instant response
     if intent == "GREETING":
         response = _casual_response(question)
         await _save_turn(session_id, question, response)
@@ -1206,60 +1264,47 @@ async def answer(
             "confidence": "high",
         }
 
-    # 2. General — answer with LLM directly (ChatGPT-style, no RAG)
     if intent == "GENERAL":
         result = await _call_general_llm(question, session_id)
-        if not _skip_cache:
+        if _akey_orig:
             await cache.set(_akey_orig, result, ttl=TTL_ANSWER)
         return result
 
-    # 3. Compare — skip cache (doc_a/doc_b already excluded above)
     if intent == "COMPARE" or (doc_a and doc_b):
         return await tool_compare(
             question, doc_a or "Document A", doc_b or "Document B",
             filters, session_id, top_k)
 
-    # 4. Full document
     if intent == "FULL_DOC":
         result = await tool_full_doc(question, filters, session_id)
-        if not _skip_cache:
+        if _akey_orig:
             await cache.set(_akey_orig, result, ttl=TTL_ANSWER)
         return result
 
-    # 5. Summary / Overview
     if intent == "SUMMARY":
         result = await tool_refine(question, filters, session_id, top_k)
-        if not _skip_cache:
+        if _akey_orig:
             await cache.set(_akey_orig, result, ttl=TTL_ANSWER)
         return result
 
-    # 6. Analysis (contradictions, gaps, issues, review)
     if intent == "ANALYSIS":
         result = await tool_analysis(question, filters, session_id)
-        if not _skip_cache:
+        if _akey_orig:
             await cache.set(_akey_orig, result, ttl=TTL_ANSWER)
         return result
 
-    # 7. List — retrieve more for complete lists
     if intent == "LIST":
         result = await tool_search(question, filters, session_id, top_k=12)
-    # 8. Yes/No — standard search, short answer
     elif intent == "YESNO":
         result = await tool_search(question, filters, session_id, top_k=6)
-    # 9. Specific fact — standard search
     elif intent == "SPECIFIC":
         result = await tool_search(question, filters, session_id, top_k=6)
-    # 10. Explanation — refine for better context
     elif intent == "EXPLAIN":
         result = await tool_refine(question, filters, session_id, top_k)
-    # 11. Default search
     else:
         result = await tool_search(question, filters, session_id, top_k)
 
-    # ── Save answer to cache using ORIGINAL question key ─────────────────────
-    # Using _akey_orig ensures the pre-rewrite cache check hits next time
-    # Same question typed again → instant, no rewrite LLM call needed
-    if not _skip_cache and not doc_a and not doc_b:
+    if _akey_orig:
         await cache.set(_akey_orig, result, ttl=TTL_ANSWER)
         logger.info("Answer cached for: %s", question[:50])
 

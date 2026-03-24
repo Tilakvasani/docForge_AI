@@ -1,0 +1,102 @@
+[
+  {
+    "document": "NDA",
+    "question": "what are the confidentiality obligations in the nda",
+    "ground_truth": "The NDA requires the receiving party to keep all disclosed confidential information strictly confidential, use it only for the agreed purpose, and not disclose it to third parties without prior written consent. Permitted disclosures include legally required disclosures and sharing with affiliates or advisors bound by equivalent confidentiality obligations. The confidentiality obligation survives termination for three years."
+  },
+  {
+    "document": "SOW / Sales Contract",
+    "question": "compare sow vs nda confidentiality clauses",
+    "ground_truth": "An NDA confidentiality clause lasts 3 years post-termination and covers business strategies, technical data, pricing, and customer information. A Statement of Work does not contain a standalone confidentiality clause and relies on the governing NDA for confidentiality protection. Best practice is to embed a dedicated confidentiality clause in the SOW referencing the NDA."
+  },
+  {
+    "document": "Vendor Contract",
+    "question": "what are the payment terms in the vendor contract",
+    "ground_truth": "The vendor contract specifies payment terms including invoice submission timelines, payment due dates typically within 30 days of invoice receipt, and applicable late payment penalties or interest. GST and applicable taxes are handled as per Indian regulatory requirements. TDS deductions are made as required by law and TDS certificates provided within the statutory timeline."
+  },
+  {
+    "document": "Service Agreement",
+    "question": "what are the termination rights in the service agreement",
+    "ground_truth": "The service agreement grants both parties the right to terminate with written notice, typically 30 to 60 days. Termination for cause may be immediate upon material breach if the breach is not remedied within a specified cure period. Post-termination obligations include returning confidential information and settling all outstanding payments."
+  },
+  {
+    "document": "Licensing Agreement",
+    "question": "what are the intellectual property rights in the licensing agreement",
+    "ground_truth": "The licensing agreement grants the licensee a non-exclusive, non-transferable right to use the licensed intellectual property for specified purposes and duration. All IP rights remain with the licensor. The licensee may not sublicense, modify, or reverse-engineer the licensed material without prior written consent of the licensor."
+  },
+  {
+    "document": "Employment Contract",
+    "question": "what are the employee benefits in the employment contract",
+    "ground_truth": "Employee benefits at turabit include health insurance, provident fund contributions per Indian law, paid leave entitlements, and performance-based bonuses as defined in individual contracts. Benefits during probation, leave, or termination are governed by company policy and applicable Indian regulatory requirements."
+  },
+  {
+    "document": "Employee Handbook",
+    "question": "what are the leave policy details",
+    "ground_truth": "Turabit employees are entitled to paid vacation, sick leave, and statutory leaves per Indian labor laws. Leave eligibility begins after successful probation completion. Requests must be submitted via the HR portal or in writing with sufficient notice subject to operational feasibility. Unused leave may be carried forward up to a company-defined maximum with forfeiture beyond that limit unless approved."
+  },
+  {
+    "document": "Leave Approval Letter",
+    "question": "what are the conditions in the leave approval letter",
+    "ground_truth": "The leave approval letter conditions include completing proper handover before proceeding on leave, remaining reachable for urgent matters, obtaining prior HR approval for any extensions, and adhering to the approved leave dates. The letter references a unique leave request reference number and specifies the type, duration, and exact dates of approved leave."
+  },
+  {
+    "document": "Influencer Agreement",
+    "question": "what are the obligations of the influencer in the influencer agreement",
+    "ground_truth": "The influencer agreement requires the influencer to create and publish content as specified, disclose the commercial relationship per applicable advertising guidelines, maintain brand consistency, and not make unauthorized claims about products or services. The influencer must not engage in conduct that brings turabit into disrepute during or after the agreement term."
+  },
+  {
+    "document": "Procurement Compliance Checklist",
+    "question": "what does the procurement compliance checklist verify",
+    "ground_truth": "The Procurement Compliance Checklist verifies that all required contract documentation is in place before a vendor engagement proceeds. This includes signed agreements, insurance certificates, tax registration documents, and compliance declarations. It ensures vendors meet turabit's procurement standards before onboarding."
+  },
+  {
+    "document": "NDA",
+    "question": "what are the exclusions from confidentiality in the nda",
+    "ground_truth": "The NDA excludes from confidentiality obligations information that is already in the public domain, was known to the receiving party prior to disclosure, is independently developed without use of confidential information, or is required to be disclosed by law or court order. These exclusions must be demonstrable by the receiving party."
+  },
+  {
+    "document": "Vendor Contract",
+    "question": "what are the liability caps in the vendor contract",
+    "ground_truth": "The vendor contract limits each party's total liability to the fees paid or payable under the contract in the preceding 12 months. Liability caps typically exclude gross negligence, wilful misconduct, indemnity obligations, and confidentiality breaches which may carry unlimited liability."
+  },
+  {
+    "document": "Service Agreement",
+    "question": "what are the dispute resolution mechanisms in the service agreement",
+    "ground_truth": "The service agreement provides for dispute resolution through escalation to senior management first, followed by mediation, and finally arbitration if unresolved. Arbitration is conducted under Indian Arbitration and Conciliation Act rules. Courts of the specified jurisdiction serve as the final recourse."
+  },
+  {
+    "document": "Employment Contract",
+    "question": "what are the post termination obligations in the employment contract",
+    "ground_truth": "Post-termination obligations include returning all company property, maintaining confidentiality of proprietary information, honoring non-solicitation provisions, and cooperating in handover of responsibilities. Final settlement of dues including unpaid salary, leave encashment, and provident fund is completed within the statutory timeframe under Indian law."
+  },
+  {
+    "document": "Employee Handbook",
+    "question": "what does the employee handbook say about it and acceptable use policy",
+    "ground_truth": "The IT and Acceptable Use Policy in the Employee Handbook governs use of company-provided technology, systems, and data. Employees must use IT resources solely for business purposes, maintain data security, and not access unauthorized systems or install unauthorized software. Violations may result in disciplinary action including termination."
+  },
+  {
+    "document": "Licensing Agreement",
+    "question": "what are the renewal terms in the licensing agreement",
+    "ground_truth": "The licensing agreement may be renewed for successive terms upon mutual written agreement before the expiry of the current term. Either party must provide written notice of non-renewal within the period specified in the agreement, typically 30 to 60 days before expiry. Renewal terms and pricing are subject to renegotiation unless otherwise agreed in writing."
+  },
+  {
+    "document": "Influencer Agreement",
+    "question": "what are the payment terms in the influencer agreement",
+    "ground_truth": "The influencer agreement specifies the fee payable to the influencer upon successful delivery and approval of the agreed content. Payment is typically made within 30 days of content approval. The influencer is responsible for their own tax obligations including GST registration if applicable under Indian law."
+  },
+  {
+    "document": "SOW / Sales Contract",
+    "question": "what are the deliverables and acceptance criteria in the sow",
+    "ground_truth": "The Statement of Work defines specific deliverables, timelines, and acceptance criteria that each deliverable must meet before payment is released. Deliverables are subject to a review and acceptance process by the client within a defined period. Rejected deliverables must be revised and resubmitted within an agreed timeframe."
+  },
+  {
+    "document": "Procurement Compliance Checklist",
+    "question": "what vendor documents are required in the procurement compliance checklist",
+    "ground_truth": "The Procurement Compliance Checklist requires vendors to submit signed contracts, GST registration certificate, PAN card, insurance certificates, bank account details for payment processing, and any applicable compliance declarations before onboarding. Incomplete documentation results in the vendor engagement being put on hold until all documents are received."
+  },
+  {
+    "document": "Leave Approval Letter",
+    "question": "what information is included in the leave approval letter",
+    "ground_truth": "The leave approval letter includes the employee name, leave request reference number, type of leave approved, start and end dates, total duration in days, and any specific conditions attached to the approval. It also states the requirement for prior HR approval for any extensions and confirms the leave has been recorded in the HR system."
+  }
+]
