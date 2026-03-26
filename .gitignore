@@ -44,3 +44,14 @@ chroma_db/
 .env.production
 .env.staging
 secrets.json
+
+# ChromaDB
+chroma/
+chroma_db/
+chroma-data/
+chromadb/
+
+# Persistent storage
+*.chroma
+*.db
+*.sqlite3
