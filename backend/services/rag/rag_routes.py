@@ -47,8 +47,15 @@ async def api_ingest(req: IngestRequest):
 @router.post("/ask")
 async def api_ask(req: AskRequest):
     try:
+        from backend.services.rag.agent_graph import run_agent, _classify_intent
+
+        # ── 1. Classify intent ──────────────────────────────────────────────
+        intent = _classify_intent(req.question)
+
+        # ── 2. Standard RAG execution ───────────────────────────────────────
         from backend.services.rag.rag_service import answer
-        result = await answer(
+
+        rag_result = await answer(
             question=req.question,
             filters=req.filters,
             session_id=req.session_id,
@@ -56,7 +63,16 @@ async def api_ask(req: AskRequest):
             doc_a=req.doc_a,
             doc_b=req.doc_b,
         )
+
+        # ── 3. Agent post-processing: auto-ticket + memory update ────────────
+        result = await run_agent(
+            question=req.question,
+            rag_result=rag_result,
+            session_id=req.session_id,
+        )
+        result["intent"] = "rag"
         return result
+
     except Exception as e:
         logger.error("Ask error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

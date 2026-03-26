@@ -21,7 +21,7 @@ TTL_ANSWER      = 3600
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 ANSWER_PROMPT = """\
-You are CiteRAG — a precise legal and business document analyst for turabit.
+You are CiteRAG — a precise business document assistant for turabit.
 Use ONLY the context below. Do NOT use outside knowledge.
 If the answer is not in the context, say exactly:
 "I could not find information about this in the available documents."
@@ -34,31 +34,24 @@ Context:
 Question: {question}
 
 CRITICAL RULES:
-1. Start with FINAL ANSWER — a direct YES/NO or 1-sentence verdict
-2. Then provide supporting analysis with specific document names and sections
-3. Never use vague labels — always give ACTUAL content (numbers, names, dates, conditions)
-4. Cross-check ALL documents, not just the first match
-5. Always flag: undefined terms (reasonable, promptly, material breach, good faith)
-6. Always flag: missing standard clauses (indemnity, liability cap, force majeure, dispute resolution)
-7. For YES/NO questions — still provide evidence and flag risks even if answer is YES
-8. Never stop at 1 sentence — always provide structured analysis
+1. Answer ONLY what the question asks — do not volunteer unrequested analysis
+2. Be direct and concise — start with the actual answer, not a preamble
+3. Use specific facts from the documents: numbers, names, dates, conditions
+4. Cite the document name/section where the information comes from
+5. Do NOT add sections about undefined terms, missing clauses, or risks unless the question explicitly asks for an audit or analysis
+6. Do NOT pad the response with extra sections that are not relevant to the question
 
-OUTPUT FORMAT by question type:
+OUTPUT FORMAT — match the question type:
 
-FINAL ANSWER
-[YES/NO or direct answer — 1-2 sentences]
+Single fact question → 1-2 sentences with the exact value + document reference
 
-[Then one of these structures:]
+What/How/Why question → 2-4 sentences covering the key facts from the documents
 
-Single fact → exact value + document reference
+List question → bullet points with document references per item
 
-What/How/Why → 2-5 sentences with specific document citations
+Yes/No question → direct YES or NO, then 1-2 sentences of evidence
 
-List → bullet points with document references per item
-
-Analysis → use CONTRADICTIONS / INCONSISTENCIES / GAPS / AMBIGUITIES sections
-
-Comparison → per-document breakdown then SUMMARY
+Analysis/audit question → use structured sections (CONTRADICTIONS / GAPS / AMBIGUITIES) only when asked
 
 Answer:"""
 
@@ -232,6 +225,37 @@ EXAMPLES — DOCUMENT intent:
 Reply in this exact format:
 REWRITTEN: [the clear precise question]
 INTENT: [one of: GREETING, COMPARE, FULL_DOC, SUMMARY, LIST, YESNO, SPECIFIC, EXPLAIN, ANALYSIS, SEARCH]"""
+
+# ── Classifier prompt — fires BEFORE retrieval ────────────────────────────────
+CLASSIFIER_PROMPT = """You are a query classifier for CiteRAG — turabit's internal document assistant.
+
+Your ONLY job: decide if the user's question is about turabit's internal business documents,
+OR if it is a general knowledge / personal / off-topic question.
+
+turabit's documents include:
+- HR policies (leave, salary, attendance, benefits, probation, appraisal, overtime)
+- Legal contracts (NDA, MSA, SOW, employment agreements, vendor contracts, SLA)
+- Finance documents (invoices, purchase orders, budgets, payroll, GST, TDS)
+- Operations (onboarding, offboarding, procurement, compliance, SLA)
+- Any named employee, person, or entity that appears in these internal documents
+
+ROUTING RULES:
+- DOCUMENT → question is about turabit policies, contracts, HR, finance, operations, or any
+  person/entity mentioned in these internal records (e.g. "what is rahul's employee id")
+- GENERAL → coding, math, science, creative writing, news, celebrities, general how-to,
+  or any question clearly unrelated to a business document system
+
+IMPORTANT — employee/person queries:
+- "what is rahul's employee id" → DOCUMENT (looking up internal record)
+- "who is elon musk" → GENERAL (public figure, not in turabit docs)
+- "what is priya's salary" → DOCUMENT (internal HR record)
+- "tell me a joke" → GENERAL
+
+Respond with EXACTLY one word: DOCUMENT or GENERAL
+
+Question: {question}
+
+Classification:"""
 
 ANALYSIS_PROMPT = """\
 You are CiteRAG — a senior legal and business document analyst for turabit.
@@ -605,7 +629,7 @@ def _classify_intent(question: str) -> str:
         "check", "verify", "examine",
         "improve", "recommendation", "suggest", "better",
         "complete", "correct", "accurate", "valid",
-        "comply", "complian", "legal", "enforceable",
+        "comply", "complian", "enforceable",
         "expose one party", "excessive liability", "one-sided",
         "unfair clause", "disproportionate", "favor one party",
         "unintentionally favor",
@@ -758,10 +782,28 @@ async def tool_search(question: str, filters: dict,
         _get_history(session_id),
     )
 
+    # ── Early not-found guard ─────────────────────────────────────────────────
+    # If no chunks pass the quality threshold, skip the LLM entirely and return
+    # a clean one-liner instead of a padded "not found" essay.
+    quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
+    if not quality_chunks:
+        not_found_answer = "I could not find information about this in the available documents."
+        await _save_turn(session_id, question, not_found_answer)
+        return {
+            "answer":     not_found_answer,
+            "citations":  [],
+            "chunks":     [],
+            "tool_used":  "search",
+            "confidence": "low",
+        }
+
     answer  = _get_llm().invoke(
         ANSWER_PROMPT.format(history=history, context=context, question=question)
     ).content.strip()
     not_found = "could not find" in answer.lower()
+    if not_found:
+        # LLM said not found but we had chunks — return clean message
+        answer = "I could not find information about this in the available documents."
     await _save_turn(session_id, question, answer)
     return {
         "answer":     answer,
@@ -1058,6 +1100,39 @@ async def _rewrite_query(question: str) -> tuple[str, str]:
 
 # ── Main dispatcher ───────────────────────────────────────────────────────────
 
+async def _classify_document_question(question: str) -> bool:
+    """
+    Use a lightweight LLM call to decide if the question is about
+    turabit's internal documents (True) or general knowledge (False).
+
+    Uses a Redis cache with TTL=3600s so repeated identical questions
+    never cost a second LLM call.
+
+    Falls back to True (allow through to RAG) if LLM call fails —
+    better to over-retrieve than to block a valid document question.
+    """
+    cache_key = f"docforge:rag:classifier:{hashlib.md5(question.strip().lower().encode()).hexdigest()}"
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        logger.info("Classifier cache HIT: %s → %s", question[:50], cached)
+        return cached == "DOCUMENT"
+
+    try:
+        raw = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _get_llm().invoke(
+                CLASSIFIER_PROMPT.format(question=question)
+            ).content.strip().upper()
+        )
+        result = "DOCUMENT" if "DOCUMENT" in raw else "GENERAL"
+        await cache.set(cache_key, result, ttl=3600)
+        logger.info("Classifier: '%s' → %s", question[:60], result)
+        return result == "DOCUMENT"
+    except Exception as e:
+        logger.warning("Classifier LLM failed (%s) — defaulting to DOCUMENT", e)
+        return True   # fail-open: allow RAG rather than block valid question
+
+
 async def answer(
     question:   str,
     filters:    Optional[dict] = None,
@@ -1113,70 +1188,14 @@ async def answer(
             "confidence": "high",
         }
 
-    # ── RAG-only guard ────────────────────────────────────────────────────────
-    # Block any question that is clearly outside document scope.
-    # Fires BEFORE any retrieval so no wasted ChromaDB / LLM calls.
+    # ── RAG-only guard — LLM classifier ─────────────────────────────────────────
+    # Use a lightweight LLM call to decide if the question is about turabit's
+    # internal documents or is general knowledge / off-topic.
+    # Result is cached in Redis (TTL 1h) so repeated questions cost nothing.
+    # Greeting intent already returned above — only non-greeting reaches here.
+    is_document_question = await _classify_document_question(question)
 
-    # Signals that confirm the question IS about company documents
-    _doc_signals = [
-        "policy", "contract", "agreement", "nda", "sow", "clause",
-        "document", "employee", "leave", "salary", "hr", "turabit",
-        "handbook", "offer", "notice", "vendor", "invoice", "legal",
-        "finance", "procurement", "sla", "compliance", "budget",
-        "employment", "termination", "probation", "reimbursement",
-        "appraisal", "attendance", "overtime", "benefit", "holiday",
-        "resignation", "confidential", "intellectual property", "ip rights",
-        "indemnity", "liability", "force majeure", "dispute", "arbitration",
-        "governing law", "jurisdiction", "amendment", "renewal", "sow",
-        "master service", "msaa", "nda", "msa", "purchase order", "po ",
-        "payroll", "tax", "gst", "tds", "invoice", "payment terms",
-        "department", "operations", "onboarding", "offboarding",
-    ]
-
-    # Signals that STRONGLY indicate off-topic (coding, math, general knowledge)
-    _off_topic_signals = [
-        # Coding / programming
-        "python", "javascript", "java ", " code ", "function", "algorithm",
-        "class ", "variable", "loop", "array", "string", "integer", "boolean",
-        "import ", "def ", "return ", "print(", "sql ", "database query",
-        "api call", "http ", "html", "css ", "react", "angular", "django",
-        "flask", "docker", "kubernetes", "git ", "github", "programming",
-        "script", "bug ", "debug", "compile", "runtime error", "syntax",
-        # Math / science
-        "calculate", "solve for", "what is 2", "what is 3", "what is 4",
-        "what is 5", "what is 6", "what is 7", "what is 8", "what is 9",
-        "equation", "formula", "integral", "derivative", "matrix",
-        "prime number", "factorial", "algebra", "geometry", "trigonometry",
-        "physics", "chemistry", "biology", "astronomy", "quantum",
-        "speed of light", "newton", "einstein",
-        # General knowledge / creative
-        "capital of", "who is the president", "population of",
-        "history of", "when was", "who invented", "write a story",
-        "write a poem", "write an essay", "translate", "recipe for",
-        "weather in", "movie", "song", "music", "sport", "football",
-        "cricket", "chess", "joke", "meme", "fun fact",
-        # Explicit non-document questions
-        "what is the meaning of life", "how to cook", "how to drive",
-        "how to lose weight", "best phone", "buy a laptop",
-    ]
-
-    q_lower = question.lower()
-    _is_doc_question = any(s in q_lower for s in _doc_signals)
-    _is_off_topic    = any(s in q_lower for s in _off_topic_signals)
-
-    # Block if: explicitly off-topic keyword found AND no doc signal overrides it
-    if _is_off_topic and not _is_doc_question:
-        await _save_turn(session_id, question, _OFF_TOPIC_RESPONSE)
-        return {
-            "answer":     _OFF_TOPIC_RESPONSE,
-            "citations":  [],
-            "chunks":     [],
-            "tool_used":  "chat",
-            "confidence": "high",
-        }
-
-    # Also block short vague questions with no document signals (original guard)
-    if not _is_doc_question and intent == "SEARCH" and len(question.split()) < 6:
+    if not is_document_question:
         await _save_turn(session_id, question, _OFF_TOPIC_RESPONSE)
         return {
             "answer":     _OFF_TOPIC_RESPONSE,

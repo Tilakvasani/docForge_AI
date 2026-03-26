@@ -207,7 +207,10 @@ def _init_ragas() -> bool:
 
 def _run_single_metric(metric, data) -> Optional[float]:
     """Run one RAGAS metric synchronously inside a thread executor.
-    Supports both v0.1 (evaluate()) and v0.2+ (metric.score()) APIs.
+    Supports both v0.1 (evaluate()) and v0.2+ APIs.
+
+    For v0.2, `data` is already an EvaluationDataset built in score().
+    For v0.1, `data` is a HuggingFace Dataset.
     """
     import os
     os.environ["TQDM_DISABLE"] = "1"
@@ -217,28 +220,32 @@ def _run_single_metric(metric, data) -> Optional[float]:
 
     try:
         if major == 0 and minor >= 2:
-            # v0.2+ uses EvaluationDataset + metric.score()
+            # v0.2+: data is already an EvaluationDataset — pass directly
             from ragas import evaluate as ragas_evaluate
-            from ragas import EvaluationDataset
-
-            # EvaluationDataset expects a list of dicts
-            rows = [
-                {k: v[0] for k, v in data.to_dict().items()}
-            ]
-            eval_dataset = EvaluationDataset.from_list(rows)
 
             import contextlib, io
             with contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
-                result = ragas_evaluate(eval_dataset, metrics=[metric])
+                result = ragas_evaluate(data, metrics=[metric])
 
-            df  = result.to_pandas()
-            col = metric_name if metric_name in df.columns else df.columns[-1]
+            df = result.to_pandas()
+            # Resolve column: try exact metric name, then case-insensitive, then last numeric col
+            if metric_name in df.columns:
+                col = metric_name
+            else:
+                # Try case-insensitive match
+                lower_map = {c.lower(): c for c in df.columns}
+                col = lower_map.get(metric_name.lower())
+                if col is None:
+                    # Fall back to last non-metadata column (drop user_input/response/etc.)
+                    skip = {"user_input", "response", "retrieved_contexts", "reference"}
+                    numeric_cols = [c for c in df.columns if c not in skip]
+                    col = numeric_cols[-1] if numeric_cols else df.columns[-1]
             val = df.iloc[0][col]
             return round(float(val), 3)
 
         else:
-            # v0.1 uses HuggingFace Dataset + evaluate()
+            # v0.1: data is a HuggingFace Dataset
             from ragas import evaluate
             import contextlib, io
             with contextlib.redirect_stdout(io.StringIO()), \
@@ -267,9 +274,8 @@ async def score(
 
     faithfulness      — always real (no GT needed)
     answer_relevancy  — always real (no GT needed)
-    context_precision — always real (no GT needed)
-    context_recall    — real when GT found in qa_dataset.json
-                        None when question has no dataset match
+    context_precision — real when GT found (v0.2 requires GT); None if no GT match
+    context_recall    — real when GT found in qa_dataset.json; None if no GT match
 
     All metrics run in parallel via asyncio.gather.
 
@@ -296,25 +302,47 @@ async def score(
     # Resolve ground truth: caller override > dataset lookup > None
     real_gt = ground_truth or _lookup_ground_truth(question)
 
-    # Build datasets — HuggingFace Dataset format works for both v0.1 and v0.2+
-    # (v0.2 _run_single_metric converts to EvaluationDataset internally)
-    from datasets import Dataset
-
-    data_no_gt = Dataset.from_dict({
-        "question": [question], 
-        "answer":   [answer],
-        "contexts": [contexts],
-    })
-
-    data_with_gt = Dataset.from_dict({
-        "question":     [question],
-        "answer":       [answer],
-        "contexts":     [contexts],
-        "ground_truth": [real_gt],
-    }) if real_gt else None
-
+    # Build datasets.
+    # v0.1: HuggingFace Dataset with fields question/answer/contexts/ground_truth
+    # v0.2: EvaluationDataset with fields user_input/response/retrieved_contexts/reference
     major, minor = _get_ragas_version()
     logger.info("Running RAGAS scoring with v%d.%d", major, minor)
+
+    if major == 0 and minor >= 2:
+        # RAGAS v0.2+ — EvaluationDataset field names
+        from ragas import EvaluationDataset
+
+        eval_no_gt = EvaluationDataset.from_list([{
+            "user_input":         question,
+            "response":           answer,
+            "retrieved_contexts": contexts,
+        }])
+
+        eval_with_gt = EvaluationDataset.from_list([{
+            "user_input":         question,
+            "response":           answer,
+            "retrieved_contexts": contexts,
+            "reference":          real_gt,
+        }]) if real_gt else None
+
+        data_no_gt   = eval_no_gt
+        data_with_gt = eval_with_gt
+    else:
+        # RAGAS v0.1 — HuggingFace Dataset field names
+        from datasets import Dataset
+
+        data_no_gt = Dataset.from_dict({
+            "question": [question],
+            "answer":   [answer],
+            "contexts": [contexts],
+        })
+
+        data_with_gt = Dataset.from_dict({
+            "question":     [question],
+            "answer":       [answer],
+            "contexts":     [contexts],
+            "ground_truth": [real_gt],
+        }) if real_gt else None
 
     loop = asyncio.get_event_loop()
 
@@ -325,11 +353,12 @@ async def score(
             None, _run_single_metric, metric, dataset
         )
 
-    # Run all 4 in parallel — context_recall gets None dataset if no GT found
+    # Run all 4 in parallel — context_recall/context_precision get None dataset if no GT
+    # NOTE: In v0.2, ContextPrecision also requires reference (ground truth)
     results = await asyncio.gather(
         _run(_faithfulness,      data_no_gt),
         _run(_answer_relevancy,  data_no_gt),
-        _run(_context_precision, data_with_gt),
+        _run(_context_precision, data_with_gt),   # needs GT in v0.2
         _run(_context_recall,    data_with_gt),
         return_exceptions=True,
     )

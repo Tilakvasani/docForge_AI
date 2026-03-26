@@ -440,3 +440,170 @@ MIT License — feel free to use, modify, and distribute.
 ---
 
 Built with ⚡ by [Tilak Vasani](https://github.com/Tilakvasani)
+# CiteRAG Backend — New Files Guide
+
+## What was built
+
+| File | Location in project | Purpose |
+|------|---------------------|---------|
+| `agent_routes.py` | `backend/services/rag/` | FastAPI routes for LangGraph agent (tickets + memory) |
+| `ingest_service.py` | `backend/services/rag/` | Notion → ChromaDB ingest pipeline |
+| `agent_graph.py` | `backend/services/rag/` | LangGraph state machine (auto-ticket on low confidence) |
+| `main.py` | `backend/` | Updated app entry point (registers agent router) |
+| `config.py` | `backend/core/` | Updated settings with NOTION_TICKET_DB_ID |
+
+---
+
+## 1. Notion Ticket Database Setup
+
+Create a Notion database for tickets with these columns:
+
+| Property | Type | Options |
+|----------|------|---------|
+| `Question` | **Title** | — |
+| `Status` | Select | `Open`, `In Progress`, `Resolved` |
+| `Priority` | Select | `High`, `Medium`, `Low` |
+| `Summary` | Rich Text | — |
+| `Attempted Sources` | Multi-select | — |
+| `Session ID` | Rich Text | — |
+| `Created` | Date | — |
+
+Copy the database ID from the Notion URL and add to `.env`:
+```
+NOTION_TICKET_DB_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+---
+
+## 2. .env additions
+
+Add these to your existing `.env`:
+
+```env
+# Existing keys (already in your .env):
+NOTION_TOKEN=secret_...
+NOTION_DATABASE_ID=...        # your source doc DB
+
+# New key:
+NOTION_TICKET_DB_ID=...       # your ticket tracking DB
+```
+
+---
+
+## 3. File placement
+
+```
+backend/
+├── core/
+│   └── config.py          ← replace existing
+├── main.py                ← replace existing
+└── services/
+    └── rag/
+        ├── agent_routes.py     ← NEW
+        ├── agent_graph.py      ← NEW
+        ├── ingest_service.py   ← NEW
+        ├── rag_routes.py       ← existing (unchanged)
+        ├── rag_service.py      ← existing (unchanged)
+        └── ragas_scorer.py     ← existing (unchanged)
+```
+
+---
+
+## 4. How the Agent Layer Works
+
+The `agent_graph.py` wraps every `/api/rag/ask` response transparently:
+
+```
+User asks question
+     ↓
+rag_service.answer() runs (unchanged)
+     ↓
+agent_graph.run_agent() runs on the result
+     ↓
+if confidence == "low" AND chunks == []:
+    → summarize attempted sources
+    → POST to /api/agent/ticket/create
+    → ticket appears in Notion DB + 🤖 Agent tab
+     ↓
+rag_result returned to user (unchanged — no extra text added)
+```
+
+To wire the agent into the ask route, add this to `rag_routes.py` `/ask` endpoint:
+
+```python
+@router.post("/ask")
+async def api_ask(req: AskRequest):
+    try:
+        from backend.services.rag.rag_service import answer
+        from backend.services.rag.agent_graph import run_agent   # ADD
+
+        result = await answer(
+            question=req.question,
+            filters=req.filters,
+            session_id=req.session_id,
+            top_k=req.top_k,
+            doc_a=req.doc_a,
+            doc_b=req.doc_b,
+        )
+
+        # Agent layer — transparent wrap (fires ticket if low confidence)
+        result = await run_agent(req.question, result, req.session_id)  # ADD
+
+        return result
+    except Exception as e:
+        logger.error("Ask error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+---
+
+## 5. Available Agent Endpoints
+
+After starting the server, these new endpoints are available:
+
+```
+GET  /api/agent/tickets           → list all tickets from Notion (cached 60s)
+POST /api/agent/tickets/update    → { "ticket_id": "ABC123", "status": "Resolved" }
+GET  /api/agent/memory?session_id=xxx → session memory for a user
+POST /api/agent/ticket/create     → internal: create ticket (called by agent_graph)
+```
+
+---
+
+## 6. Ingest Service
+
+The existing `/api/rag/ingest` endpoint in `rag_routes.py` already calls:
+
+```python
+from backend.services.rag.ingest_service import ingest_from_notion
+result = await ingest_from_notion(force=req.force)
+```
+
+The new `ingest_service.py` implements this function. It:
+
+1. Fetches all pages from `NOTION_DATABASE_ID`
+2. Extracts text block-by-block (headings, paragraphs, lists, tables, toggles)
+3. Chunks text at ~800 chars with 150-char overlap (paragraph-aware)
+4. Embeds in batches of 64 using `text-embedding-3-large`
+5. Upserts into ChromaDB with deterministic IDs (safe to re-run)
+6. Stores `{ total_docs, total_chunks, ingested_at }` in Redis
+
+**Trigger via UI:** Streamlit → Settings → Ingest, or:
+```bash
+curl -X POST http://localhost:8000/api/rag/ingest -H "Content-Type: application/json" -d '{"force": true}'
+```
+
+---
+
+## 7. Testing Checklist
+
+After deploying:
+
+- [ ] `GET /health` returns `{"status": "ok"}`
+- [ ] `POST /api/rag/ingest` with `{"force": true}` — check logs for chunk count
+- [ ] `GET /api/rag/status` — shows `total_chunks > 0`
+- [ ] `POST /api/rag/ask` with a question — answer returns
+- [ ] Low-confidence question (ask something not in docs) → ticket appears in `GET /api/agent/tickets`
+- [ ] 🤖 Agent tab in Streamlit shows the ticket
+- [ ] Update ticket status via Agent tab → Notion updates
+- [ ] `DELETE /api/rag/cache` — flushes all cached answers

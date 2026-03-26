@@ -1,356 +1,493 @@
 """
-ingest_service.py  — Production RAG Ingestion
-==============================================
-Flow: Notion Docs → Clean → Smart Chunk → Embed → ChromaDB
+ingest_service.py — Notion → Chunks → Embeddings → ChromaDB
+=============================================================
 
-Chunking Strategy:
-  - Split at headings (section boundaries)
-  - Short sections  (<200 tokens) → 1 chunk
-  - Medium sections (200-600 tokens) → 2-3 chunks  (400 tokens, 50 overlap)
-  - Long sections   (>600 tokens)   → 3-5 chunks   (400 tokens, 50 overlap)
-  
-Each chunk stores full metadata:
-  {doc_title, section, doc_type, department, version, citation}
+POST /api/rag/ingest triggers this module.
+
+Pipeline:
+  1. Fetch all pages from the configured Notion database
+  2. Extract + clean text from each page (blocks → plain text)
+  3. Chunk text with overlap (respects paragraph boundaries)
+  4. Embed chunks using Azure OpenAI text-embedding-3-large
+  5. Upsert into ChromaDB with rich metadata
+  6. Store ingest metadata in Redis for /status endpoint
+
+Idempotent: chunks are upserted by deterministic ID (md5 of page_id+heading+chunk_index),
+so re-running ingest updates changed content without duplicating.
+
+force=True skips the "already ingested" Redis lock check.
 """
 
+import asyncio
 import hashlib
-import httpx
+import json
+import re
+import time
+from typing import Optional
+
 from backend.core.config import settings
 from backend.core.logger import logger
 from backend.services.redis_service import cache
 
-NOTION_API_URL  = "https://api.notion.com/v1"
-COLLECTION_NAME = "rag_chunks"
-CHUNK_SIZE      = 400    # tokens (approx 4 chars per token)
-CHUNK_OVERLAP   = 50
-TTL_INGEST_LOCK = 86400  # 24 hours
-KEY_INGEST_LOCK = "docforge:rag:ingest_lock"
-KEY_INGEST_META = "docforge:rag:ingest_meta"
+COLLECTION_NAME   = "rag_chunks"
+CHUNK_SIZE        = 800     # target chars per chunk
+CHUNK_OVERLAP     = 150     # overlap between consecutive chunks
+MIN_CHUNK_LEN     = 80      # discard very short fragments
+BATCH_EMBED_SIZE  = 64      # embed N chunks per API call
+INGEST_LOCK_KEY   = "docforge:rag:ingest_lock"
+INGEST_META_KEY   = "docforge:rag:ingest_meta"
+INGEST_LOCK_TTL   = 1800    # 30 min — prevent concurrent ingests
 
 
-# ── Notion helpers ────────────────────────────────────────────────────────────
+# ── Singleton clients (reused across calls) ───────────────────────────────────
 
-def _notion_headers():
-    return {
-        "Authorization":  f"Bearer {settings.NOTION_API_KEY}",
-        "Content-Type":   "application/json",
-        "Notion-Version": "2022-06-28",
-    }
+_embedder_instance   = None
+_collection_instance = None
 
-
-async def _fetch_all_pages():
-    pages, cursor = [], None
-    async with httpx.AsyncClient(timeout=30) as client:
-        while True:
-            body = {"page_size": 100}
-            if cursor:
-                body["start_cursor"] = cursor
-            resp = await client.post(
-                f"{NOTION_API_URL}/databases/{settings.NOTION_DATABASE_ID}/query",
-                headers=_notion_headers(), json=body)
-            if resp.status_code != 200:
-                logger.error("Notion DB error: %s %s", resp.status_code, resp.text[:200])
-                break
-            data = resp.json()
-            pages.extend(data.get("results", []))
-            if not data.get("has_more"):
-                break
-            cursor = data.get("next_cursor")
-            # Redis rate limiting: respect Notion 3 req/sec limit
-            await cache.set("docforge:rag:notion_rate", 1, ttl=1)
-    logger.info("Fetched %d pages from Notion", len(pages))
-    return pages
-
-
-async def _fetch_page_blocks(page_id: str):
-    blocks, cursor = [], None
-    async with httpx.AsyncClient(timeout=30) as client:
-        while True:
-            params = {"page_size": 100}
-            if cursor:
-                params["start_cursor"] = cursor
-            resp = await client.get(
-                f"{NOTION_API_URL}/blocks/{page_id}/children",
-                headers=_notion_headers(), params=params)
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-            blocks.extend(data.get("results", []))
-            if not data.get("has_more"):
-                break
-            cursor = data.get("next_cursor")
-    return blocks
-
-
-# ── Block → text ──────────────────────────────────────────────────────────────
-
-def _block_to_text(block: dict) -> str:
-    btype = block.get("type", "")
-    bdata = block.get(btype, {})
-    if btype == "table_row":
-        return " | ".join(
-            "".join(rt.get("plain_text", "") for rt in cell)
-            for cell in bdata.get("cells", []))
-    return "".join(rt.get("plain_text", "") for rt in bdata.get("rich_text", []))
-
-
-def _is_heading(block: dict):
-    btype = block.get("type", "")
-    if btype in ("heading_1", "heading_2", "heading_3"):
-        return True, _block_to_text(block)
-    return False, ""
-
-
-# ── Page metadata ─────────────────────────────────────────────────────────────
-
-def _page_meta(page: dict) -> dict:
-    props = page.get("properties", {})
-
-    def get_text(k):
-        p     = props.get(k, {})
-        items = (p.get("title", []) if p.get("type") == "title"
-                 else p.get("rich_text", []))
-        return "".join(i.get("text", {}).get("content", "") for i in items)
-
-    def get_select(k):
-        sel = props.get(k, {}).get("select")
-        return sel.get("name", "") if sel else ""
-
-    return {
-        "notion_page_id": page["id"].replace("-", ""),
-        "doc_title":      get_text("Title"),
-        "doc_type":       get_text("Doc Type"),
-        "department":     get_select("Department"),
-        "version":        get_text("Version") or "v1",
-    }
-
-
-# ── Smart chunker ─────────────────────────────────────────────────────────────
-
-def _approx_tokens(text: str) -> int:
-    """Approximate token count (1 token ≈ 4 chars)."""
-    return len(text) // 4
-
-
-def _split_text(text: str, chunk_size: int = CHUNK_SIZE,
-                overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """
-    Split text into overlapping chunks by words.
-    Short text (<= chunk_size tokens) → single chunk.
-    """
-    if _approx_tokens(text) <= chunk_size:
-        return [text.strip()]
-
-    words    = text.split()
-    char_limit  = chunk_size * 4
-    overlap_chars = overlap * 4
-    chunks   = []
-    start    = 0
-
-    while start < len(words):
-        # Build chunk up to char_limit
-        chunk_words = []
-        char_count  = 0
-        i = start
-        while i < len(words) and char_count + len(words[i]) < char_limit:
-            chunk_words.append(words[i])
-            char_count += len(words[i]) + 1
-            i += 1
-
-        chunk = " ".join(chunk_words).strip()
-        if chunk:
-            chunks.append(chunk)
-
-        if i >= len(words):
-            break
-
-        # Move start forward accounting for overlap
-        overlap_words = 0
-        overlap_count = 0
-        for w in reversed(chunk_words):
-            if overlap_count >= overlap_chars:
-                break
-            overlap_words += 1
-            overlap_count += len(w) + 1
-
-        start = i - overlap_words
-
-    return chunks if chunks else [text.strip()]
-
-
-def _chunk_blocks(blocks: list) -> list[dict]:
-    """
-    1. Split at heading boundaries → sections
-    2. Apply token-based chunking within each section
-    Returns list of {heading, content, chunk_index}
-    """
-    # Step 1: collect sections
-    sections          = []
-    current_heading   = "Introduction"
-    current_lines     = []
-
-    for block in blocks:
-        is_h, heading_text = _is_heading(block)
-        if is_h:
-            if current_lines:
-                sections.append({
-                    "heading": current_heading,
-                    "content": "\n".join(current_lines).strip(),
-                })
-            current_heading = heading_text
-            current_lines   = []
-        else:
-            text = _block_to_text(block)
-            if text.strip():
-                current_lines.append(text.strip())
-
-    if current_lines:
-        sections.append({
-            "heading": current_heading,
-            "content": "\n".join(current_lines).strip(),
-        })
-
-    # Step 2: split long sections into chunks
-    chunks = []
-    for sec in sections:
-        if not sec["content"] or len(sec["content"]) < 20:
-            continue
-        sub_chunks = _split_text(sec["content"])
-        for i, sub in enumerate(sub_chunks):
-            chunks.append({
-                "heading":     sec["heading"],
-                "content":     sub,
-                "chunk_index": i,
-            })
-
-    return chunks
-
-
-# ── Embedder + ChromaDB ───────────────────────────────────────────────────────
 
 def _get_embedder():
-    from langchain_openai import AzureOpenAIEmbeddings
-    return AzureOpenAIEmbeddings(
-        azure_endpoint=settings.AZURE_EMB_ENDPOINT,
-        api_key=settings.AZURE_OPENAI_EMB_KEY,
-        azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
-        api_version=settings.AZURE_EMB_API_VERSION,
-    )
+    global _embedder_instance
+    if _embedder_instance is None:
+        from langchain_openai import AzureOpenAIEmbeddings
+        _embedder_instance = AzureOpenAIEmbeddings(
+            azure_endpoint=settings.AZURE_EMB_ENDPOINT,
+            api_key=settings.AZURE_OPENAI_EMB_KEY,
+            azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
+            api_version=settings.AZURE_EMB_API_VERSION,
+        )
+    return _embedder_instance
 
 
 def _get_collection():
-    import chromadb
-    client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
+    global _collection_instance
+    if _collection_instance is None:
+        import chromadb
+        client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
+        _collection_instance = client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+    return _collection_instance
+
+
+# ── Notion fetcher ─────────────────────────────────────────────────────────────
+
+def _get_notion():
+    from notion_client import Client
+    return Client(auth=settings.NOTION_TOKEN)
+
+
+def _fetch_all_notion_pages() -> list[dict]:
+    """
+    Query all pages from the configured Notion source database.
+    Handles Notion pagination automatically.
+    """
+    notion  = _get_notion()
+    db_id   = settings.NOTION_DATABASE_ID
+    results = []
+    cursor  = None
+
+    while True:
+        kwargs: dict = {"database_id": db_id, "page_size": 100}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        resp    = notion.databases.query(**kwargs)
+        results.extend(resp.get("results", []))
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("next_cursor")
+
+    logger.info("Fetched %d pages from Notion DB %s", len(results), db_id)
+    return results
+
+
+def _fetch_page_blocks(page_id: str) -> list[dict]:
+    """Recursively fetch all blocks (including children) for a Notion page."""
+    notion = _get_notion()
+    blocks = []
+    cursor = None
+
+    while True:
+        kwargs: dict = {"block_id": page_id, "page_size": 100}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        resp   = notion.blocks.children.list(**kwargs)
+        blocks.extend(resp.get("results", []))
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("next_cursor")
+
+    # Recurse into child blocks (toggles, callouts, etc.)
+    expanded = []
+    for block in blocks:
+        expanded.append(block)
+        if block.get("has_children"):
+            try:
+                child_blocks = _fetch_page_blocks(block["id"])
+                expanded.extend(child_blocks)
+            except Exception as e:
+                logger.warning("Failed to fetch children of block %s: %s", block["id"], e)
+
+    return expanded
+
+
+# ── Text extraction ────────────────────────────────────────────────────────────
+
+def _rich_text_to_str(rich_text_items: list) -> str:
+    return "".join(t.get("plain_text", "") for t in rich_text_items)
+
+
+def _block_to_text(block: dict) -> tuple[str, str]:
+    """
+    Extract (heading, text) from a Notion block.
+    Returns ("", "") for unsupported block types.
+    """
+    btype = block.get("type", "")
+    bdata = block.get(btype, {})
+
+    heading = ""
+    text    = ""
+
+    if btype in ("heading_1", "heading_2", "heading_3"):
+        heading = _rich_text_to_str(bdata.get("rich_text", []))
+        text    = heading
+
+    elif btype == "paragraph":
+        text = _rich_text_to_str(bdata.get("rich_text", []))
+
+    elif btype in ("bulleted_list_item", "numbered_list_item", "to_do"):
+        text = "• " + _rich_text_to_str(bdata.get("rich_text", []))
+
+    elif btype == "toggle":
+        text = _rich_text_to_str(bdata.get("rich_text", []))
+
+    elif btype == "quote":
+        text = "> " + _rich_text_to_str(bdata.get("rich_text", []))
+
+    elif btype == "callout":
+        text = _rich_text_to_str(bdata.get("rich_text", []))
+
+    elif btype == "code":
+        text = _rich_text_to_str(bdata.get("rich_text", []))
+
+    elif btype == "table_row":
+        cells = bdata.get("cells", [])
+        row   = " | ".join(_rich_text_to_str(cell) for cell in cells)
+        text  = row
+
+    elif btype == "divider":
+        text = "---"
+
+    return heading, text
+
+
+def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
+    """
+    Extract metadata and full text sections from a Notion page + its blocks.
+    Returns a dict with title, doc_type, department, text sections with headings.
+    """
+    props = page.get("properties", {})
+
+    def _prop_text(prop_name: str) -> str:
+        prop  = props.get(prop_name, {})
+        ptype = prop.get("type", "")
+        if ptype == "title":
+            return _rich_text_to_str(prop.get("title", []))
+        if ptype == "rich_text":
+            return _rich_text_to_str(prop.get("rich_text", []))
+        if ptype == "select":
+            sel = prop.get("select") or {}
+            return sel.get("name", "")
+        if ptype == "multi_select":
+            return ", ".join(s.get("name", "") for s in prop.get("multi_select", []))
+        return ""
+
+    # Try common property name variants for title
+    title = (
+        _prop_text("Name") or _prop_text("Title") or _prop_text("Document Name")
+        or page.get("url", "").split("/")[-1].replace("-", " ")
     )
+    doc_type   = _prop_text("Doc Type") or _prop_text("Type") or _prop_text("Document Type") or ""
+    department = _prop_text("Department") or _prop_text("Team") or ""
+    version    = _prop_text("Version") or "v1"
+    status     = _prop_text("Status") or ""
+
+    # Walk blocks and build sections
+    sections: list[dict] = []
+    current_heading  = title or "General"
+    current_texts: list[str] = []
+
+    for block in blocks:
+        heading, text = _block_to_text(block)
+        if not text.strip():
+            continue
+
+        if heading:
+            # Save previous section if it has content
+            if current_texts:
+                sections.append({
+                    "heading": current_heading,
+                    "text":    "\n".join(current_texts).strip(),
+                })
+                current_texts = []
+            current_heading = heading
+        else:
+            current_texts.append(text)
+
+    # Save last section
+    if current_texts:
+        sections.append({
+            "heading": current_heading,
+            "text":    "\n".join(current_texts).strip(),
+        })
+
+    return {
+        "page_id":    page["id"],
+        "title":      title,
+        "doc_type":   doc_type,
+        "department": department,
+        "version":    version,
+        "status":     status,
+        "url":        page.get("url", ""),
+        "sections":   sections,
+    }
 
 
-# ── Main ingest ───────────────────────────────────────────────────────────────
+# ── Chunker ────────────────────────────────────────────────────────────────────
+
+def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """
+    Split text into overlapping chunks, preferring paragraph/sentence boundaries.
+    """
+    if not text or len(text) < MIN_CHUNK_LEN:
+        return [text] if text.strip() else []
+
+    # Split on double newlines first (paragraphs)
+    paragraphs = [p.strip() for p in re.split(r"\n\n+", text) if p.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    for para in paragraphs:
+        if len(current) + len(para) + 1 <= size:
+            current = (current + "\n\n" + para).strip()
+        else:
+            if current:
+                chunks.append(current)
+            # If single paragraph exceeds size, split by sentence
+            if len(para) > size:
+                sentences = re.split(r"(?<=[.!?])\s+", para)
+                sent_buf  = ""
+                for sent in sentences:
+                    if len(sent_buf) + len(sent) + 1 <= size:
+                        sent_buf = (sent_buf + " " + sent).strip()
+                    else:
+                        if sent_buf:
+                            chunks.append(sent_buf)
+                        sent_buf = sent
+                if sent_buf:
+                    current = sent_buf
+                else:
+                    current = ""
+            else:
+                current = para
+
+    if current:
+        chunks.append(current)
+
+    # Apply overlap: prepend tail of previous chunk to next
+    if overlap > 0 and len(chunks) > 1:
+        overlapped = [chunks[0]]
+        for i in range(1, len(chunks)):
+            tail    = chunks[i - 1][-overlap:]
+            merged  = (tail + " " + chunks[i]).strip()
+            overlapped.append(merged)
+        chunks = overlapped
+
+    return [c for c in chunks if len(c) >= MIN_CHUNK_LEN]
+
+
+# ── Chunk ID generator ─────────────────────────────────────────────────────────
+
+def _chunk_id(page_id: str, heading: str, chunk_index: int) -> str:
+    raw = f"{page_id}::{heading}::{chunk_index}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+# ── Citation formatter ─────────────────────────────────────────────────────────
+
+def _format_citation(title: str, heading: str, doc_type: str) -> str:
+    parts = [title]
+    if doc_type and doc_type.lower() != title.lower():
+        parts.append(doc_type)
+    if heading and heading.lower() != title.lower():
+        parts.append(f"§ {heading}")
+    return " › ".join(parts)
+
+
+# ── Embedding + upsert ─────────────────────────────────────────────────────────
+
+def _embed_and_upsert(chunks_batch: list[dict], collection) -> int:
+    """
+    Embed a batch of chunk dicts and upsert into ChromaDB.
+    Each chunk dict has: id, text, metadata.
+    Returns number of chunks upserted.
+    """
+    if not chunks_batch:
+        return 0
+
+    embedder = _get_embedder()
+    texts    = [c["text"] for c in chunks_batch]
+
+    try:
+        embeddings = embedder.embed_documents(texts)
+    except Exception as e:
+        logger.error("Embedding failed for batch of %d: %s", len(texts), e)
+        return 0
+
+    ids        = [c["id"]       for c in chunks_batch]
+    metadatas  = [c["metadata"] for c in chunks_batch]
+
+    try:
+        collection.upsert(
+            ids=ids,
+            embeddings=embeddings,
+            documents=texts,
+            metadatas=metadatas,
+        )
+        return len(chunks_batch)
+    except Exception as e:
+        logger.error("ChromaDB upsert failed: %s", e)
+        return 0
+
+
+# ── Main ingest function ───────────────────────────────────────────────────────
 
 async def ingest_from_notion(force: bool = False) -> dict:
     """
-    Full pipeline: Notion → Chunks → Embeddings → ChromaDB
+    Full ingest pipeline:
+      Notion pages → extract → chunk → embed → ChromaDB upsert
 
-    Guard logic (priority order):
-    1. force=True          → always re-ingest everything
-    2. ChromaDB has chunks → skip completely (survives restarts, Redis loss)
-    3. Redis lock active   → skip (extra safety within same session)
-    4. Otherwise           → run full ingest
+    Args:
+        force: if True, skip the Redis lock check (allow re-ingest)
+
+    Returns:
+        dict with total_docs, total_chunks, elapsed_s, skipped
     """
-    collection = _get_collection()
-
-    # ── Guard 1: ChromaDB already has data (primary persistent guard) ──────────
+    # ── Lock check ──────────────────────────────────────────────────────────────
     if not force:
-        try:
-            existing_count = collection.count()
-            if existing_count > 0:
-                meta = await cache.get(KEY_INGEST_META) or {
-                    "total_chunks": existing_count,
-                    "message": "Chunks already in ChromaDB — skipped"
-                }
-                logger.info(
-                    "Ingest skipped — ChromaDB already has %d chunks (restart-safe)",
-                    existing_count
-                )
-                return {**meta, "skipped": True, "reason": "chromadb_has_data"}
-        except Exception as e:
-            logger.warning("Could not check ChromaDB count: %s", e)
+        locked = await cache.exists(INGEST_LOCK_KEY)
+        if locked:
+            logger.warning("Ingest already in progress — skipping (use force=True to override)")
+            return {
+                "status":       "skipped",
+                "reason":       "ingest_locked",
+                "total_docs":   0,
+                "total_chunks": 0,
+            }
 
-    # ── Guard 2: Redis lock (secondary guard within same session) ──────────────
-    if not force and await cache.exists(KEY_INGEST_LOCK):
-        meta = await cache.get(KEY_INGEST_META) or {}
-        logger.info("Ingest skipped — Redis lock active")
-        return {**meta, "skipped": True, "reason": "redis_lock"}
+    # Set lock
+    await cache.set(INGEST_LOCK_KEY, "1", ttl=INGEST_LOCK_TTL)
+    t_start = time.time()
 
-    logger.info("Starting ingest (force=%s)", force)
-    embedder = _get_embedder()
+    try:
+        collection = _get_collection()
 
-    pages        = await _fetch_all_pages()
-    total_chunks = 0
-    skipped      = 0
+        # ── Step 1: Fetch pages ────────────────────────────────────────────────
+        logger.info("Fetching pages from Notion...")
+        loop  = asyncio.get_event_loop()
+        pages = await loop.run_in_executor(None, _fetch_all_notion_pages)
 
-    for page in pages:
-        meta = _page_meta(page)
-        if not meta["doc_title"]:
-            skipped += 1
-            continue
+        if not pages:
+            logger.warning("No pages returned from Notion")
+            return {
+                "status":       "done",
+                "total_docs":   0,
+                "total_chunks": 0,
+                "elapsed_s":    round(time.time() - t_start, 1),
+            }
 
-        blocks = await _fetch_page_blocks(page["id"])
-        chunks = _chunk_blocks(blocks)
-        if not chunks:
-            skipped += 1
-            continue
+        total_docs   = len(pages)
+        total_chunks = 0
+        all_chunks:  list[dict] = []
 
-        page_id = meta["notion_page_id"]
+        # ── Step 2: Extract + chunk ────────────────────────────────────────────
+        for page in pages:
+            page_id = page["id"]
+            try:
+                blocks  = await loop.run_in_executor(None, _fetch_page_blocks, page_id)
+                content = _extract_page_content(page, blocks)
+            except Exception as e:
+                logger.error("Failed to extract page %s: %s", page_id, e)
+                continue
 
-        # Delete stale chunks for this page before re-inserting
-        try:
-            existing = collection.get(where={"notion_page_id": page_id})
-            if existing["ids"]:
-                collection.delete(ids=existing["ids"])
-        except Exception:
-            pass
+            title      = content["title"]
+            doc_type   = content["doc_type"]
+            department = content["department"]
+            version    = content["version"]
+            url        = content["url"]
 
-        # Embed in batches of 20
-        texts  = [c["content"] for c in chunks]
-        embeds = []
-        for i in range(0, len(texts), 20):
-            batch = embedder.embed_documents(texts[i:i+20])
-            embeds.extend(batch)
+            for section in content["sections"]:
+                heading = section["heading"]
+                text    = section["text"]
+                chunks  = _chunk_text(text)
+                citation = _format_citation(title, heading, doc_type)
 
-        ids, docs, metas, emb_list = [], [], [], []
-        for i, (chunk, emb) in enumerate(zip(chunks, embeds)):
-            chunk_id = hashlib.md5(f"{page_id}_{i}".encode()).hexdigest()
-            citation = f"{meta['doc_title']} → {chunk['heading']}"
-            ids.append(chunk_id)
-            docs.append(chunk["content"])
-            emb_list.append(emb)
-            metas.append({
-                "notion_page_id": page_id,
-                "doc_title":      meta["doc_title"],
-                "doc_type":       meta["doc_type"],
-                "department":     meta["department"],
-                "version":        meta["version"],
-                "heading":        chunk["heading"],
-                "chunk_index":    chunk["chunk_index"],
-                "citation":       citation,
-            })
+                for idx, chunk_text in enumerate(chunks):
+                    cid = _chunk_id(page_id, heading, idx)
+                    all_chunks.append({
+                        "id":   cid,
+                        "text": chunk_text,
+                        "metadata": {
+                            "notion_page_id": page_id,
+                            "doc_title":      title,
+                            "doc_type":       doc_type,
+                            "department":     department,
+                            "version":        version,
+                            "heading":        heading,
+                            "chunk_index":    idx,
+                            "citation":       citation,
+                            "source_url":     url,
+                        },
+                    })
 
-        collection.upsert(
-            ids=ids, documents=docs,
-            embeddings=emb_list, metadatas=metas,
+        logger.info("Prepared %d chunks from %d pages", len(all_chunks), total_docs)
+
+        # ── Step 3: Embed + upsert in batches ──────────────────────────────────
+        for i in range(0, len(all_chunks), BATCH_EMBED_SIZE):
+            batch        = all_chunks[i : i + BATCH_EMBED_SIZE]
+            upserted     = await loop.run_in_executor(
+                None, _embed_and_upsert, batch, collection
+            )
+            total_chunks += upserted
+            logger.info(
+                "Embedded batch %d/%d — %d/%d chunks upserted",
+                i // BATCH_EMBED_SIZE + 1,
+                (len(all_chunks) + BATCH_EMBED_SIZE - 1) // BATCH_EMBED_SIZE,
+                total_chunks,
+                len(all_chunks),
+            )
+
+        elapsed = round(time.time() - t_start, 1)
+
+        # ── Step 4: Save ingest metadata to Redis ──────────────────────────────
+        meta = {
+            "total_docs":   total_docs,
+            "total_chunks": total_chunks,
+            "elapsed_s":    elapsed,
+            "ingested_at":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        await cache.set(INGEST_META_KEY, meta)
+
+        logger.info(
+            "Ingest complete: %d docs, %d chunks, %.1fs",
+            total_docs, total_chunks, elapsed,
         )
-        total_chunks += len(ids)
-        logger.info("Ingested '%s' → %d chunks", meta["doc_title"], len(ids))
+        return {"status": "done", **meta}
 
-    result = {
-        "total_docs":   len(pages) - skipped,
-        "total_chunks": total_chunks,
-        "skipped":      skipped,
-    }
-    await cache.set(KEY_INGEST_LOCK, 1,      ttl=TTL_INGEST_LOCK)
-    await cache.set(KEY_INGEST_META, result,  ttl=86400)
-    logger.info("Ingest complete: %d docs, %d chunks", result["total_docs"], total_chunks)
-    return result
+    except Exception as e:
+        logger.error("Ingest pipeline failed: %s", e, exc_info=True)
+        raise
+
+    finally:
+        # Always release the lock
+        await cache.delete(INGEST_LOCK_KEY)

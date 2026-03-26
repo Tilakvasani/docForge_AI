@@ -1,83 +1,63 @@
-from contextlib import asynccontextmanager
+"""
+main.py — FastAPI entry point for DocForge AI + CiteRAG
+=========================================================
+
+Run with:
+    uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+
+Routes registered:
+  /api/rag/*    — RAG ingest, ask, status, eval, scores, cache
+  /api/agent/*  — LangGraph agent: tickets + memory
+  /api/*        — DocForge document generation (routes.py)
+"""
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from backend.core.logger import logger
-from backend.api.routes import router
+
+app = FastAPI(
+    title="DocForge AI + CiteRAG",
+    description="AI document generation (DocForge) and RAG Q&A (CiteRAG) for Turabit",
+    version="5.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── DocForge generation routes ─────────────────────────────────────────────────
+from backend.api.routes import router as docforge_router
+app.include_router(docforge_router, prefix="/api")
+
+# ── RAG routes (ingest, ask, status, eval, scores) ────────────────────────────
 from backend.services.rag.rag_routes import router as rag_router
-from backend.services.db_service import get_pool, close_pool
-from backend.services.redis_service import cache
-from backend.core.config import settings
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # ── PostgreSQL ──────────────────────────────────────────────────────────
-    try:
-        await get_pool()
-        logger.info("✅ PostgreSQL connection pool ready")
-    except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
-        raise
-
-    # ── Redis (optional — app works without it) ─────────────────────────────
-    redis_url = getattr(settings, "REDIS_URL", "redis://localhost:6379")
-    await cache.connect(redis_url)
-
-    # ── RAG auto-ingest on startup ────────────────────────────────────────
-    try:
-        from backend.services.rag.ingest_service import ingest_from_notion
-        logger.info("Starting RAG auto-ingest...")
-        result = await ingest_from_notion(force=False)
-        if result.get("skipped"):
-            logger.info("RAG ingest skipped — recently ingested (%s chunks cached)",
-                        result.get("total_chunks", 0))
-        else:
-            logger.info("RAG ingest complete: %d docs, %d chunks",
-                        result.get("total_docs", 0), result.get("total_chunks", 0))
-    except Exception as e:
-        logger.warning("RAG auto-ingest failed (non-fatal): %s", e)
-
-    yield
-
-    # ── Cleanup ─────────────────────────────────────────────────────────────
-    await close_pool()
-    await cache.disconnect()
-
-
-app = FastAPI(title="DocForge AI", version="3.0.0", lifespan=lifespan)
-
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-app.include_router(router,     prefix="/api")
 app.include_router(rag_router, prefix="/api")
 
+# ── Agent routes (tickets, memory) — THIS IS WHAT FIXES THE 404 ───────────────
+from backend.services.rag.agent_routes import router as agent_router
+app.include_router(agent_router, prefix="/api")
 
-@app.get("/health")
+
+@app.get("/health", tags=["System"])
 async def health():
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        db_status = "connected"
-    except Exception as e:
-        db_status = str(e)
-
-    return {
-        "status": "healthy" if db_status == "connected" else "degraded",
-        "database": db_status,
-        "redis": "connected" if cache.is_available else "unavailable (cache disabled)",
-    }
+    return {"status": "ok", "service": "DocForge AI + CiteRAG"}
 
 
-@app.get("/api/cache/stats")
-async def cache_stats_endpoint():
-    """Show Redis cache stats — useful for debugging."""
-    return await cache.cache_stats()
+@app.get("/", tags=["System"])
+async def root():
+    return {"docs": "/docs", "health": "/health"}
 
 
-@app.delete("/api/cache/flush")
-async def cache_flush_endpoint():
-    """Flush all DocForge cache keys."""
-    count = await cache.flush_pattern("docforge:*")
-    return {"flushed": count, "message": f"Deleted {count} cache keys"}
+@app.on_event("startup")
+async def startup_event():
+    logger.info("DocForge AI backend started — routes: /api/rag/*, /api/agent/*, /api/*")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("DocForge AI backend shutting down")

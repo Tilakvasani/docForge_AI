@@ -316,13 +316,19 @@ def init_session():
         section_questions={}, section_answers={},
         section_contents={}, sec_ids_ordered=[],
         gen_id=None, full_document="",
-        active_tab="ask",
+        active_tab="ask", main_tab="💬 CiteRAG",
         rag_chats={}, rag_active_chat=None,
         docx_bytes_cache=None, docx_cache_doc=None,
         _library_data=None, _answer_drafts={},
         _last_chunks=[],
-        _last_ragas_scores=None,   # stores RAGAS scores from last /rag/ask
         _ragas_history=[],         # [{question, scores, timestamp, tool_used}]
+        _batch_progress=None,      # {done, total, current_q} — live batch progress
+        # ── Agent / Tickets tab ────────────────────────────────────────────────
+        agent_tickets=[],          # [{ticket_id, question, status, priority, url, created_at, summary, sources}]
+        agent_tickets_loaded=False,
+        _pending_ticket_idx=None,  # index of message awaiting ticket creation
+        _ticket_created={},        # {msg_idx: ticket_url} — tracks created tickets per message
+        agent_memory={},           # {user_name, industry, last_doc, last_intent}
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -341,21 +347,27 @@ with st.sidebar:
     st.caption("Generate · Ask · Discover")
     st.divider()
 
-    tab = st.radio(
+    def _switch_tab():
+        tab = st.session_state.main_tab
+        if "DocForge" in tab:
+            st.session_state.active_tab = "generate"
+        elif "Library" in tab:
+            st.session_state.active_tab = "library"
+        elif "RAGAS" in tab:
+            st.session_state.active_tab = "ragas"
+        elif "Ticket" in tab:
+            st.session_state.active_tab = "agent"
+        else:
+            st.session_state.active_tab = "ask"
+
+    st.radio(
         "Mode",
-        ["💬 CiteRAG", "⚡ DocForge", "📚 Library", "📊 RAGAS"],
+        ["💬 CiteRAG", "⚡ DocForge", "📚 Library", "📊 RAGAS", "🎫 Tickets"],
         label_visibility="collapsed",
         key="main_tab",
         horizontal=False,
+        on_change=_switch_tab,
     )
-    if "DocForge" in tab:
-        st.session_state.active_tab = "generate"
-    elif "Library" in tab:
-        st.session_state.active_tab = "library"
-    elif "RAGAS" in tab:
-        st.session_state.active_tab = "ragas"
-    else:
-        st.session_state.active_tab = "ask"
 
     st.divider()
 
@@ -630,8 +642,22 @@ if st.session_state.active_tab == "ask":
                 src_html = " &nbsp;·&nbsp; ".join(parts)
                 st.markdown(f'<div class="cite-sources">📎 {src_html}</div>', unsafe_allow_html=True)
 
+            # ── Agent command replies (tool_used == "agent") ──────────────────
+            if role == "assistant" and msg.get("tool_used") == "agent":
+                # Already rendered above via st.markdown(content) — just add pill
+                st.markdown(
+                    '<div style="margin-top:6px">'
+                    '<span style="font-size:11px;background:rgba(99,102,241,0.15);color:#a5b4fc;'
+                    'padding:2px 8px;border-radius:99px">🤖 Agent</span>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+
     _prefill = st.session_state.pop("_prefill_q", "")
-    user_q   = st.chat_input("Ask anything about your documents...")
+    user_q   = st.chat_input("Ask anything...")
+
 
     if user_q or _prefill:
         question = (user_q or _prefill).strip()
@@ -650,11 +676,15 @@ if st.session_state.active_tab == "ask":
             }, timeout=120)
         if res:
             ai_msg = {
-                "role":       "assistant",
-                "content":    res.get("answer", "No answer returned."),
-                "citations":  res.get("citations", []),
-                "confidence": res.get("confidence", ""),
-                "tool_used":  res.get("tool_used", ""),
+                "role":           "assistant",
+                "content":        res.get("answer", "No answer returned."),
+                "citations":      res.get("citations", []),
+                "confidence":     res.get("confidence", ""),
+                "tool_used":      res.get("tool_used", ""),
+                "ticket_pending": res.get("ticket_pending", False),
+                "orig_question":  question,
+                "ticket_id":      res.get("ticket_id"),    # set if agent auto-created one
+                "ticket_url":     res.get("ticket_url"),
             }
             if res.get("tool_used") == "compare":
                 ai_msg.update({
@@ -666,18 +696,6 @@ if st.session_state.active_tab == "ask":
                     "doc_b":       res.get("doc_b", "Document B"),
                 })
             st.session_state._last_chunks       = res.get("chunks", [])
-            st.session_state._last_ragas_scores = res.get("ragas_scores")
-            # Append to RAGAS history for the dedicated tab
-            _rscores = res.get("ragas_scores")
-            if _rscores:
-                import time as _time
-                st.session_state._ragas_history.append({
-                    "question":  question,
-                    "scores":    _rscores,
-                    "tool_used": res.get("tool_used", ""),
-                    "timestamp": _time.strftime("%H:%M:%S"),
-                })
-                st.session_state._ragas_history = st.session_state._ragas_history[-20:]
         else:
             ai_msg = {
                 "role":      "assistant",
@@ -685,7 +703,6 @@ if st.session_state.active_tab == "ask":
                 "citations": [],
             }
             st.session_state._last_chunks       = []
-            st.session_state._last_ragas_scores = None
         st.session_state.rag_chats[active_id]["messages"].append(ai_msg)
         st.rerun()
 
@@ -944,99 +961,256 @@ elif st.session_state.active_tab == "ragas":
     if last_scores:
         st.markdown("#### 🔬 Latest Answer Quality")
         _render_ragas_scores(last_scores, title="Most recent question")
-    else:
-        st.info(
-            "No RAGAS scores yet. Use the **🧪 Manual Evaluation** panel below "
-            "to run RAGAS on any question — paste a question and click **▶ Run Evaluation**."
-        )
 
-    # ── Section 2: Manual eval — run RAGAS on a custom question ────────────────
+
+
+    # ── Section 3: Batch Evaluation ───────────────────────────────────────────
     st.divider()
-    st.markdown("#### 🧪 Manual Evaluation")
-    st.caption("Run RAGAS on any question manually — useful for testing specific queries.")
+    st.markdown("#### 🗂 Batch Evaluation")
+    st.caption("Run RAGAS on multiple questions at once — add rows manually or import a JSON file.")
+
+    # ── Init batch state ──────────────────────────────────────────────────────
+    if "batch_rows" not in st.session_state:
+        st.session_state.batch_rows = [{"question": "", "ground_truth": ""}]
+    if "batch_results" not in st.session_state:
+        st.session_state.batch_results = []
+    if "batch_running" not in st.session_state:
+        st.session_state.batch_running = False
 
     with st.container(border=True):
-        eval_q = st.text_input(
-            "Question",
-            placeholder="e.g. What is the notice period in the employment contract?",
-            key="ragas_eval_q",
-            label_visibility="visible",
-        )
-        eval_gt = st.text_area(
-            "Ground Truth (optional)",
-            placeholder="Paste the expected answer here to enable Context Recall scoring...",
-            height=80,
-            key="ragas_eval_gt",
-            label_visibility="visible",
-        )
-        if st.button("▶ Run Evaluation", type="primary", key="ragas_run_btn", use_container_width=True):
-            if not eval_q.strip():
-                st.warning("Enter a question first.")
-            else:
-                with st.spinner("⏳ Running RAG + RAGAS scoring… this takes 20–60 seconds"):
-                    import time as _rtime
-                    _ts = _rtime.strftime("%H:%M:%S")
-                    # /rag/eval runs RAGAS synchronously — real scores guaranteed in response
-                    eval_res = api_post("/rag/eval", {
-                        "question":     eval_q.strip(),
-                        "ground_truth": eval_gt.strip() if eval_gt else "",
-                        "top_k":        15,
-                    }, timeout=300)
 
-                if eval_res:
-                    _scores = eval_res.get("ragas_scores")
-                    # Show the RAG answer
-                    with st.expander("📄 RAG Answer", expanded=False):
-                        st.markdown(eval_res.get("answer", "No answer returned."))
-                        _cits = eval_res.get("citations", [])
-                        if _cits:
-                            _parts = []
-                            for c in _cits:
-                                if isinstance(c, dict) and c.get("url"):
-                                    _parts.append(f'<a href="{c["url"]}" target="_blank">{c["text"]}</a>')
-                                else:
-                                    _parts.append(str(c.get("text", c) if isinstance(c, dict) else c))
-                            st.markdown(
-                                f'<div style="font-size:12px;color:#475569;margin-top:8px">📎 {" · ".join(_parts)}</div>',
-                                unsafe_allow_html=True,
-                            )
+        # ── JSON import ────────────────────────────────────────────────────────
+        with st.expander("📥 Import from JSON", expanded=False):
+            st.caption(
+                'Expected format: `[{"question": "...", "ground_truth": "..."}, ...]`  '
+                '— `ground_truth` is optional in each item.'
+            )
 
-                    if _scores:
-                        st.success("✅ Real RAGAS scores ready!")
-                        _render_ragas_scores(_scores, title=eval_q[:60], timestamp=_ts)
-                        # Save to history
-                        st.session_state._ragas_history.append({
-                            "question":  eval_q.strip(),
-                            "scores":    _scores,
-                            "tool_used": eval_res.get("tool_used", ""),
-                            "timestamp": _ts,
-                        })
-                        st.session_state._ragas_history = st.session_state._ragas_history[-20:]
-                        st.session_state._last_ragas_scores = _scores
-                    else:
-                        _ragas_err = eval_res.get("ragas_error")
-                        if _ragas_err:
-                            st.error(f"❌ RAGAS scoring failed: {_ragas_err}")
-                            with st.expander("🔍 Debug info"):
-                                st.code(_ragas_err)
-                                st.markdown(
-                                    "**Common fixes:**\n"
-                                    "- RAGAS v0.2+: run `pip install ragas==0.1.21` to downgrade, "
-                                    "or the updated `ragas_scorer.py` handles v0.2 automatically\n"
-                                    "- Check Azure LLM endpoint/key in `.env`\n"
-                                    "- Check backend logs for the full traceback"
-                                )
+            def _handle_json_upload():
+                uploaded = st.session_state.get("batch_json_upload")
+                if uploaded:
+                    import json as _json
+                    try:
+                        raw_data = _json.loads(uploaded.read().decode("utf-8"))
+                        if not isinstance(raw_data, list):
+                            st.session_state["_batch_err"] = "JSON must be a list of objects."
                         else:
-                            st.warning(
-                                "⚠️ RAGAS returned no scores and no error was reported. "
-                                "This usually means the RAG answer had no retrieved chunks, "
-                                "or `_init_ragas()` returned False silently. "
-                                "Check backend logs for `RAGAS init failed` or `RAGAS import failed`."
-                            )
-                else:
-                    st.error("Could not reach the RAG service. Make sure the backend is running.")
+                            parsed_rows = []
+                            for item in raw_data:
+                                if isinstance(item, dict) and item.get("question", "").strip():
+                                    parsed_rows.append({
+                                        "question":     item.get("question", "").strip(),
+                                        "ground_truth": item.get("ground_truth", "").strip(),
+                                    })
+                            if parsed_rows:
+                                st.session_state.batch_rows = parsed_rows
+                                st.session_state.batch_results = []
+                                st.session_state["_batch_succ"] = f"Loaded {len(parsed_rows)} questions from JSON."
+                            else:
+                                st.session_state["_batch_err"] = "No valid questions found in JSON."
+                    except Exception as _je:
+                        st.session_state["_batch_err"] = f"JSON parse error: {_je}"
 
-    # ── Section 3: Session history ──────────────────────────────────────────────
+            st.file_uploader(
+                "Upload JSON file",
+                type=["json"],
+                key="batch_json_upload",
+                label_visibility="collapsed",
+                on_change=_handle_json_upload,
+            )
+            
+            if "_batch_succ" in st.session_state:
+                st.success(st.session_state.pop("_batch_succ"))
+            if "_batch_err" in st.session_state:
+                st.error(st.session_state.pop("_batch_err"))
+
+        # ── Manual rows ────────────────────────────────────────────────────────
+        st.markdown("**Questions**")
+        rows_to_delete = []
+        for _ri, _row in enumerate(st.session_state.batch_rows):
+            _rc1, _rc2, _rc3 = st.columns([3, 3, 0.5])
+            with _rc1:
+                _q_val = st.text_input(
+                    f"Question {_ri + 1}",
+                    value=_row["question"],
+                    placeholder="e.g. What is the leave policy?",
+                    key=f"batch_q_{_ri}",
+                    label_visibility="collapsed",
+                )
+                st.session_state.batch_rows[_ri]["question"] = _q_val
+            with _rc2:
+                _gt_val = st.text_input(
+                    f"Ground Truth {_ri + 1}",
+                    value=_row["ground_truth"],
+                    placeholder="Ground truth (optional)",
+                    key=f"batch_gt_{_ri}",
+                    label_visibility="collapsed",
+                )
+                st.session_state.batch_rows[_ri]["ground_truth"] = _gt_val
+            with _rc3:
+                if len(st.session_state.batch_rows) > 1:
+                    if st.button("✕", key=f"batch_del_{_ri}", help="Remove row"):
+                        rows_to_delete.append(_ri)
+
+        if rows_to_delete:
+            for _idx in sorted(rows_to_delete, reverse=True):
+                st.session_state.batch_rows.pop(_idx)
+            st.session_state.batch_results = []
+            st.rerun()
+
+        _ba1, _ba2 = st.columns([1, 3])
+        with _ba1:
+            if st.button("＋ Add Row", key="batch_add_row"):
+                st.session_state.batch_rows.append({"question": "", "ground_truth": ""})
+                st.rerun()
+        with _ba2:
+            st.caption(f"{len(st.session_state.batch_rows)} question(s) queued · Each takes 20–60s · No timeout limit")
+
+        st.write("")
+        _valid_rows = [r for r in st.session_state.batch_rows if r["question"].strip()]
+
+        # ── Live progress display (survives st.rerun) ─────────────────────────
+        _bp = st.session_state.get("_batch_progress")
+        if _bp and _bp.get("running"):
+            _done  = _bp["done"]
+            _total = _bp["total"]
+            _frac  = _done / _total if _total else 0
+            st.progress(_frac, text=f"⏳ Running {_done}/{_total}: {_bp.get('current_q', '')[:55]}…")
+            st.caption(f"Question {_done} of {_total} complete — waiting for next result…")
+
+        if st.button(
+            f"▶ Run Batch ({len(_valid_rows)} questions)",
+            type="primary",
+            key="batch_run_btn",
+            use_container_width=True,
+            disabled=len(_valid_rows) == 0 or st.session_state.get("batch_running", False),
+        ):
+            if _valid_rows:
+                import time as _bt
+                st.session_state.batch_results = []
+                st.session_state.batch_running = True
+                _total = len(_valid_rows)
+                st.session_state._batch_progress = {
+                    "running": True, "done": 0, "total": _total, "current_q": ""
+                }
+
+                for _bi, _brow in enumerate(_valid_rows):
+                    _bq  = _brow["question"].strip()
+                    _bgt = _brow["ground_truth"].strip()
+
+                    # Update progress state so the re-render above shows current status
+                    st.session_state._batch_progress["current_q"] = _bq
+                    st.session_state._batch_progress["done"]       = _bi
+
+                    _bts  = _bt.strftime("%H:%M:%S")
+                    _bres = api_post("/rag/eval", {
+                        "question":     _bq,
+                        "ground_truth": _bgt,
+                        "top_k":        15,
+                    }, timeout=600)
+
+                    _bresult = {
+                        "question":     _bq,
+                        "ground_truth": _bgt,
+                        "timestamp":    _bts,
+                        "scores":       None,
+                        "answer":       "",
+                        "error":        None,
+                        "tool_used":    "",
+                    }
+                    if _bres:
+                        _bresult["scores"]    = _bres.get("ragas_scores")
+                        _bresult["answer"]    = _bres.get("answer", "")
+                        _bresult["error"]     = _bres.get("ragas_error")
+                        _bresult["tool_used"] = _bres.get("tool_used", "")
+                        if _bresult["scores"]:
+                            st.session_state._ragas_history.append({
+                                "question":  _bq,
+                                "scores":    _bresult["scores"],
+                                "tool_used": _bresult["tool_used"],
+                                "timestamp": _bts,
+                            })
+                            st.session_state._ragas_history = st.session_state._ragas_history[-20:]
+                    else:
+                        _bresult["error"] = "API call failed — backend unreachable."
+
+                    st.session_state.batch_results.append(_bresult)
+                    st.session_state._batch_progress["done"] = _bi + 1
+
+                st.session_state._batch_progress = {"running": False, "done": _total, "total": _total, "current_q": ""}
+                st.session_state.batch_running = False
+                st.rerun()
+
+    # ── Batch results display ─────────────────────────────────────────────────
+    if st.session_state.batch_results:
+        _br = st.session_state.batch_results
+        st.divider()
+        st.markdown(f"**📊 Batch Results** — {len(_br)} questions")
+
+        # Aggregate summary row
+        _bscored = [r for r in _br if r["scores"]]
+        if _bscored:
+            def _bavg(key):
+                vals = [r["scores"].get(key) for r in _bscored if r["scores"].get(key) is not None]
+                return round(sum(vals) / len(vals), 3) if vals else None
+
+            _bfa = _bavg("faithfulness")
+            _bra = _bavg("answer_relevancy")
+            _bpa = _bavg("context_precision")
+            _bca = _bavg("context_recall")
+
+            with st.container(border=True):
+                st.caption(f"BATCH AVERAGES · {len(_bscored)}/{len(_br)} scored")
+                _bc1, _bc2, _bc3, _bc4 = st.columns(4)
+                def _bm(col, label, val):
+                    if val is not None:
+                        col.metric(label, f"{val:.3f}")
+                    else:
+                        col.metric(label, "n/a")
+                _bm(_bc1, "Faithfulness",      _bfa)
+                _bm(_bc2, "Ans. Relevancy",     _bra)
+                _bm(_bc3, "Context Precision",  _bpa)
+                _bm(_bc4, "Context Recall",     _bca)
+
+        # Per-question expandable cards
+        for _bri, _bentry in enumerate(_br):
+            _blabel = f"Q{_bri+1}: {_bentry['question'][:65]}{'…' if len(_bentry['question']) > 65 else ''}"
+            _bstatus = "✅" if _bentry["scores"] else ("❌" if _bentry["error"] else "⚠️")
+            with st.expander(f"{_bstatus} {_blabel} · {_bentry['timestamp']}"):
+                if _bentry["answer"]:
+                    st.markdown(f"**📄 RAG Answer:**")
+                    st.markdown(_bentry["answer"])
+                if _bentry["scores"]:
+                    _render_ragas_scores(_bentry["scores"], title=_bentry["question"])
+                elif _bentry["error"]:
+                    st.error(f"RAGAS error: {_bentry['error']}")
+                else:
+                    st.warning("No scores returned — check backend logs.")
+
+        # Export batch results as JSON
+        import json as _ejson, time as _et
+        _export_data = [
+            {
+                "question":     r["question"],
+                "ground_truth": r["ground_truth"],
+                "timestamp":    r["timestamp"],
+                "tool_used":    r["tool_used"],
+                "answer":       r["answer"],
+                "scores":       r["scores"],
+                "error":        r["error"],
+            }
+            for r in _br
+        ]
+        st.download_button(
+            "⬇️ Export Results as JSON",
+            data=_ejson.dumps(_export_data, indent=2),
+            file_name=f"ragas_batch_{_et.strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            key="batch_export_btn",
+        )
+
+    # ── Section 4: Session history ────────────────────────────────────────────
+    
     history = st.session_state.get("_ragas_history", [])
     if history:
         st.divider()
@@ -1076,7 +1250,6 @@ elif st.session_state.active_tab == "ragas":
 
         if st.button("🗑 Clear History", key="ragas_clear_hist"):
             st.session_state._ragas_history = []
-            st.session_state._last_ragas_scores = None
             st.rerun()
 
     # ── Section 4: Metric explanations ────────────────────────────────────────
@@ -1088,10 +1261,7 @@ elif st.session_state.active_tab == "ragas":
 | **Faithfulness** | Is every claim in the answer supported by the retrieved documents? High = no hallucination. | ≥ 0.85 |
 | **Answer Relevancy** | Does the answer actually address the question? Low = answer went off-topic. | ≥ 0.80 |
 | **Context Precision** | Are the retrieved chunks relevant? Low = retriever is pulling in noise. | ≥ 0.75 |
-| **Context Recall** | Did retrieval cover all the important facts? Only scored when a ground truth exists in `qa_dataset.json`. | ≥ 0.75 |
-
-**Scores are real RAGAS metrics** computed by `ragas_scorer.py` using Azure OpenAI as the judge LLM.  
-Context recall shows **n/a** when no matching question is found in `qa_dataset.json`.
+| **Context Recall** | Did retrieval cover all the important facts? Only scored when a **Ground Truth** is provided in the batch or eval form. | ≥ 0.75 |
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1605,3 +1775,289 @@ elif st.session_state.active_tab == "generate":
             st.session_state["departments"]  = saved_depts
             st.session_state["step"]         = 1
             st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  🎫 TICKETS — Knowledge-gap ticket viewer + status manager
+#  Tickets are auto-created when CiteRAG retrieval confidence is low.
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif st.session_state.active_tab == "agent":
+    import json as _aj
+
+    def _ag_get(ep, timeout=30):
+        try:
+            r = httpx.get(f"{API_URL}{ep}", timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _ag_post(ep, payload, timeout=60):
+        try:
+            r = httpx.post(f"{API_URL}{ep}", json=payload, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ── Page header ────────────────────────────────────────────────────────────
+    st.markdown("""
+<div style="padding:0 0 0.5rem">
+  <h2 style="color:#e2e8f0;font-weight:700;margin-bottom:0.2rem">🎫 Tickets</h2>
+  <p style="color:#475569;font-size:0.88rem;margin:0">
+    Knowledge-gap tickets — auto-created when
+    <b style="color:#93c5fd">💬 CiteRAG</b> can't find an answer in the documents
+  </p>
+</div>
+""", unsafe_allow_html=True)
+    st.divider()
+
+    # ── Two-column layout ──────────────────────────────────────────────────────
+    col_mem, col_tix = st.columns([1, 2], gap="large")
+
+    # ════════════════════════════════════════════════════════════
+    #  LEFT — 🧠 Memory panel
+    # ════════════════════════════════════════════════════════════
+    with col_mem:
+        st.markdown("""
+<div style="font-size:11px;font-weight:600;color:#475569;letter-spacing:0.08em;
+            text-transform:uppercase;margin-bottom:10px">🧠 Session Memory</div>
+""", unsafe_allow_html=True)
+
+        mem = st.session_state.agent_memory
+
+        # Live memory chips
+        if mem:
+            chips_html = ""
+            _chip = lambda ico, val: (
+                f'<span style="display:inline-flex;align-items:center;gap:4px;'
+                f'background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);'
+                f'border-radius:20px;padding:3px 10px;font-size:11px;color:#93c5fd;'
+                f'margin:2px 3px">{ico} {val}</span>'
+            )
+            if mem.get("user_name"):
+                chips_html += _chip("👤", mem["user_name"])
+            if mem.get("industry"):
+                chips_html += _chip("🏭", mem["industry"])
+            if mem.get("last_intent"):
+                chips_html += _chip("🎯", mem["last_intent"])
+            if mem.get("last_doc"):
+                chips_html += _chip("📄", mem["last_doc"][:22])
+            st.markdown(f'<div style="margin-bottom:14px">{chips_html}</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.caption("No memory yet — ask a question in 💬 CiteRAG to populate this.")
+
+        st.divider()
+
+        # Context hints (pre-fill memory)
+        st.markdown("""
+<div style="font-size:11px;font-weight:600;color:#475569;letter-spacing:0.08em;
+            text-transform:uppercase;margin-bottom:8px">⚙️ Context Hints</div>
+""", unsafe_allow_html=True)
+        st.caption("Pre-fill memory so the agent knows who you are before the first question.")
+
+        _hn = st.text_input("Your name", value=mem.get("user_name", ""),
+                            placeholder="e.g. Rahul", key="ag_hint_name")
+        _hi = st.text_input("Industry / department", value=mem.get("industry", ""),
+                            placeholder="e.g. Technology / HR", key="ag_hint_industry")
+
+        if st.button("💾 Save Hints", key="ag_save_hints", use_container_width=True):
+            st.session_state.agent_memory["user_name"] = _hn.strip()
+            st.session_state.agent_memory["industry"]  = _hi.strip()
+            st.success("Saved!")
+            st.rerun()
+
+        st.divider()
+
+        # Sync memory from backend (LangGraph checkpointer)
+        if st.button("↺ Sync from Backend", key="ag_sync_mem", use_container_width=True):
+            _mres = _ag_get("/agent/memory")
+            if _mres and "error" not in _mres:
+                st.session_state.agent_memory.update(_mres.get("memory", {}))
+                st.success("Memory synced!")
+                st.rerun()
+            else:
+                st.warning(
+                    f"⚠️ `/api/agent/memory` not yet implemented. "
+                    "Memory will populate automatically once `agent_routes.py` is deployed."
+                )
+
+        # Quick stats
+        st.divider()
+        _open_n = len([t for t in st.session_state.agent_tickets
+                       if t.get("status") == "Open"])
+        _tot_n  = len(st.session_state.agent_tickets)
+        _c1, _c2 = st.columns(2)
+        _c1.metric("Total Tickets", _tot_n)
+        _c2.metric("Open", _open_n)
+
+    # ════════════════════════════════════════════════════════════
+    #  RIGHT — 🎫 My Tickets
+    # ════════════════════════════════════════════════════════════
+    with col_tix:
+        # Header row
+        _th1, _th2, _th3 = st.columns([2, 1, 1])
+        with _th1:
+            st.markdown("""
+<div style="font-size:11px;font-weight:600;color:#475569;letter-spacing:0.08em;
+            text-transform:uppercase;margin-bottom:10px">🎫 Knowledge-Gap Tickets</div>
+""", unsafe_allow_html=True)
+        with _th2:
+            _tix_filter = st.selectbox(
+                "Status filter",
+                ["All", "Open", "In Progress", "Resolved"],
+                key="ag_tix_filter",
+                label_visibility="collapsed",
+            )
+        with _th3:
+            if st.button("↺ Refresh", key="ag_refresh_tix", use_container_width=True):
+                st.session_state.agent_tickets_loaded = False
+
+        # Load tickets from backend (Notion)
+        if not st.session_state.agent_tickets_loaded:
+            with st.spinner("Loading tickets from Notion…"):
+                _td = _ag_get("/agent/tickets")
+            if _td and "error" not in _td:
+                st.session_state.agent_tickets = _td.get("tickets", [])
+                st.session_state.agent_tickets_loaded = True
+            else:
+                _err_msg = _td.get("error", "Unknown") if _td else "Backend unreachable"
+                st.info(
+                    f"ℹ️ Tickets endpoint not yet active: `{_err_msg}`\n\n"
+                    "Tickets will appear here automatically once `agent_routes.py` is deployed "
+                    "and CiteRAG starts creating them on low-confidence answers."
+                )
+
+        _all_tix = st.session_state.agent_tickets
+        _show_tix = (
+            _all_tix if _tix_filter == "All"
+            else [t for t in _all_tix if t.get("status", "") == _tix_filter]
+        )
+
+        if not _all_tix:
+            st.markdown("""
+<div style="text-align:center;padding:3rem 1rem;background:#0f111a;
+            border:1px dashed #1e2843;border-radius:12px;margin-top:8px">
+  <div style="font-size:2rem;margin-bottom:0.6rem">🎫</div>
+  <div style="color:#475569;font-size:0.85rem;line-height:1.6">
+    No tickets yet.<br>
+    When <b style="color:#93c5fd">CiteRAG</b> can't find an answer in the documents,<br>
+    the LangGraph agent will auto-create a ticket here<br>
+    with the question, attempted sources, and priority.
+  </div>
+</div>
+""", unsafe_allow_html=True)
+        else:
+            # Summary metrics bar
+            _op  = len([t for t in _all_tix if t.get("status") == "Open"])
+            _ip  = len([t for t in _all_tix if t.get("status") == "In Progress"])
+            _dn  = len([t for t in _all_tix if t.get("status") == "Resolved"])
+            _sm1, _sm2, _sm3, _sm4 = st.columns(4)
+            _sm1.metric("Total",       len(_all_tix))
+            _sm2.metric("Open",        _op)
+            _sm3.metric("In Progress", _ip)
+            _sm4.metric("Resolved",    _dn)
+            st.write("")
+
+            if not _show_tix:
+                st.info(f"No tickets with status '{_tix_filter}'.")
+            else:
+                for _t in _show_tix:
+                    _ts   = _t.get("status", "Open")
+                    _tp   = _t.get("priority", "Medium")
+                    _tq   = _t.get("question", "—")
+                    _tid  = _t.get("ticket_id", "—")
+                    _tts  = _t.get("created_at", "")
+                    _turl = _t.get("url", "")
+                    _tsum = _t.get("summary", "")
+                    _tsrc = _t.get("attempted_sources", [])
+
+                    # Colour mappings
+                    _s_col = {"Open": "#f87171", "In Progress": "#fbbf24",
+                              "Resolved": "#4ade80"}.get(_ts, "#94a3b8")
+                    _s_bg  = {"Open": "rgba(239,68,68,0.08)", "In Progress": "rgba(245,158,11,0.08)",
+                              "Resolved": "rgba(34,197,94,0.08)"}.get(_ts, "rgba(148,163,184,0.08)")
+                    _s_bd  = {"Open": "rgba(239,68,68,0.25)", "In Progress": "rgba(245,158,11,0.25)",
+                              "Resolved": "rgba(34,197,94,0.25)"}.get(_ts, "rgba(148,163,184,0.25)")
+                    _p_col = {"High": "#f87171", "Medium": "#fbbf24",
+                              "Low": "#4ade80"}.get(_tp, "#94a3b8")
+
+                    with st.container(border=True):
+                        _tca, _tcb = st.columns([4, 1])
+                        with _tca:
+                            st.markdown(
+                                f'<span style="background:{_s_bg};border:1px solid {_s_bd};'
+                                f'border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600;'
+                                f'color:{_s_col}">{_ts}</span>'
+                                f'&nbsp;<span style="font-size:11px;color:{_p_col};'
+                                f'font-weight:600">{_tp}</span>'
+                                f'&nbsp;<span style="font-size:11px;color:#334155">· #{_tid}</span>'
+                                + (f'&nbsp;<span style="font-size:11px;color:#1e3a5f">· {_tts}</span>'
+                                   if _tts else ""),
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown(
+                                f"**{_tq[:110]}{'…' if len(_tq) > 110 else ''}**"
+                            )
+                            if _tsum:
+                                st.caption(_tsum[:200])
+
+                        with _tcb:
+                            if _turl:
+                                st.link_button("Notion →", _turl,
+                                               use_container_width=True)
+
+                        # Attempted sources
+                        if _tsrc:
+                            with st.expander("📎 Attempted sources", expanded=False):
+                                for _s in _tsrc:
+                                    st.markdown(f"- {_s}")
+
+                        # Inline status update
+                        _opts   = ["Open", "In Progress", "Resolved"]
+                        _curidx = _opts.index(_ts) if _ts in _opts else 0
+                        # Use page_id for widget keys — always unique even if ticket_id is missing
+                        _wkey   = _t.get("page_id", _tid).replace("-", "")[:16]
+                        _col_sel, _col_btn = st.columns([2, 1])
+                        with _col_sel:
+                            _new_s = st.selectbox(
+                                "Update status",
+                                _opts,
+                                index=_curidx,
+                                key=f"tix_sel_{_wkey}",
+                                label_visibility="collapsed",
+                            )
+                        with _col_btn:
+                            if _new_s != _ts:
+                                if st.button("✅ Update", key=f"tix_upd_{_wkey}",
+                                             use_container_width=True, type="primary"):
+                                    _ur = _ag_post("/agent/tickets/update",
+                                                   {"ticket_id": _tid, "status": _new_s})
+                                    if _ur and "error" not in _ur:
+                                        st.success(f"Ticket #{_tid} → {_new_s}")
+                                        st.session_state.agent_tickets_loaded = False
+                                        st.rerun()
+                                    else:
+                                        st.error(_ur.get("error", "Update failed") if _ur
+                                                 else "Backend unreachable")
+
+    # ── Backend endpoint reference (collapsible) ───────────────────────────────
+    st.divider()
+    with st.expander("🔧 Backend endpoints needed to fully activate this tab"):
+        st.markdown("""
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/agent/tickets` | GET | Fetch all tickets from Notion ticket DB |
+| `/api/agent/tickets/update` | POST | Update ticket status in Notion |
+| `/api/agent/memory` | GET | Read LangGraph thread memory for current user |
+
+**How tickets get created:**
+The LangGraph agent in `agent_graph.py` wraps every CiteRAG answer.
+When `confidence == "low"` or `chunks == []`, the graph transitions to the
+`create_ticket` node which calls the Notion API to write a new ticket row
+with: question · attempted sources · conversation summary · priority · status=Open.
+
+**CiteRAG tab stays unchanged** — the agent layer is backend-only.
+No second chat UI needed.
+""")

@@ -1,37 +1,67 @@
-from pathlib import Path
-from pydantic_settings import BaseSettings
+"""
+config.py — Pydantic settings for DocForge AI + CiteRAG
+========================================================
 
-ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+All values read from environment / .env file.
+Add .env to .gitignore — never commit secrets.
+
+Required .env keys:
+  AZURE_LLM_ENDPOINT
+  AZURE_OPENAI_LLM_KEY
+  AZURE_LLM_DEPLOYMENT_41_MINI
+  AZURE_EMB_ENDPOINT
+  AZURE_OPENAI_EMB_KEY
+  AZURE_EMB_DEPLOYMENT
+  AZURE_EMB_API_VERSION
+  NOTION_TOKEN
+  NOTION_DATABASE_ID          ← source document DB for RAG ingest
+  NOTION_TICKET_DB_ID         ← ticket tracking DB for agent layer
+  CHROMA_PATH
+  REDIS_URL
+  DATABASE_URL                ← PostgreSQL
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
+
 
 class Settings(BaseSettings):
-    AZURE_OPENAI_LLM_KEY:         str = ""
-    AZURE_LLM_ENDPOINT:           str = ""
-    AZURE_LLM_DEPLOYMENT_41_MINI: str = "gpt-4.1-mini"
-    AZURE_LLM_API_VERSION:        str = "2024-12-01-preview"   # ADDED
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-    AZURE_OPENAI_EMB_KEY:  str = ""
-    AZURE_EMB_ENDPOINT:    str = ""
-    AZURE_EMB_API_VERSION: str = "2024-02-01"
-    AZURE_EMB_DEPLOYMENT:  str = "text-embedding-3-large"
+    # ── Azure OpenAI — LLM ────────────────────────────────────────────────────
+    AZURE_LLM_ENDPOINT:            str = ""
+    AZURE_OPENAI_LLM_KEY:          str = ""
+    AZURE_LLM_DEPLOYMENT_41_MINI:  str = "gpt-4.1-mini"
+    AZURE_LLM_API_VERSION:         str = "2024-12-01-preview"
 
-    NOTION_API_KEY:     str = ""
-    NOTION_DATABASE_ID: str = ""
+    # ── Azure OpenAI — Embeddings ─────────────────────────────────────────────
+    AZURE_EMB_ENDPOINT:            str = ""
+    AZURE_OPENAI_EMB_KEY:          str = ""
+    AZURE_EMB_DEPLOYMENT:          str = "text-embedding-3-large"
+    AZURE_EMB_API_VERSION:         str = "2024-02-01"
 
-    DATABASE_URL: str = "postgresql://postgres@localhost:5432/docforge_db"
-    REDIS_URL:    str = "redis://localhost:6379"
-    CHROMA_PATH:  str = "./chroma_db"
+    # ── Notion ────────────────────────────────────────────────────────────────
+    NOTION_TOKEN:                  str = ""       # preferred key name
+    NOTION_API_KEY:                str = ""       # legacy key name (alias fallback)
+    NOTION_DATABASE_ID:            str = ""       # Source docs DB
+    NOTION_TICKET_DB_ID:           Optional[str] = None  # Ticket tracking DB
 
-    APP_ENV:   str = "development"
-    LOG_LEVEL: str = "INFO"
+    # ── Vector store ──────────────────────────────────────────────────────────
+    CHROMA_PATH:                   str = "./chroma_db"
 
-    class Config:
-        env_file = str(ENV_FILE)
-        extra    = "ignore"              # ADDED: unknown .env keys won't crash
+    # ── Cache ─────────────────────────────────────────────────────────────────
+    REDIS_URL:                     str = "redis://localhost:6379/0"
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    DATABASE_URL:                  str = "postgresql://user:pass@localhost:5432/docforge"
+
+    # ── App ───────────────────────────────────────────────────────────────────
+    APP_ENV:                       str = "development"
+    LOG_LEVEL:                     str = "INFO"
+
 
 settings = Settings()
-
-print(f"Loading .env from: {ENV_FILE}")
-print(f"NOTION_API_KEY:  {'YES' if settings.NOTION_API_KEY else 'NO'}")
-print(f"AZURE_LLM_KEY:   {'YES' if settings.AZURE_OPENAI_LLM_KEY else 'NO'}")
-print(f"AZURE_EMB_KEY:   {'YES' if settings.AZURE_OPENAI_EMB_KEY else 'NO'}")
-print(f"CHROMA_PATH:     {settings.CHROMA_PATH}")
