@@ -37,8 +37,6 @@ desktop.ini
 
 # ── Project specific ──────────────────────────────────────────────────────────
 chroma_db/
-*.log
-logs/
 
 # ── Secrets (NEVER commit these) ─────────────────────────────────────────────
 .env
