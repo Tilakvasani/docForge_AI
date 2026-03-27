@@ -21,6 +21,8 @@ import json
 import logging
 from typing import Any, Optional
 
+import redis.asyncio as aioredis  # async Redis client
+
 logger = logging.getLogger(__name__)
 
 # ─── TTL constants (seconds) ──────────────────────────────────────────────────
@@ -54,7 +56,6 @@ class RedisCache:
         App continues normally if this returns False.
         """
         try:
-            import redis.asyncio as aioredis
             client = aioredis.from_url(url, encoding="utf-8",
                                        decode_responses=True,
                                        socket_connect_timeout=2)
@@ -105,6 +106,7 @@ class RedisCache:
             return False
 
     async def delete(self, key: str) -> bool:
+        """Delete a single key. Returns False if Redis is unavailable or on error."""
         if not self._available:
             return False
         try:
@@ -115,14 +117,24 @@ class RedisCache:
             return False
 
     async def flush_pattern(self, pattern: str) -> int:
-        """Delete all keys matching pattern. Returns count deleted."""
+        """
+        Delete all keys matching pattern using SCAN cursor (non-blocking).
+        Unlike KEYS, SCAN is safe in production with large keyspaces.
+        Returns count of deleted keys.
+        """
         if not self._available:
             return 0
         try:
-            keys = await self._redis.keys(pattern)
-            if keys:
-                await self._redis.delete(*keys)
-            return len(keys)
+            deleted = 0
+            cursor = 0
+            while True:
+                cursor, keys = await self._redis.scan(cursor, match=pattern, count=100)
+                if keys:
+                    await self._redis.delete(*keys)
+                    deleted += len(keys)
+                if cursor == 0:
+                    break
+            return deleted
         except Exception as e:
             logger.warning("Redis FLUSH error for %s: %s", pattern, e)
             return 0
@@ -137,6 +149,7 @@ class RedisCache:
             return -2
 
     async def exists(self, key: str) -> bool:
+        """Return True if the key exists in Redis."""
         if not self._available:
             return False
         try:
@@ -210,4 +223,4 @@ class RedisCache:
 
 
 # ── Singleton instance ─────────────────────────────────────────────────────────
-cache = RedisCache()
+cache = RedisCache()    

@@ -1,26 +1,27 @@
 """
-agent_routes.py — FastAPI routes for LangGraph Agent layer
-===========================================================
+agent_routes.py — FastAPI routes for the CiteRAG Agent layer
+==============================================================
 
 Endpoints:
   GET  /api/agent/tickets           — Fetch all knowledge-gap tickets from Notion DB
   POST /api/agent/tickets/update    — Update ticket status in Notion
-  GET  /api/agent/memory            — Read LangGraph thread memory for current user
+  GET  /api/agent/memory            — Read agent memory for current session
   POST /api/agent/ticket/create     — (internal) Create a new ticket from low-confidence RAG answers
-
-How tickets get created:
-  The LangGraph agent wraps every CiteRAG answer. When confidence == "low"
-  OR chunks == [], the graph transitions to the create_ticket node which
-  calls Notion API to write a new ticket row with:
-    question · attempted sources · conversation summary · priority · status=Open
+  DELETE /api/agent/dedup/flush     — Clear dedup cache (admin)
 """
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+# ── Standard library ──────────────────────────────────────────────────────────
+from datetime import datetime, timezone
 from typing import Optional, List
 
-from backend.core.logger import logger
-from backend.services.redis_service import cache
+# ── Third-party ───────────────────────────────────────────────────────────────
+import httpx as _httpx
+from fastapi import APIRouter, HTTPException  # FastAPI routing + error responses
+from pydantic import BaseModel                 # Request/response schema validation
+
+# ── Internal ──────────────────────────────────────────────────────────────────
+from backend.core.logger import logger         # Structured logger
+from backend.services.redis_service import cache  # Redis client for caching tickets
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
 
@@ -50,8 +51,12 @@ NOTION_VER  = "2022-06-28"
 
 
 def _notion_headers() -> dict:
-    from backend.core.config import settings
-    # Support both old (NOTION_API_KEY) and new (NOTION_TOKEN) env key names
+    """
+    Build Notion API request headers using the token from .env.
+    Supports both NOTION_TOKEN and legacy NOTION_API_KEY env variable names.
+    Raises ValueError if no token is found.
+    """
+    from backend.core.config import settings  # lazy: avoids circular import on startup
     token = (
         getattr(settings, "NOTION_TOKEN", "")
         or getattr(settings, "NOTION_API_KEY", "")
@@ -68,7 +73,8 @@ def _notion_headers() -> dict:
 
 
 def _get_ticket_db_id() -> str:
-    from backend.core.config import settings
+    """Return the Notion database ID for support tickets (NOTION_TICKET_DB_ID), falling back to NOTION_DATABASE_ID."""
+    from backend.core.config import settings  # lazy: avoids circular import on startup
     return getattr(settings, "NOTION_TICKET_DB_ID", None) or settings.NOTION_DATABASE_ID
 
 
@@ -140,37 +146,38 @@ async def get_tickets():
     try:
         import httpx as _httpx
         headers = _notion_headers()
-        body    = {"page_size": 100}   # no sort — avoids 400 if property doesn't exist
+        body    = {"page_size": 100}
 
         results  = []
         cursor   = None
-        while True:
-            if cursor:
-                body["start_cursor"] = cursor
-            resp = _httpx.post(
-                f"{NOTION_API}/databases/{ticket_db_id}/query",
-                headers=headers, json=body, timeout=30
-            )
-            resp_data = resp.json()
-            if resp.status_code == 404:
-                logger.warning(
-                    "Notion DB %s not found (404) — integration may lack access", ticket_db_id
+        async with _httpx.AsyncClient(timeout=30) as client:
+            while True:
+                if cursor:
+                    body["start_cursor"] = cursor
+                resp = await client.post(
+                    f"{NOTION_API}/databases/{ticket_db_id}/query",
+                    headers=headers, json=body
                 )
-                return {
-                    "tickets": [],
-                    "source":  "error",
-                    "hint":    (
-                        f"Notion returned 404 for DB {ticket_db_id}. "
-                        "Fix: open the database in Notion → Share → Invite your integration."
-                    ),
-                }
-            resp.raise_for_status()
-            data = resp_data
-            results.extend(data.get("results", []))
-            if not data.get("has_more"):
-                break
-            cursor = data.get("next_cursor")
-            body.pop("start_cursor", None)
+                resp_data = resp.json()
+                if resp.status_code == 404:
+                    logger.warning(
+                        "Notion DB %s not found (404) — integration may lack access", ticket_db_id
+                    )
+                    return {
+                        "tickets": [],
+                        "source":  "error",
+                        "hint":    (
+                            f"Notion returned 404 for DB {ticket_db_id}. "
+                            "Fix: open the database in Notion → Share → Invite your integration."
+                        ),
+                    }
+                resp.raise_for_status()
+                data = resp_data
+                results.extend(data.get("results", []))
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+                body.pop("start_cursor", None)
 
         # Sort by created_time descending (client-side, always safe)
         results.sort(key=lambda p: p.get("created_time", ""), reverse=True)
@@ -187,6 +194,11 @@ async def get_tickets():
 
 @router.post("/tickets/update")
 async def update_ticket(req: TicketUpdateRequest):
+    """
+    Update the Notion status of a ticket by its ticket_id.
+    Looks up the page_id from Redis cache first; falls back to querying Notion directly.
+    Invalidates the ticket cache after a successful update.
+    """
     VALID_STATUSES = {"Open", "In Progress", "Resolved"}
     if req.status not in VALID_STATUSES:
         raise HTTPException(
@@ -206,29 +218,29 @@ async def update_ticket(req: TicketUpdateRequest):
                 page_id = t.get("page_id")
                 break
 
-        # If not in cache, re-query Notion
-        if not page_id:
-            db_id = _get_ticket_db_id()
-            resp  = _httpx.post(
-                f"{NOTION_API}/databases/{db_id}/query",
-                headers=_notion_headers(), json={"page_size": 100}, timeout=30
+        async with _httpx.AsyncClient(timeout=30) as client:
+            # If not in cache, re-query Notion
+            if not page_id:
+                db_id = _get_ticket_db_id()
+                resp  = await client.post(
+                    f"{NOTION_API}/databases/{db_id}/query",
+                    headers=_notion_headers(), json={"page_size": 100}
+                )
+                resp.raise_for_status()
+                for p in resp.json().get("results", []):
+                    if p["id"].replace("-", "")[:8].upper() == req.ticket_id:
+                        page_id = p["id"]
+                        break
+
+            if not page_id:
+                raise HTTPException(status_code=404, detail=f"Ticket {req.ticket_id} not found")
+
+            upd = await client.patch(
+                f"{NOTION_API}/pages/{page_id}",
+                headers=_notion_headers(),
+                json={"properties": {"Status": {"select": {"name": req.status}}}},
             )
-            resp.raise_for_status()
-            for p in resp.json().get("results", []):
-                if p["id"].replace("-", "")[:8].upper() == req.ticket_id:
-                    page_id = p["id"]
-                    break
-
-        if not page_id:
-            raise HTTPException(status_code=404, detail=f"Ticket {req.ticket_id} not found")
-
-        upd = _httpx.patch(
-            f"{NOTION_API}/pages/{page_id}",
-            headers=_notion_headers(),
-            json={"properties": {"Status": {"select": {"name": req.status}}}},
-            timeout=30,
-        )
-        upd.raise_for_status()
+            upd.raise_for_status()
 
         await cache.flush_pattern("docforge:agent:tickets*")
         logger.info("Ticket %s → %s", req.ticket_id, req.status)
@@ -244,105 +256,105 @@ async def update_ticket(req: TicketUpdateRequest):
 @router.get("/memory")
 async def get_memory(session_id: str = "default"):
     """
-    Return the LangGraph thread memory for the current session/user.
-    Reads from Redis session store — same keys used by rag_service.py.
+    Return the agent memory for the current session.
+    Reads from Redis — same keys used by agent_graph.py.
     """
     try:
-        session_key = f"docforge:rag:session:{session_id}"
-        history     = await cache.get(session_key) or []
-
-        memory: dict = {}
-
-        if history:
-            # Infer memory from last few turns
-            last_turn = history[-1] if history else {}
-            memory["last_question"] = last_turn.get("q", "")
-            memory["last_answer"]   = last_turn.get("a", "")[:200]
-            memory["turn_count"]    = len(history)
-
-        # Also try dedicated memory key (written by agent layer if deployed)
         mem_key   = f"docforge:agent:memory:{session_id}"
         agent_mem = await cache.get(mem_key) or {}
-        memory.update(agent_mem)
-
-        return {"session_id": session_id, "memory": memory}
+        return {"session_id": session_id, "memory": agent_mem}
 
     except Exception as e:
         logger.error("get_memory error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/ticket/create")
-async def create_ticket(req: TicketCreateRequest):
+async def _create_notion_ticket(req: "TicketCreateRequest") -> dict:
     """
-    Internal endpoint — called by the LangGraph agent when a RAG answer
-    has low confidence or no chunks. Creates a new ticket row in Notion.
-    """
-    try:
-        import httpx as _httpx
-        from datetime import datetime, timezone
-        
-        db_id    = _get_ticket_db_id()
-        headers  = _notion_headers()
-        priority = req.priority if req.priority in {"High", "Medium", "Low"} else "Medium"
-        live_date = datetime.now(timezone.utc).isoformat()
+    Plain async function — core Notion ticket creation logic.
+    Called directly by the LangGraph agent (Bug #8 fix) and also by
+    the HTTP route handler below.
 
-        # ── Property names must EXACTLY match the Notion DB columns ──────────
-        # DB columns: Question(title), Status(select), Priority(select),
-        #             Summary(rich_text), Session ID(rich_text),
-        #             Attempted Sources(multi_select), Created(date),
-        #             User Info(rich_text), Assigned Owner(rich_text)
-        properties: dict = {
-            "Question": {
-                "title": [{"type": "text", "text": {"content": req.question[:2000]}}]
-            },
-            "Status":   {"select": {"name": "Open"}},
-            "Priority": {"select": {"name": priority}},
-            "User Info": {
-                "rich_text": [{"type": "text", "text": {"content": req.user_info or "Admin"}}]
-            },
-            "Created": {
-                # Notion date API requires ISO-8601 date string — NOT full datetime with tz offset.
-                # Use date-only format "YYYY-MM-DD" which always works.
-                "date": {"start": live_date[:10]}
-            },
-            "Assigned Owner": {
-                "rich_text": [{"type": "text", "text": {"content": "Support Team"}}]
-            },
+    Returns: {"success": bool, "ticket_id": str, "page_id": str, "url": str}
+    Raises on Notion API failure.
+    """
+    db_id     = _get_ticket_db_id()
+    headers   = _notion_headers()
+    priority  = req.priority if req.priority in {"High", "Medium", "Low"} else "Medium"
+    live_date = datetime.now(timezone.utc).isoformat()
+
+    # ── Property names must EXACTLY match the Notion DB columns ──────────────
+    properties: dict = {
+        "Question": {
+            "title": [{"type": "text", "text": {"content": req.question[:2000]}}]
+        },
+        "Status":   {"select": {"name": "Open"}},
+        "Priority": {"select": {"name": priority}},
+        "User Info": {
+            "rich_text": [{"type": "text", "text": {"content": req.user_info or "Admin"}}]
+        },
+        "Created": {
+            "date": {"start": live_date[:10]}
+        },
+        "Assigned Owner": {
+            "rich_text": [{"type": "text", "text": {"content": "Support Team"}}]
+        },
+    }
+    if req.summary:
+        properties["Summary"] = {
+            "rich_text": [{"type": "text", "text": {"content": req.summary[:2000]}}]
         }
-        if req.summary:
-            properties["Summary"] = {
-                "rich_text": [{"type": "text", "text": {"content": req.summary[:2000]}}]
-            }
-        if req.session_id:
-            properties["Session ID"] = {
-                "rich_text": [{"type": "text", "text": {"content": req.session_id}}]
-            }
-        if req.attempted_sources:
-            properties["Attempted Sources"] = {
-                "multi_select": [{"name": s[:100]} for s in req.attempted_sources[:10]]
-            }
+    if req.session_id:
+        properties["Session ID"] = {
+            "rich_text": [{"type": "text", "text": {"content": req.session_id}}]
+        }
+    if req.attempted_sources:
+        properties["Attempted Sources"] = {
+            "multi_select": [{"name": s[:100]} for s in req.attempted_sources[:10]]
+        }
 
-        resp = _httpx.post(
+    async with _httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
             f"{NOTION_API}/pages",
             headers=headers,
             json={"parent": {"database_id": db_id}, "properties": properties},
-            timeout=30,
         )
-        resp.raise_for_status()
-        page = resp.json()
+    resp.raise_for_status()
+    page = resp.json()
 
-        ticket_id = page["id"].replace("-", "")[:8].upper()
-        await cache.flush_pattern("docforge:agent:tickets*")
-        logger.info("Created ticket %s for: %s", ticket_id, req.question[:60])
+    ticket_id = page["id"].replace("-", "")[:8].upper()
+    await cache.flush_pattern("docforge:agent:tickets*")
+    logger.info("Created ticket %s for: %s", ticket_id, req.question[:60])
+    return {
+        "success":   True,
+        "ticket_id": ticket_id,
+        "page_id":   page["id"],
+        "url":       page.get("url", ""),
+    }
 
-        return {
-            "success":   True,
-            "ticket_id": ticket_id,
-            "page_id":   page["id"],
-            "url":       page.get("url", ""),
-        }
 
+@router.post("/ticket/create")
+async def create_ticket(req: TicketCreateRequest):
+    """
+    HTTP endpoint — delegates to _create_notion_ticket().
+    The LangGraph agent now calls _create_notion_ticket() directly
+    instead of importing this route handler (Bug #8 fix).
+    """
+    try:
+        return await _create_notion_ticket(req)
     except Exception as e:
         logger.error("create_ticket error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── DELETE /api/agent/dedup/flush (admin) ────────────────────────────────────
+
+@router.delete("/dedup/flush")
+async def flush_dedup():
+    """Clear the duplicate-detection cache (exact hashes + embeddings)."""
+    try:
+        from backend.services.rag.ticket_dedup import flush_dedup_cache
+        await flush_dedup_cache()
+        return {"success": True, "message": "Dedup cache flushed."}
+    except Exception as e:
+        logger.error("flush_dedup error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

@@ -439,8 +439,152 @@ MIT License — feel free to use, modify, and distribute.
 
 ---
 
+---
+
 Built with ⚡ by [Tilak Vasani](https://github.com/Tilakvasani)
-# CiteRAG Backend — New Files Guide
+
+---
+
+# CiteRAG — Conversational RAG + Ticket Agent
+
+## Architecture Overview
+
+CiteRAG is a **tool-calling conversational RAG agent** built on Azure OpenAI. It handles every user turn in **one LLM call**, maintaining full chat history in Redis so it understands context across turns (references like "the first one", "dono", "pehla", etc.).
+
+```
+User message
+    │
+    ▼
+POST /api/rag/ask
+    │
+    ├─ RAG pipeline runs (always) → gets document answer + confidence
+    │
+    └─ run_agent() ──► LLM sees: [system prompt] + [chat history] + [user message]
+                           │
+                           └─ LLM picks one tool ──►  search()
+                                                       create_ticket()
+                                                       select_ticket(index)
+                                                       create_all_tickets()
+                                                       update_ticket(status, ticket_index?)
+                                                       cancel()
+                           │
+                           └─ Tool executes → reply saved to Redis history → response returned
+```
+
+---
+
+## Key Files
+
+| File | Location | Purpose |
+|------|----------|---------|
+| `agent_graph.py` | `backend/services/rag/` | Tool-calling agent: LLM loop, tool executors, Redis history + memory |
+| `agent_routes.py` | `backend/services/rag/` | FastAPI: ticket CRUD routes, Notion REST helpers |
+| `rag_routes.py` | `backend/services/rag/` | FastAPI: /ask, /ingest, /status, /eval, /cache |
+| `ticket_dedup.py` | `backend/services/rag/` | LLM-based duplicate ticket detection (queries live Notion) |
+| `rag_service.py` | `backend/services/rag/` | Core RAG: vector retrieval, Azure OpenAI answer generation |
+| `ingest_service.py` | `backend/services/rag/` | Notion → ChromaDB ingest pipeline |
+
+---
+
+## Agent Tools
+
+| Tool | When LLM calls it | What it does |
+|------|------------------|-------------|
+| `search(question)` | Any question about docs/people/policies | Returns RAG answer; silently saves to unanswered list if low confidence |
+| `create_ticket()` | "create ticket", "ticket banao" | Shows list if 2+ unanswered questions; creates directly if only 1 |
+| `select_ticket(index)` | User picks number from creation list | Creates ticket for that specific question |
+| `create_all_tickets()` | "all", "dono", "sabhi" | Creates tickets for every saved unanswered question |
+| `update_ticket(status, ticket_index?)` | "resolved", "in progress", "open" | If 1 ticket → updates it. If 2+ → shows list. `ticket_index=-1` → updates all |
+| `cancel()` | "cancel", "no", "chodo" | Cancels flow; keeps saved questions for later |
+
+---
+
+## Notion Ticket Database Setup
+
+Create a Notion database with these columns:
+
+| Property | Type | Options |
+|----------|------|---------|
+| `Question` | **Title** | — |
+| `Status` | Select | `Open`, `In Progress`, `Resolved` |
+| `Priority` | Select | `High`, `Medium`, `Low` |
+| `Summary` | Rich Text | — |
+| `Attempted Sources` | Multi-select | — |
+| `Session ID` | Rich Text | — |
+| `Created` | Date | — |
+| `Assigned Owner` | Rich Text | — |
+| `User Info` | Rich Text | — |
+
+Add the database ID to `.env`:
+```
+NOTION_TICKET_DB_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+---
+
+## .env Variables (CiteRAG additions)
+
+```env
+# Azure OpenAI (for RAG + agent LLM)
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_API_KEY=your_key
+AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4o
+AZURE_OPENAI_API_VERSION=2024-02-01
+
+# Notion
+NOTION_TOKEN=secret_...
+NOTION_DATABASE_ID=...          # source documents DB
+NOTION_TICKET_DB_ID=...         # support ticket tracking DB
+
+# ChromaDB (embedding store)
+CHROMA_PATH=./chroma_db
+
+# Redis (chat history, agent memory, answer caching)
+REDIS_URL=redis://localhost:6379
+```
+
+---
+
+## Available API Endpoints
+
+```
+# RAG
+POST   /api/rag/ask           → conversational Q&A via tool-calling agent
+POST   /api/rag/ingest        → Notion → ChromaDB ingest  { "force": true }
+GET    /api/rag/status        → collection stats
+DELETE /api/rag/cache         → flush retrieval/answer/session caches
+POST   /api/rag/eval          → manual RAGAS evaluation
+GET    /api/rag/scores?key=   → poll RAGAS scores
+
+# Agent / Tickets
+GET    /api/agent/tickets              → list all Notion tickets (cached 60s)
+POST   /api/agent/tickets/update       → { "ticket_id": "ABC123", "status": "Resolved" }
+GET    /api/agent/memory?session_id=   → agent memory for a session
+POST   /api/agent/ticket/create        → create ticket directly (internal use)
+DELETE /api/agent/dedup/flush          → clear dedup cache (admin)
+
+# System
+GET    /health    → { "status": "ok" }
+GET    /docs      → Swagger UI
+```
+
+---
+
+## Testing Checklist
+
+- [ ] `GET /health` returns `{"status": "ok"}`
+- [ ] `POST /api/rag/ingest` with `{"force": true}` — check logs for chunk count
+- [ ] `GET /api/rag/status` — shows `total_chunks > 0`
+- [ ] Ask a question that IS in the docs → answer returned, no ticket prompt
+- [ ] Ask a question NOT in docs → "could not find" returned, question saved silently
+- [ ] Say "create ticket" → if 1 question: created directly; if 2+: numbered list shown
+- [ ] Say a number → that ticket created; remaining questions stay in queue
+- [ ] Say "all" → all remaining questions get tickets
+- [ ] Create 2 tickets, say "resolved" → selection list shown with both tickets
+- [ ] Say "1" → only first ticket updated in Notion
+- [ ] Say "all" after list shown → both tickets updated
+- [ ] `GET /api/agent/tickets` → both tickets visible with correct status
+
 
 ## What was built
 

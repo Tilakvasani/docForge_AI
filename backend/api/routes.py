@@ -1,8 +1,10 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+# ── Third-party ───────────────────────────────────────────────────────────────
+from fastapi import APIRouter, HTTPException   # FastAPI routing + error responses
+from pydantic import BaseModel                 # Request/response schema validation
 from typing import List
 
-from backend.core.logger import logger
+# ── Internal ──────────────────────────────────────────────────────────────────
+from backend.core.logger import logger         # Structured logger
 from backend.services.db_service import (
     get_all_departments, get_sections_by_doc_type,
     save_generated_document,
@@ -17,7 +19,8 @@ from backend.schemas.document_schema import (
     GenerateSectionRequest, EditSectionRequest,
     NotionPublishRequest,
 )
-from backend.services.redis_service import cache
+from backend.services.redis_service import cache   # Redis caching layer
+from prompts.quality_gates import check_quality    # PS1 quality gate validator
 
 router = APIRouter()
 
@@ -115,6 +118,7 @@ async def api_save_answers(req: SaveAnswersRequest):
 
 @router.post("/section/generate")
 async def api_generate_section(req: GenerateSectionRequest):
+    """Generate section content via LLM + run quality gate check before returning."""
     try:
         # Check cache — if same sec_id already generated, return instantly
         if req.sec_id:
@@ -125,12 +129,21 @@ async def api_generate_section(req: GenerateSectionRequest):
 
         result = await generate_section_content(req)
 
-        # Cache the expensive LLM result
+        # ── Quality gate: check generated content meets minimum standards ───────
+        content    = result.get("content", "") if result else ""
+        doc_type   = getattr(req, "doc_type", "").lower().replace(" ", "_") if result else ""
+        passed, qc_note = check_quality(content, doc_type)
+        if not passed:
+            logger.warning("⚠️  [QC FAIL] sec_id=%s doc_type=%s note=%s", req.sec_id, doc_type, qc_note)
+        else:
+            logger.info("✅ [QC PASS] sec_id=%s", req.sec_id)
+
+        # Cache the expensive LLM result (even if QC failed — let user refine)
         if req.sec_id and result:
             await cache.set_section_content(req.sec_id, result)
             logger.info("💾 [CACHE SET] section content:%s", req.sec_id)
 
-        return result
+        return {**result, "quality_passed": passed, "quality_note": qc_note if not passed else ""}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

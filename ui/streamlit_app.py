@@ -642,16 +642,35 @@ if st.session_state.active_tab == "ask":
                 src_html = " &nbsp;·&nbsp; ".join(parts)
                 st.markdown(f'<div class="cite-sources">📎 {src_html}</div>', unsafe_allow_html=True)
 
-            # ── Agent command replies (tool_used == "agent") ──────────────────
-            if role == "assistant" and msg.get("tool_used") == "agent":
-                # Already rendered above via st.markdown(content) — just add pill
-                st.markdown(
-                    '<div style="margin-top:6px">'
-                    '<span style="font-size:11px;background:rgba(99,102,241,0.15);color:#a5b4fc;'
-                    'padding:2px 8px;border-radius:99px">🤖 Agent</span>'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
+            # ── Agent ticket replies ───────────────────────────────────────────
+            # tool_used=="agent": full reply is in content (already rendered above)
+            # agent_reply set on RAG messages: show as info box below the answer
+            if role == "assistant":
+                agent_note = msg.get("agent_reply", "")
+                if agent_note and msg.get("tool_used") != "agent":
+                    # Ticket created / duplicate found / status updated
+                    # Show as a distinct callout below the RAG answer
+                    is_ticket_created = "✅" in agent_note and "Ticket" in agent_note
+                    is_duplicate      = "🎫" in agent_note
+                    box_bg  = "rgba(34,197,94,0.07)"  if is_ticket_created else "rgba(59,130,246,0.07)"
+                    box_bdr = "#22c55e"                if is_ticket_created else "#3b82f6"
+                    box_clr = "#4ade80"                if is_ticket_created else "#93c5fd"
+                    st.markdown(
+                        f'<div style="margin-top:10px;padding:10px 14px;' +
+                        f'background:{box_bg};border-left:3px solid {box_bdr};' +
+                        f'border-radius:0 8px 8px 0;font-size:0.83rem;color:{box_clr}">' +
+                        agent_note.replace("\n", "<br>") +
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+                elif msg.get("tool_used") == "agent":
+                    st.markdown(
+                        '<div style="margin-top:6px">'
+                        '<span style="font-size:11px;background:rgba(99,102,241,0.15);color:#a5b4fc;'
+                        'padding:2px 8px;border-radius:99px">🤖 Agent</span>'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
 
 
 
@@ -683,8 +702,9 @@ if st.session_state.active_tab == "ask":
                 "tool_used":      res.get("tool_used", ""),
                 "ticket_pending": res.get("ticket_pending", False),
                 "orig_question":  question,
-                "ticket_id":      res.get("ticket_id"),    # set if agent auto-created one
+                "ticket_id":      res.get("ticket_id"),
                 "ticket_url":     res.get("ticket_url"),
+                "agent_reply":    res.get("agent_reply", ""),  # ticket create/update reply
             }
             if res.get("tool_used") == "compare":
                 ai_msg.update({
@@ -695,24 +715,40 @@ if st.session_state.active_tab == "ask":
                     "doc_a":       res.get("doc_a", "Document A"),
                     "doc_b":       res.get("doc_b", "Document B"),
                 })
-            st.session_state._last_chunks       = res.get("chunks", [])
+            # Use _raw_chunks when chunks=[] (not-found) so Show Sources still appears
+            st.session_state._last_chunks    = res.get("chunks") or res.get("_raw_chunks", [])
+            st.session_state._last_not_found = (not res.get("chunks") and bool(res.get("_raw_chunks")))
         else:
             ai_msg = {
                 "role":      "assistant",
                 "content":   "Could not reach the RAG service. Make sure the backend is running.",
                 "citations": [],
             }
-            st.session_state._last_chunks       = []
+            st.session_state._last_chunks    = []
+            st.session_state._last_not_found = False
         st.session_state.rag_chats[active_id]["messages"].append(ai_msg)
         st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════════
-    # SHOW SOURCES + RAGAS QUALITY — toggle section
+    # SHOW SOURCES — toggle section (works for found AND not-found answers)
     # ══════════════════════════════════════════════════════════════════════════
 
-    chunks = st.session_state.get("_last_chunks", [])
+    chunks       = st.session_state.get("_last_chunks", [])
+    not_found    = st.session_state.get("_last_not_found", False)
+    toggle_label = "🔍 Show Sources" if not not_found else "🔍 Show Sources (searched but not found)"
+
     if chunks:
-        if st.toggle("🔍 Show Sources", value=False, key="show_retrieval"):
+        if st.toggle(toggle_label, value=False, key="show_retrieval"):
+
+            # ── Banner when answer was not found ─────────────────────────────
+            if not_found:
+                st.markdown(
+                    '<div style="background:#1a1f2e;border:1px solid #ef444430;border-radius:8px;'
+                    'padding:8px 12px;margin-bottom:10px;font-size:12px;color:#f87171">'
+                    '⚠️ These were the closest documents found — none contained a confident answer.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
 
             # ── Build top-5 unique docs ───────────────────────────────────────
             seen_docs = {}
@@ -765,6 +801,8 @@ if st.session_state.active_tab == "ask":
                     )
                 cards_html += "</div>"
                 st.markdown(cards_html, unsafe_allow_html=True)
+            elif not_found:
+                st.info("No documents were retrieved — this topic may not exist in any ingested document yet.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LIBRARY
@@ -1042,7 +1080,7 @@ elif st.session_state.active_tab == "ragas":
                 _gt_val = st.text_input(
                     f"Ground Truth {_ri + 1}",
                     value=_row["ground_truth"],
-                    placeholder="Ground truth (optional)",
+                    placeholder="Ground truth",
                     key=f"batch_gt_{_ri}",
                     label_visibility="collapsed",
                 )
@@ -1067,7 +1105,7 @@ elif st.session_state.active_tab == "ragas":
             st.caption(f"{len(st.session_state.batch_rows)} question(s) queued · Each takes 20–60s · No timeout limit")
 
         st.write("")
-        _valid_rows = [r for r in st.session_state.batch_rows if r["question"].strip()]
+        _valid_rows = [r for r in st.session_state.batch_rows if r["question"].strip() and r['ground_truth'].strip()]
 
         # ── Live progress display (survives st.rerun) ─────────────────────────
         _bp = st.session_state.get("_batch_progress")
@@ -1805,8 +1843,9 @@ elif st.session_state.active_tab == "agent":
 <div style="padding:0 0 0.5rem">
   <h2 style="color:#e2e8f0;font-weight:700;margin-bottom:0.2rem">🎫 Tickets</h2>
   <p style="color:#475569;font-size:0.88rem;margin:0">
-    Knowledge-gap tickets — auto-created when
-    <b style="color:#93c5fd">💬 CiteRAG</b> can't find an answer in the documents
+    Knowledge-gap tickets — say <b style="color:#93c5fd">"create a ticket"</b>,
+    <b style="color:#93c5fd">"raise a ticket"</b> or <b style="color:#93c5fd">"open a case"</b>
+    in <b style="color:#93c5fd">💬 CiteRAG</b> to log a missing answer
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -1942,9 +1981,9 @@ elif st.session_state.active_tab == "agent":
   <div style="font-size:2rem;margin-bottom:0.6rem">🎫</div>
   <div style="color:#475569;font-size:0.85rem;line-height:1.6">
     No tickets yet.<br>
-    When <b style="color:#93c5fd">CiteRAG</b> can't find an answer in the documents,<br>
-    the LangGraph agent will auto-create a ticket here<br>
-    with the question, attempted sources, and priority.
+    Ask a question in <b style="color:#93c5fd">💬 CiteRAG</b>, then say:<br>
+    <b style="color:#a5b4fc">"create a ticket"</b> · <b style="color:#a5b4fc">"raise a ticket"</b> · <b style="color:#a5b4fc">"open a case"</b><br>
+    Duplicate questions are automatically detected before creating a new ticket.
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -2052,12 +2091,17 @@ elif st.session_state.active_tab == "agent":
 | `/api/agent/tickets/update` | POST | Update ticket status in Notion |
 | `/api/agent/memory` | GET | Read LangGraph thread memory for current user |
 
-**How tickets get created:**
-The LangGraph agent in `agent_graph.py` wraps every CiteRAG answer.
-When `confidence == "low"` or `chunks == []`, the graph transitions to the
-`create_ticket` node which calls the Notion API to write a new ticket row
-with: question · attempted sources · conversation summary · priority · status=Open.
+**How tickets get created (manual only):**
+The LangGraph agent detects ticket-creation intent from the user's message:
+- ✅ "create a ticket", "raise a ticket", "open a case", "generate a ticket"
+- ✅ "escalate this", "log this", "file a ticket", "submit a request"
+- ✅ "mark as resolved", "set to in progress", "close the ticket"
 
-**CiteRAG tab stays unchanged** — the agent layer is backend-only.
-No second chat UI needed.
+**Duplicate detection (2-layer):**
+- Layer 1 — Exact: MD5 hash of normalised question → Redis lookup (instant)
+- Layer 2 — Semantic: cosine similarity of embeddings ≥ 0.88 → blocks duplicate
+
+**New file required:** Place `ticket_dedup.py` in `backend/services/rag/`
+
+**New endpoint:** `DELETE /api/agent/dedup/flush` — clears dedup cache after bulk cleanup
 """)
