@@ -1,20 +1,4 @@
 """
-<<<<<<< HEAD
-rag_routes.py — FastAPI routes for RAG system
-
-POST /api/rag/ingest    — Notion → Chunks → Embeddings → ChromaDB
-POST /api/rag/ask       — Query → Search → LLM → Answer + Citations
-GET  /api/rag/status    — Collection stats + cache info
-DELETE /api/rag/cache   — Flush retrieval cache
-"""
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Dict
-
-from backend.core.logger import logger
-from backend.services.redis_service import cache
-=======
 rag_routes.py — FastAPI routes for RAG + Tool-Calling Agent
 ============================================================
 
@@ -50,11 +34,10 @@ from pydantic import BaseModel                      # Request schema validation
 from backend.core.logger import logger                              # Structured logger
 from backend.core.config import settings                            # App settings (.env)
 from backend.services.redis_service import cache                    # Redis caching layer
-from backend.services.rag.rag_service import answer                 # Core RAG pipeline
+from backend.services.rag.rag_service import answer, _save_turn           # Core RAG pipeline
 from backend.services.rag.ragas_scorer import score as ragas_score  # RAGAS evaluation scorer
 from backend.services.rag.ingest_service import COLLECTION_NAME, ingest_from_notion  # Notion ingest
 from backend.services.rag.agent_graph import run_agent              # Tool-calling agent
->>>>>>> rag
 
 router = APIRouter(prefix="/rag", tags=["RAG"])
 
@@ -71,19 +54,20 @@ class AskRequest(BaseModel):
     doc_a:      str = ""
     doc_b:      str = ""
 
-<<<<<<< HEAD
-
-@router.post("/ingest")
-async def api_ingest(req: IngestRequest):
-    try:
-        from backend.services.rag.ingest_service import ingest_from_notion
-        result = await ingest_from_notion(force=req.force)
-        # Safety rule 2: flush answer cache so stale answers never served
-=======
     def sanitized_question(self) -> str:
-        """Strip whitespace, collapse internal whitespace, cap at 2000 chars."""
+        """Strip whitespace, collapse internal whitespace, cap at 2000 chars.
+        (Prompt injection detection temporarily disabled for LLM testing)
+        """
         q = " ".join(self.question.strip().split())
-        return q[:2000]
+        q = q[:2000]
+
+        # ── Prompt injection detection (DISABLED FOR TESTING) ─────────────────
+        # _injection_patterns = [ ... ]
+        # q_lower = q.lower()
+        # if any(pattern in q_lower for pattern in _injection_patterns):
+        #     raise HTTPException(...)
+
+        return q
 
 
 # ── Multi-question splitting ───────────────────────────────────────────────────
@@ -96,7 +80,7 @@ def _split_questions(text: str) -> list[str]:
     """
     text = text.strip()
 
-    numbered = re.findall(r'\d+[\.\)]\s*(.+?)(?=\s*\d+[\.\)]|$)', text, re.DOTALL)
+    numbered = re.findall(r'\d+[\.\\)]\s*(.+?)(?=\s*\d+[\.\\)]|$)', text, re.DOTALL)
     if len(numbered) > 1:
         return [q.strip() for q in numbered if len(q.strip()) > 3][:5]
 
@@ -111,7 +95,7 @@ def _split_questions(text: str) -> list[str]:
 
 async def _process_multi_question(questions: list[str], req: AskRequest) -> dict:
     """Run multiple questions through RAG in parallel."""
-    logger.info("🔀 Multi-question: %d questions (parallel)", len(questions))
+    logger.info("🔀 [Multi] Split into %d questions (parallel)", len(questions))
 
     tasks = [
         answer(
@@ -129,7 +113,7 @@ async def _process_multi_question(questions: list[str], req: AskRequest) -> dict
 
     for q, r in zip(questions, results):
         if isinstance(r, Exception):
-            logger.warning("RAG error for '%s': %s", q[:40], r)
+            logger.warning("⚠️ [Sub-RAG] error for '%s': %s", q[:40], r)
             unanswered_parts.append({"question": q, "raw_chunks": []})
             continue
 
@@ -166,72 +150,23 @@ async def api_ingest(req: IngestRequest):
     """Trigger Notion → ChromaDB ingest pipeline. Pass force=True to re-ingest all pages."""
     try:
         result  = await ingest_from_notion(force=req.force)
->>>>>>> rag
         flushed = await cache.flush_pattern("docforge:rag:answer:*")
-        logger.info("Answer cache flushed after ingest (%d keys)", flushed)
+        logger.info("🧹 [Cache] Flushed after ingest (%d keys)", flushed)
         return result
     except Exception as e:
-        logger.error("Ingest error: %s", e)
+        logger.error("❌ [Ingest] Error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/ask")
 async def api_ask(req: AskRequest):
-<<<<<<< HEAD
-    try:
-        from backend.services.rag.agent_graph import run_agent, _classify_intent
-
-        # ── 1. Classify intent ──────────────────────────────────────────────
-        intent = _classify_intent(req.question)
-
-        # ── 2. Standard RAG execution ───────────────────────────────────────
-        from backend.services.rag.rag_service import answer
-
-        rag_result = await answer(
-            question=req.question,
-            filters=req.filters,
-            session_id=req.session_id,
-            top_k=req.top_k,
-            doc_a=req.doc_a,
-            doc_b=req.doc_b,
-        )
-
-        # ── 3. Agent post-processing: auto-ticket + memory update ────────────
-        result = await run_agent(
-            question=req.question,
-            rag_result=rag_result,
-            session_id=req.session_id,
-        )
-        result["intent"] = "rag"
-        return result
-
-    except Exception as e:
-        logger.error("Ask error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/status")
-async def api_rag_status():
-    try:
-        from backend.services.rag.ingest_service import COLLECTION_NAME
-        from backend.core.config import settings
-        import chromadb
-
-        client     = chromadb.PersistentClient(path=settings.CHROMA_PATH)
-        collection = client.get_or_create_collection(COLLECTION_NAME)
-        total_chunks = collection.count()
-
-        meta   = await cache.get("docforge:rag:ingest_meta") or {}
-        locked = await cache.exists("docforge:rag:ingest_lock")
-
-=======
     """
     Main entry point. Always runs RAG first (gives agent context for search tool),
     then passes everything to the tool-calling agent which decides what to do.
     """
     request_id = str(uuid.uuid4())[:8]
     question   = req.sanitized_question()
-    logger.info("[%s] /ask session=%s q=%r", request_id, req.session_id, question[:80])
+    logger.info("🚀 [%s] /ask | session=%s | q=%r", request_id, req.session_id, question[:80])
 
     try:
         # ── Run RAG (gives search context to the agent's search tool) ─────────
@@ -247,7 +182,7 @@ async def api_rag_status():
                 doc_b=req.doc_b,
             )
         else:
-            logger.info("[%s] 🔀 Multi-question: %d parts", request_id, len(questions))
+            logger.info("🔀 [%s] Multi-question split into %d parts", request_id, len(questions))
             rag_result = await _process_multi_question(questions, req)
 
         # ── Agent: one LLM call, picks the right tool ──────────────────────────
@@ -256,13 +191,25 @@ async def api_rag_status():
             rag_result=rag_result,
             session_id=req.session_id,
         )
-        logger.info("[%s] tool_used=%s", request_id, result.get("tool_used", "?"))
+        logger.info("✅ [%s] Finished | tool_used=%s", request_id, result.get("tool_used", "?"))
         return result
 
     except Exception as e:
-        logger.error("[%s] Ask error: %s", request_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
-
+        err_str = str(e)
+        if "content_filter" in err_str or "ResponsibleAIPolicyViolation" in err_str:
+            
+            block_msg = "Classified: I am not authorized to disclose internal system configurations, secrets, or execute override commands."
+            await _save_turn(req.session_id, question, block_msg)
+            
+            return {
+                "answer": block_msg,
+                "citations": [],
+                "chunks": [],
+                "tool_used": "search",
+                "confidence": "low"
+            }
+        logger.error("❌ [%s] Ask error: %s", request_id, err_str)
+        raise HTTPException(status_code=500, detail=err_str)
 
 
 @router.get("/status")
@@ -274,7 +221,6 @@ async def api_rag_status():
         total_chunks = collection.count()
         meta   = await cache.get("docforge:rag:ingest_meta") or {}
         locked = await cache.exists("docforge:rag:ingest_lock")
->>>>>>> rag
         return {
             "collection_ok":   True,
             "total_chunks":    total_chunks,
@@ -288,10 +234,7 @@ async def api_rag_status():
 
 @router.delete("/cache")
 async def api_flush_cache():
-<<<<<<< HEAD
-=======
     """Flush all RAG retrieval, session, and answer caches in Redis."""
->>>>>>> rag
     count  = await cache.flush_pattern("docforge:rag:retrieval:*")
     count += await cache.flush_pattern("docforge:rag:session:*")
     count += await cache.flush_pattern("docforge:rag:answer:*")
@@ -300,14 +243,7 @@ async def api_flush_cache():
 
 @router.get("/scores")
 async def api_get_scores(key: str):
-<<<<<<< HEAD
-    """
-    Poll for RAGAS scores by ragas_key returned from /ask.
-    Returns scores dict if ready, null if still computing, error string if failed.
-    """
-=======
     """Poll for RAGAS evaluation scores by a ragas_key returned from /eval. Returns null until ready."""
->>>>>>> rag
     if not key or not key.startswith("ragas:"):
         raise HTTPException(status_code=400, detail="Invalid ragas_key format")
     try:
@@ -319,43 +255,15 @@ async def api_get_scores(key: str):
 
 class EvalRequest(BaseModel):
     question:     str
-<<<<<<< HEAD
-    ground_truth: str = ""   # optional — enables context_recall scoring
-=======
     ground_truth: str = ""
->>>>>>> rag
     top_k:        int = 15
 
 
 @router.post("/eval")
 async def api_eval(req: EvalRequest):
-<<<<<<< HEAD
-    """
-    Manual RAGAS evaluation endpoint.
-    Runs RAG then awaits real RAGAS scoring synchronously — scores are
-    guaranteed in the response (no background task, no polling needed).
-    Use this from the RAGAS tab manual eval panel, NOT from the chat UI.
-    """
-    try:
-        from backend.services.rag.rag_service import answer
-        from backend.services.rag.ragas_scorer import score as ragas_score
-
-        # Step 1: get RAG answer + retrieved chunks
-        rag_result = await answer(
-            question=req.question,
-            filters={},
-            session_id="ragas_eval",
-            top_k=req.top_k,
-        )
-
-        chunks      = rag_result.get("chunks", [])
-        rag_answer  = rag_result.get("answer", "")
-
-        # Step 2: run real RAGAS synchronously (await — blocks until done)
-=======
     """Manual RAGAS evaluation. Stores run snapshot in Redis for reproducibility."""
     request_id = str(uuid.uuid4())[:8]
-    logger.info("[%s] /eval q=%r", request_id, req.question[:60])
+    logger.info("🧪 [%s] /eval | q=%r", request_id, req.question[:60])
     try:
         rag_result = await answer(
             question=req.question, filters={},
@@ -363,39 +271,18 @@ async def api_eval(req: EvalRequest):
         )
         chunks     = rag_result.get("chunks", [])
         rag_answer = rag_result.get("answer", "")
->>>>>>> rag
+
         ragas_scores = None
         ragas_error  = None
         if chunks and rag_answer:
             try:
                 ragas_scores = await ragas_score(
-<<<<<<< HEAD
-                    question=req.question,
-                    answer=rag_answer,
-                    chunks=chunks,
-                    ground_truth=req.ground_truth.strip() or None,
-                )
-                logger.info("Eval RAGAS scores: %s", ragas_scores)
-            except Exception as e:
-                ragas_error = str(e)
-                logger.error("RAGAS scoring failed in /eval: %s", e, exc_info=True)
-                ragas_scores = None
-
-        return {
-            **rag_result,
-            "ragas_scores": ragas_scores,
-            "ragas_error":  ragas_error,
-        }
-
-    except Exception as e:
-        logger.error("Eval error: %s", e)
-=======
                     question=req.question, answer=rag_answer,
                     chunks=chunks, ground_truth=req.ground_truth.strip() or None,
                 )
             except Exception as e:
                 ragas_error = str(e)
-                logger.error("[%s] RAGAS scoring failed: %s", request_id, e)
+                logger.error("❌ [%s] RAGAS scoring failed: %s", request_id, e)
 
         # ── Store eval run snapshot for reproducibility ──────────────────────────
         run_snapshot = {
@@ -412,11 +299,11 @@ async def api_eval(req: EvalRequest):
         all_runs = await cache.get("ragas:run_index") or []
         all_runs.insert(0, {"run_id": request_id, "timestamp": run_snapshot["timestamp"], "question": req.question})
         await cache.set("ragas:run_index", all_runs[:50], ttl=604800)  # keep last 50
-        logger.info("[%s] Eval run stored (scores=%s)", request_id, ragas_scores is not None)
+        logger.info("💾 [%s] Eval run stored (scores=%s)", request_id, ragas_scores is not None)
 
         return {**rag_result, "ragas_scores": ragas_scores, "ragas_error": ragas_error, "run_id": request_id}
     except Exception as e:
-        logger.error("[%s] Eval error: %s", request_id, e)
+        logger.error("❌ [%s] Eval error: %s", request_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -441,5 +328,4 @@ async def api_eval_run_detail(run_id: str):
     except HTTPException:
         raise
     except Exception as e:
->>>>>>> rag
         raise HTTPException(status_code=500, detail=str(e))

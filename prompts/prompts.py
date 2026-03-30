@@ -498,11 +498,12 @@ SECTION PURPOSE: {section_purpose}
 REQUIREMENTS:
 1. Generate exactly {question_count} questions for this section.
 2. Questions must be specific to {doc_type} — not generic.
-3. Ask for concrete details: names, dates, numbers, percentages, policies, procedures.
-4. Use plain, professional English. No jargon.
-5. Each question should unlock a different piece of information needed for this section.
-6. Order questions from most important to least important.
-7. Do NOT ask for information already covered in previous sections: {completed_sections}
+3. Ensure questions extract MECE (Mutually Exclusive, Collectively Exhaustive) data.
+4. Ask for concrete details: quantities, roles, timelines, dates, numbers, percentages.
+5. Use plain, professional English. No jargon.
+6. Each question should unlock a different piece of information needed for this section.
+7. Order questions from most important to least important.
+8. Do NOT ask for information already covered in previous sections: {completed_sections}
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown, no preamble:
 {{
@@ -580,7 +581,7 @@ CONTENT QUALITY:
 
 TABLES & DIAGRAMS (only include what STRUCTURE REQUIREMENTS specifies):
 10. Tables: Use markdown table format with bold column headers. Include realistic data rows.
-11. Flowcharts: Use Mermaid.js ```mermaid code block. Direction: TD. Min 5 nodes.
+11. Flowcharts: Use Mermaid.js ```mermaid code block. Direction: TD. Min 5 nodes. Ensure valid syntax (no special characters in node names without quotes).
 12. RACI: Full matrix covering all key activities for this document type.
 13. All tables must be complete — no empty cells, use "N/A" or "TBD" where appropriate.
 
@@ -621,6 +622,7 @@ ENHANCEMENT INSTRUCTIONS:
 7. If this section should contain a table based on its context, add one.
 8. Do NOT change the meaning or intent of any statement.
 9. Do NOT add new facts that were not in the original.
+10. CRITICAL: Maintain original markdown formatting (bolding, lists, links) unless inherently changed.
 
 OUTPUT: Return ONLY the enhanced section content (starting from the section heading ##).
 Do not include any preamble, explanation, or surrounding context."""
@@ -653,6 +655,7 @@ EDITING RULES:
 3. Maintain the professional tone and document style.
 4. Keep section length appropriate (150–350 words unless instruction specifies otherwise).
 5. If the instruction is ambiguous, apply the most reasonable professional interpretation.
+6. CRITICAL: Maintain original markdown formatting (bolding, lists, tables) unless the edit instruction specifically requires changing them.
 
 OUTPUT: Return ONLY the edited section content (starting from the section heading ##).
 Do not include any preamble, explanation, or note about what was changed."""
@@ -722,7 +725,7 @@ Quality rules:
 - Each question must unlock a DIFFERENT piece of information
 - Questions must be directly relevant to writing the {section_name} of a {doc_type}
 
-Output: one question per line, no numbering, no bullet points, no extra text.
+Output: CRITICAL: Output ONLY the raw questions, one per line. No numbering, no bullet points, no extra text. Do not write "Here are the questions:".
 If 0 questions: respond NONE
 
 Respond now:"""
@@ -752,7 +755,7 @@ Rules:
   Bad:  "What expenses were incurred?"
 - If the table has a natural primary key (employee name, vendor name, product), ask for it explicitly
 - Maximum 3 questions
-- One question per line, no numbering, no bullet points
+- CRITICAL: Output ONLY the raw questions, one per line. No numbering, no bullet points. Do not write "Here are the questions:".
 
 Respond now:"""
 )
@@ -779,7 +782,7 @@ Rules:
 - Ask about DECISION POINTS (yes/no branches, approvals, conditions)
 - Ask about the ROLES or SYSTEMS involved at each step
 - Maximum 3 questions
-- One question per line, no numbering, no bullet points
+- CRITICAL: Output ONLY the raw questions, one per line. No numbering, no bullet points. Do not write "Here are the questions:".
 
 Good example questions for a process flow:
   "List the sequential steps in this process from start to finish (e.g. Step 1: Submit request, Step 2: Manager review...)"
@@ -810,7 +813,7 @@ Rules:
 - Question 1: Ask for the list of ROLES or JOB TITLES involved in this process
 - Question 2 (optional): Ask for the key ACTIVITIES or TASKS to include in the matrix
 - Maximum 2 questions
-- One question per line, no numbering, no bullet points
+- CRITICAL: Output ONLY the raw questions, one per line. No numbering, no bullet points. Do not write "Here are the questions:".
 
 Respond now:"""
 )

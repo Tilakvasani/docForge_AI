@@ -300,10 +300,15 @@ def api_post(ep, data, timeout=120):
         r.raise_for_status()
         return r.json()
     except httpx.HTTPStatusError as e:
-        st.error(f"API {e.response.status_code}: {e.response.text[:200]}")
+        try:
+            err_msg = e.response.json().get("detail", e.response.text[:200])
+        except:
+            err_msg = e.response.text[:200]
+        st.session_state._last_api_error = err_msg
+        return None
     except Exception as e:
-        st.error(f"Connection error: {e}")
-    return None
+        st.session_state._last_api_error = f"Connection error: {e}"
+        return None
 
 
 # ── Session ────────────────────────────────────────────────────────────────────
@@ -642,18 +647,6 @@ if st.session_state.active_tab == "ask":
                 src_html = " &nbsp;·&nbsp; ".join(parts)
                 st.markdown(f'<div class="cite-sources">📎 {src_html}</div>', unsafe_allow_html=True)
 
-<<<<<<< HEAD
-            # ── Agent command replies (tool_used == "agent") ──────────────────
-            if role == "assistant" and msg.get("tool_used") == "agent":
-                # Already rendered above via st.markdown(content) — just add pill
-                st.markdown(
-                    '<div style="margin-top:6px">'
-                    '<span style="font-size:11px;background:rgba(99,102,241,0.15);color:#a5b4fc;'
-                    'padding:2px 8px;border-radius:99px">🤖 Agent</span>'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-=======
             # ── Agent ticket replies ───────────────────────────────────────────
             # tool_used=="agent": full reply is in content (already rendered above)
             # agent_reply set on RAG messages: show as info box below the answer
@@ -683,7 +676,6 @@ if st.session_state.active_tab == "ask":
                         '</div>',
                         unsafe_allow_html=True,
                     )
->>>>>>> rag
 
 
 
@@ -715,14 +707,9 @@ if st.session_state.active_tab == "ask":
                 "tool_used":      res.get("tool_used", ""),
                 "ticket_pending": res.get("ticket_pending", False),
                 "orig_question":  question,
-<<<<<<< HEAD
-                "ticket_id":      res.get("ticket_id"),    # set if agent auto-created one
-                "ticket_url":     res.get("ticket_url"),
-=======
                 "ticket_id":      res.get("ticket_id"),
                 "ticket_url":     res.get("ticket_url"),
                 "agent_reply":    res.get("agent_reply", ""),  # ticket create/update reply
->>>>>>> rag
             }
             if res.get("tool_used") == "compare":
                 ai_msg.update({
@@ -733,37 +720,25 @@ if st.session_state.active_tab == "ask":
                     "doc_a":       res.get("doc_a", "Document A"),
                     "doc_b":       res.get("doc_b", "Document B"),
                 })
-<<<<<<< HEAD
-            st.session_state._last_chunks       = res.get("chunks", [])
-=======
             # Use _raw_chunks when chunks=[] (not-found) so Show Sources still appears
             st.session_state._last_chunks    = res.get("chunks") or res.get("_raw_chunks", [])
             st.session_state._last_not_found = (not res.get("chunks") and bool(res.get("_raw_chunks")))
->>>>>>> rag
         else:
+            err = st.session_state.get("_last_api_error", "Could not reach the RAG service. Make sure the backend is running.")
+            if "_last_api_error" in st.session_state:
+                del st.session_state["_last_api_error"]
+
             ai_msg = {
                 "role":      "assistant",
-                "content":   "Could not reach the RAG service. Make sure the backend is running.",
+                "content":   f"⚠️ **Error:** {err}",
                 "citations": [],
             }
-<<<<<<< HEAD
-            st.session_state._last_chunks       = []
-=======
             st.session_state._last_chunks    = []
             st.session_state._last_not_found = False
->>>>>>> rag
         st.session_state.rag_chats[active_id]["messages"].append(ai_msg)
         st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════════
-<<<<<<< HEAD
-    # SHOW SOURCES + RAGAS QUALITY — toggle section
-    # ══════════════════════════════════════════════════════════════════════════
-
-    chunks = st.session_state.get("_last_chunks", [])
-    if chunks:
-        if st.toggle("🔍 Show Sources", value=False, key="show_retrieval"):
-=======
     # SHOW SOURCES — toggle section (works for found AND not-found answers)
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -783,7 +758,6 @@ if st.session_state.active_tab == "ask":
                     '</div>',
                     unsafe_allow_html=True,
                 )
->>>>>>> rag
 
             # ── Build top-5 unique docs ───────────────────────────────────────
             seen_docs = {}
@@ -836,11 +810,8 @@ if st.session_state.active_tab == "ask":
                     )
                 cards_html += "</div>"
                 st.markdown(cards_html, unsafe_allow_html=True)
-<<<<<<< HEAD
-=======
             elif not_found:
                 st.info("No documents were retrieved — this topic may not exist in any ingested document yet.")
->>>>>>> rag
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LIBRARY
@@ -1118,11 +1089,7 @@ elif st.session_state.active_tab == "ragas":
                 _gt_val = st.text_input(
                     f"Ground Truth {_ri + 1}",
                     value=_row["ground_truth"],
-<<<<<<< HEAD
-                    placeholder="Ground truth (optional)",
-=======
                     placeholder="Ground truth",
->>>>>>> rag
                     key=f"batch_gt_{_ri}",
                     label_visibility="collapsed",
                 )
@@ -1147,11 +1114,7 @@ elif st.session_state.active_tab == "ragas":
             st.caption(f"{len(st.session_state.batch_rows)} question(s) queued · Each takes 20–60s · No timeout limit")
 
         st.write("")
-<<<<<<< HEAD
-        _valid_rows = [r for r in st.session_state.batch_rows if r["question"].strip()]
-=======
         _valid_rows = [r for r in st.session_state.batch_rows if r["question"].strip() and r['ground_truth'].strip()]
->>>>>>> rag
 
         # ── Live progress display (survives st.rerun) ─────────────────────────
         _bp = st.session_state.get("_batch_progress")
@@ -1889,14 +1852,9 @@ elif st.session_state.active_tab == "agent":
 <div style="padding:0 0 0.5rem">
   <h2 style="color:#e2e8f0;font-weight:700;margin-bottom:0.2rem">🎫 Tickets</h2>
   <p style="color:#475569;font-size:0.88rem;margin:0">
-<<<<<<< HEAD
-    Knowledge-gap tickets — auto-created when
-    <b style="color:#93c5fd">💬 CiteRAG</b> can't find an answer in the documents
-=======
     Knowledge-gap tickets — say <b style="color:#93c5fd">"create a ticket"</b>,
     <b style="color:#93c5fd">"raise a ticket"</b> or <b style="color:#93c5fd">"open a case"</b>
     in <b style="color:#93c5fd">💬 CiteRAG</b> to log a missing answer
->>>>>>> rag
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -1955,14 +1913,28 @@ elif st.session_state.active_tab == "agent":
         if st.button("💾 Save Hints", key="ag_save_hints", use_container_width=True):
             st.session_state.agent_memory["user_name"] = _hn.strip()
             st.session_state.agent_memory["industry"]  = _hi.strip()
-            st.success("Saved!")
+            
+            # ── SYNC TO BACKEND ──────────────────
+            st.session_state._last_api_error = None  # Clear previous errors
+            res_sync = api_post("/agent/memory", {
+                "session_id": st.session_state.rag_active_chat,
+                "memory": {
+                    "user_name": _hn.strip(),
+                    "industry":  _hi.strip()
+                }
+            })
+            if res_sync:
+                st.success("Hints saved & synced to backend!")
+            else:
+                st.error(f"Sync failed: {st.session_state.get('_last_api_error', 'Unknown error')}")
             st.rerun()
 
         st.divider()
 
         # Sync memory from backend (LangGraph checkpointer)
         if st.button("↺ Sync from Backend", key="ag_sync_mem", use_container_width=True):
-            _mres = _ag_get("/agent/memory")
+            st.session_state._last_api_error = None  # Clear previous errors
+            _mres = api_get(f"/agent/memory?session_id={st.session_state.rag_active_chat}")
             if _mres and "error" not in _mres:
                 st.session_state.agent_memory.update(_mres.get("memory", {}))
                 st.success("Memory synced!")
@@ -2088,8 +2060,12 @@ elif st.session_state.active_tab == "agent":
                                 f'color:{_s_col}">{_ts}</span>'
                                 f'&nbsp;<span style="font-size:11px;color:{_p_col};'
                                 f'font-weight:600">{_tp}</span>'
-                                f'&nbsp;<span style="font-size:11px;color:#334155">· #{_tid}</span>'
-                                + (f'&nbsp;<span style="font-size:11px;color:#1e3a5f">· {_tts}</span>'
+                                f'&nbsp;<span style="background:rgba(51,65,85,0.06);'
+                                f'padding:2px 6px;border-radius:4px;font-family:monospace;'
+                                f'font-size:11px;color:#475569;border:1px solid rgba(51,65,85,0.12)">'
+                                f'#{_tid}</span>'
+                                + (f'&nbsp;<span style="font-size:11px;color:#64748b">'
+                                   f' · {(_tts[:10] if _tts else "")}</span>'
                                    if _tts else ""),
                                 unsafe_allow_html=True,
                             )
@@ -2148,16 +2124,7 @@ elif st.session_state.active_tab == "agent":
 | `/api/agent/tickets/update` | POST | Update ticket status in Notion |
 | `/api/agent/memory` | GET | Read LangGraph thread memory for current user |
 
-<<<<<<< HEAD
-**How tickets get created:**
-The LangGraph agent in `agent_graph.py` wraps every CiteRAG answer.
-When `confidence == "low"` or `chunks == []`, the graph transitions to the
-`create_ticket` node which calls the Notion API to write a new ticket row
-with: question · attempted sources · conversation summary · priority · status=Open.
 
-**CiteRAG tab stays unchanged** — the agent layer is backend-only.
-No second chat UI needed.
-=======
 **How tickets get created (manual only):**
 The LangGraph agent detects ticket-creation intent from the user's message:
 - ✅ "create a ticket", "raise a ticket", "open a case", "generate a ticket"
@@ -2171,5 +2138,4 @@ The LangGraph agent detects ticket-creation intent from the user's message:
 **New file required:** Place `ticket_dedup.py` in `backend/services/rag/`
 
 **New endpoint:** `DELETE /api/agent/dedup/flush` — clears dedup cache after bulk cleanup
->>>>>>> rag
 """)
