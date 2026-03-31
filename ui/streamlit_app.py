@@ -492,7 +492,7 @@ with st.sidebar:
         if st.session_state.sections:
             done_n  = len(st.session_state.section_contents)
             total_n = len(st.session_state.sections)
-            st.progress(
+            sidebar_progress_bar = st.progress(
                 done_n / total_n if total_n else 0,
                 text=f"{done_n} / {total_n} sections done",
             )
@@ -684,7 +684,7 @@ if st.session_state.active_tab == "ask":
 
 
     if user_q or _prefill:
-        question = (user_q or _prefill).strip()
+        question = (user_q or _prefill).strip() 
         if not messages:
             st.session_state.rag_chats[active_id]["title"] = (
                 question[:40] + ("..." if len(question) > 40 else "")
@@ -1502,11 +1502,21 @@ elif st.session_state.active_tab == "generate":
                             (i + 1) / total_sec,
                             text=f"{i + 1}/{total_sec} done",
                         )
+                        if "sidebar_progress_bar" in globals():
+                            sidebar_progress_bar.progress(
+                                (i + 1) / total_sec,
+                                text=f"{i + 1} / {total_sec} sections done",
+                            )
                         continue
                     progress.progress(
                         i / total_sec,
                         text=f"Writing: {sec}",
                     )
+                    if "sidebar_progress_bar" in globals():
+                        sidebar_progress_bar.progress(
+                            i / total_sec,
+                            text=f"{i} / {total_sec} sections done",
+                        )
                     q_data = q_map.get(sec, {})
                     res = api_post("/section/generate", {
                         "sec_id":          q_data.get("sec_id"),
@@ -1525,6 +1535,11 @@ elif st.session_state.active_tab == "generate":
                         (i + 1) / total_sec,
                         text=f"{i + 1}/{total_sec} done",
                     )
+                    if "sidebar_progress_bar" in globals():
+                        sidebar_progress_bar.progress(
+                            (i + 1) / total_sec,
+                            text=f"{i + 1} / {total_sec} sections done",
+                        )
 
                 st.session_state.sec_ids_ordered = ids
                 doc_lines = []

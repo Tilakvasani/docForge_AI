@@ -1,43 +1,40 @@
 """
-rag_routes.py — FastAPI routes for RAG + Tool-Calling Agent
+rag_routes.py — FastAPI routes for RAG + Single Router LLM
 ============================================================
 
 POST /api/rag/ingest    — Notion → Chunks → Embeddings → ChromaDB
-POST /api/rag/ask       — User message → RAG (if needed) → Tool-calling Agent
+POST /api/rag/ask       — User message → Single Router LLM (agent_graph.run_agent)
 GET  /api/rag/status    — Collection stats
 DELETE /api/rag/cache   — Flush retrieval cache
 GET  /api/rag/scores    — Poll RAGAS scores by key
 POST /api/rag/eval      — Manual RAGAS evaluation
 
 Flow for /ask:
-  1. Run RAG to get document search result (always, for search tool to use)
-  2. Pass everything to run_agent()
-  3. Agent's LLM sees full chat history + picks the right tool
-  4. Tool executes → response returned
-
-The agent handles ALL routing decisions. This file just feeds it data.
+  1. sanitized_question() — fast string-match injection guard (HTTP 422 on obvious patterns)
+  2. run_agent() — ONE LLM call with full history; picks the right tool; executes it; returns answer
+  No pre-RAG run. No separate classify step. No rewrite step.
 """
 
 # ── Standard library ──────────────────────────────────────────────────────────
-import asyncio    # parallel RAG calls for multi-question inputs
-import datetime   # eval run timestamps
-import re         # question splitting regex
-import uuid       # request trace IDs
+import asyncio
+import datetime
+import re
+import uuid
 from typing import Dict
 
 # ── Third-party ───────────────────────────────────────────────────────────────
-import chromadb                                     # vector store client
-from fastapi import APIRouter, HTTPException        # FastAPI routing + error responses
-from pydantic import BaseModel                      # Request schema validation
+import chromadb
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 # ── Internal ──────────────────────────────────────────────────────────────────
-from backend.core.logger import logger                              # Structured logger
-from backend.core.config import settings                            # App settings (.env)
-from backend.services.redis_service import cache                    # Redis caching layer
-from backend.services.rag.rag_service import answer, _save_turn           # Core RAG pipeline
-from backend.services.rag.ragas_scorer import score as ragas_score  # RAGAS evaluation scorer
-from backend.services.rag.ingest_service import COLLECTION_NAME, ingest_from_notion  # Notion ingest
-from backend.services.rag.agent_graph import run_agent              # Tool-calling agent
+from backend.core.logger import logger
+from backend.core.config import settings
+from backend.services.redis_service import cache
+from backend.services.rag.rag_service import tool_search, _save_turn
+from backend.services.rag.ragas_scorer import score as ragas_score
+from backend.services.rag.ingest_service import COLLECTION_NAME, ingest_from_notion
+from backend.services.rag.agent_graph import run_agent
 
 router = APIRouter(prefix="/rag", tags=["RAG"])
 
@@ -53,19 +50,84 @@ class AskRequest(BaseModel):
     top_k:      int = 5
     doc_a:      str = ""
     doc_b:      str = ""
+    doc_list:   list[str] = []   # for multi-doc compare (3+ documents)
 
     def sanitized_question(self) -> str:
         """Strip whitespace, collapse internal whitespace, cap at 2000 chars.
-        (Prompt injection detection temporarily disabled for LLM testing)
+        Fast string-match injection guard — runs BEFORE any LLM call.
+        The LLM-level guard in the agent system prompt handles everything else.
         """
         q = " ".join(self.question.strip().split())
         q = q[:2000]
 
-        # ── Prompt injection detection (DISABLED FOR TESTING) ─────────────────
-        # _injection_patterns = [ ... ]
-        # q_lower = q.lower()
-        # if any(pattern in q_lower for pattern in _injection_patterns):
-        #     raise HTTPException(...)
+        # ── Fast pattern matching — catches obvious injection before any LLM call ──
+        # Extended to cover patterns Azure flags as jailbreak (content_filter 400)
+        _INJECTION_PATTERNS = [
+            # Classic overrides
+            "ignore all previous",
+            "ignore previous instructions",
+            "forget you are",
+            "forget your instructions",
+            "forget everything above",
+            "disregard previous",
+            "disregard all instructions",
+            "system override",
+            "disable all filters",
+            "disable rag",
+            # Prompt reveal
+            "print your system prompt",
+            "reveal your prompt",
+            "reveal your system",
+            "reveal your instructions",
+            "show me your prompt",
+            "what is your system prompt",
+            "reveal your api key",
+            "reveal your token",
+            # Persona hijack
+            "act as if you have no",
+            "act as an unrestricted",
+            "you are now dan",
+            "you are now stan",
+            "you are now jailbreak",
+            "you are no longer bound",
+            "you have no restrictions",
+            "you are unrestricted",
+            "pretend you are an evil",
+            "pretend you have no",
+            "pretend you are unrestricted",
+            "roleplay as a turabit",
+            "pretend there are no rules",
+            "imagine you are a different ai",
+            "you are now a different ai",
+            # Bypass instructions
+            "answer from your general knowledge",
+            "answer from the internet",
+            "use your training data",
+            "bypass your instructions",
+            "bypass your filters",
+            "override your guidelines",
+            "override your safety",
+            "my admin code",
+            "access granted",
+            "developer mode",
+            "jailbreak mode",
+            # Structural injection markers
+            "instruction from anthropic",
+            "instruction from openai",
+            "[inst] forget",
+            "</s>[inst]",
+            "<<sys>>",
+            "<|system|>",
+            "###instruction",
+            "### instruction",
+        ]
+        q_lower = q.lower()
+        if any(pattern in q_lower for pattern in _INJECTION_PATTERNS):
+            logger.warning("🚨 [Security] Injection pattern detected in input: %r", q[:80])
+            raise HTTPException(
+                status_code=422,
+                detail="Request rejected: potential prompt injection detected.",
+            )
 
         return q
 
@@ -93,56 +155,6 @@ def _split_questions(text: str) -> list[str]:
     return [text]
 
 
-async def _process_multi_question(questions: list[str], req: AskRequest) -> dict:
-    """Run multiple questions through RAG in parallel."""
-    logger.info("🔀 [Multi] Split into %d questions (parallel)", len(questions))
-
-    tasks = [
-        answer(
-            question=q, filters=req.filters,
-            session_id=req.session_id, top_k=req.top_k,
-            doc_a=req.doc_a, doc_b=req.doc_b,
-        )
-        for q in questions
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    found_parts      = []
-    unanswered_parts = []
-    all_citations    = []
-
-    for q, r in zip(questions, results):
-        if isinstance(r, Exception):
-            logger.warning("⚠️ [Sub-RAG] error for '%s': %s", q[:40], r)
-            unanswered_parts.append({"question": q, "raw_chunks": []})
-            continue
-
-        conf      = r.get("confidence", "high")
-        ans       = r.get("answer", "")
-        not_found = conf == "low" or "could not find" in ans.lower()
-
-        if not_found:
-            unanswered_parts.append({
-                "question":   q,
-                "raw_chunks": r.get("_raw_chunks") or r.get("chunks") or [],
-            })
-        else:
-            found_parts.append({"question": q, "answer": ans, "citations": r.get("citations", [])})
-            all_citations.extend(r.get("citations", []))
-
-    sections = [f"**Q: {fp['question']}**\n\n{fp['answer']}" for fp in found_parts]
-    combined = "\n\n---\n\n".join(sections)
-
-    return {
-        "answer":                combined,
-        "confidence":            "low" if unanswered_parts else "high",
-        "chunks":                [],
-        "citations":             all_citations,
-        "tool_used":             "search",
-        "_unanswered_questions": unanswered_parts,
-    }
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.post("/ingest")
@@ -161,52 +173,83 @@ async def api_ingest(req: IngestRequest):
 @router.post("/ask")
 async def api_ask(req: AskRequest):
     """
-    Main entry point. Always runs RAG first (gives agent context for search tool),
-    then passes everything to the tool-calling agent which decides what to do.
+    Single-router entry point.
+    sanitized_question() → run_agent() → done.
+    The agent handles ALL routing: search, compare, analyze, tickets, off-topic, injection.
     """
     request_id = str(uuid.uuid4())[:8]
     question   = req.sanitized_question()
     logger.info("🚀 [%s] /ask | session=%s | q=%r", request_id, req.session_id, question[:80])
 
     try:
-        # ── Run RAG (gives search context to the agent's search tool) ─────────
         questions = _split_questions(question)
 
         if len(questions) == 1:
-            rag_result = await answer(
+            # Single question → ONE agent call
+            result = await run_agent(
                 question=question,
-                filters=req.filters,
                 session_id=req.session_id,
-                top_k=req.top_k,
                 doc_a=req.doc_a,
                 doc_b=req.doc_b,
+                doc_list=req.doc_list,
             )
         else:
-            logger.info("🔀 [%s] Multi-question split into %d parts", request_id, len(questions))
-            rag_result = await _process_multi_question(questions, req)
+            # Multi-question: run agents in parallel (each gets its own call)
+            logger.info("🔀 [%s] Split into %d questions", request_id, len(questions))
+            tasks = [
+                run_agent(
+                    question=q,
+                    session_id=req.session_id,
+                    doc_a=req.doc_a,
+                    doc_b=req.doc_b,
+                    doc_list=req.doc_list,
+                )
+                for q in questions
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # ── Agent: one LLM call, picks the right tool ──────────────────────────
-        result = await run_agent(
-            question=question,
-            rag_result=rag_result,
-            session_id=req.session_id,
-        )
-        logger.info("✅ [%s] Finished | tool_used=%s", request_id, result.get("tool_used", "?"))
+            # Merge answers from all questions
+            parts      = []
+            citations  = []
+            confidence = "high"
+            for q, r in zip(questions, results):
+                if isinstance(r, Exception):
+                    logger.warning("⚠️ Sub-agent error for '%s': %s", q[:40], r)
+                    confidence = "low"
+                    continue
+                parts.append(f"**Q: {q}**\n\n{r.get('answer', '')}")
+                citations.extend(r.get("citations", []))
+                if r.get("confidence") == "low":
+                    confidence = "low"
+
+            result = {
+                "answer":     "\n\n---\n\n".join(parts),
+                "citations":  citations,
+                "chunks":     [],
+                "tool_used":  "search",
+                "confidence": confidence,
+                "intent":     "multi_question",
+            }
+
+        logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         err_str = str(e)
         if "content_filter" in err_str or "ResponsibleAIPolicyViolation" in err_str:
-            
-            block_msg = "Classified: I am not authorized to disclose internal system configurations, secrets, or execute override commands."
+            block_msg = (
+                "I could not find information about this in the available documents. "
+                "[Note: Request restricted by security policy 🛡️]"
+            )
             await _save_turn(req.session_id, question, block_msg)
-            
             return {
-                "answer": block_msg,
-                "citations": [],
-                "chunks": [],
-                "tool_used": "search",
-                "confidence": "low"
+                "answer":     block_msg,
+                "citations":  [],
+                "chunks":     [],
+                "tool_used":  "chat",
+                "confidence": "low",
             }
         logger.error("❌ [%s] Ask error: %s", request_id, err_str)
         raise HTTPException(status_code=500, detail=err_str)
@@ -243,7 +286,7 @@ async def api_flush_cache():
 
 @router.get("/scores")
 async def api_get_scores(key: str):
-    """Poll for RAGAS evaluation scores by a ragas_key returned from /eval. Returns null until ready."""
+    """Poll for RAGAS evaluation scores by a ragas_key returned from /eval."""
     if not key or not key.startswith("ragas:"):
         raise HTTPException(status_code=400, detail="Invalid ragas_key format")
     try:
@@ -265,9 +308,9 @@ async def api_eval(req: EvalRequest):
     request_id = str(uuid.uuid4())[:8]
     logger.info("🧪 [%s] /eval | q=%r", request_id, req.question[:60])
     try:
-        rag_result = await answer(
-            question=req.question, filters={},
-            session_id="ragas_eval", top_k=req.top_k,
+        # Eval calls search directly — no agent overhead
+        rag_result = await tool_search(
+            question=req.question, filters={}, session_id="ragas_eval",
         )
         chunks     = rag_result.get("chunks", [])
         rag_answer = rag_result.get("answer", "")
@@ -284,21 +327,19 @@ async def api_eval(req: EvalRequest):
                 ragas_error = str(e)
                 logger.error("❌ [%s] RAGAS scoring failed: %s", request_id, e)
 
-        # ── Store eval run snapshot for reproducibility ──────────────────────────
         run_snapshot = {
-            "run_id":       request_id,
-            "timestamp":    datetime.datetime.utcnow().isoformat(),
-            "config":       {"top_k": req.top_k, "collection": "rag_store"},
-            "input":        {"question": req.question, "ground_truth": req.ground_truth},
-            "output":       {"answer": rag_answer, "chunk_count": len(chunks)},
-            "scores":       ragas_scores,
-            "error":        ragas_error,
+            "run_id":    request_id,
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "config":    {"top_k": req.top_k, "collection": "rag_store"},
+            "input":     {"question": req.question, "ground_truth": req.ground_truth},
+            "output":    {"answer": rag_answer, "chunk_count": len(chunks)},
+            "scores":    ragas_scores,
+            "error":     ragas_error,
         }
-        await cache.set(f"ragas:runs:{request_id}", run_snapshot, ttl=604800)  # 7 days
-        # Append run_id to index list for browsing all runs
+        await cache.set(f"ragas:runs:{request_id}", run_snapshot, ttl=604800)
         all_runs = await cache.get("ragas:run_index") or []
         all_runs.insert(0, {"run_id": request_id, "timestamp": run_snapshot["timestamp"], "question": req.question})
-        await cache.set("ragas:run_index", all_runs[:50], ttl=604800)  # keep last 50
+        await cache.set("ragas:run_index", all_runs[:50], ttl=604800)
         logger.info("💾 [%s] Eval run stored (scores=%s)", request_id, ragas_scores is not None)
 
         return {**rag_result, "ragas_scores": ragas_scores, "ragas_error": ragas_error, "run_id": request_id}
@@ -309,7 +350,7 @@ async def api_eval(req: EvalRequest):
 
 @router.get("/eval/runs")
 async def api_eval_runs():
-    """Browse the last 50 stored RAGAS evaluation runs (index only, no full output)."""
+    """Browse the last 50 stored RAGAS evaluation runs."""
     try:
         runs = await cache.get("ragas:run_index") or []
         return {"total": len(runs), "runs": runs}
@@ -319,11 +360,11 @@ async def api_eval_runs():
 
 @router.get("/eval/runs/{run_id}")
 async def api_eval_run_detail(run_id: str):
-    """Retrieve the full snapshot of a specific RAGAS evaluation run by its run_id."""
+    """Retrieve the full snapshot of a specific RAGAS evaluation run."""
     try:
         snapshot = await cache.get(f"ragas:runs:{run_id}")
         if snapshot is None:
-            raise HTTPException(status_code=404, detail=f"Run {run_id} not found (may have expired)")
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
         return snapshot
     except HTTPException:
         raise
