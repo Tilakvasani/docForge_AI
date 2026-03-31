@@ -498,8 +498,12 @@ with st.sidebar:
             )
         st.divider()
         if st.button("↺  Start Over", use_container_width=True):
+            _saved_active = st.session_state.get("active_tab", "ask")
+            _saved_main = st.session_state.get("main_tab", "💬 CiteRAG")
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
+            st.session_state.active_tab = _saved_active
+            st.session_state.main_tab = _saved_main
             st.rerun()
 
 
