@@ -176,7 +176,33 @@ async def api_ask(req: AskRequest):
     The agent handles ALL routing: search, compare, analyze, tickets, off-topic, injection.
     """
     request_id = str(uuid.uuid4())[:8]
-    question   = req.sanitized_question()
+
+    # ── Injection guard ───────────────────────────────────────────────────────
+    # sanitized_question() raises HTTPException(422) on obvious injection patterns.
+    # We catch that here and return the same friendly security message that the
+    # Azure Content Filter path returns, so the UI always gets a 200 + safe text
+    # instead of a raw 422 error.
+    try:
+        question = req.sanitized_question()
+    except HTTPException as e:
+        if e.status_code == 422:
+            block_msg = (
+                "I could not find information about this in the available documents. "
+                "[Note: Request restricted by security policy 🛡️]"
+            )
+            logger.warning(
+                "\U0001f6e1\ufe0f [%s] Injection blocked, returning safe response | session=%s",
+                request_id, req.session_id,
+            )
+            await _save_turn(req.session_id, req.question[:2000], block_msg)
+            return {
+                "answer":     block_msg,
+                "citations":  [],
+                "chunks":     [],
+                "tool_used":  "chat",
+                "confidence": "low",
+            }
+        raise  # re-raise any other unexpected HTTPException
     logger.info("🚀 [%s] /ask | session=%s | q=%r", request_id, req.session_id, question[:80])
 
     try:

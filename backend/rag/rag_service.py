@@ -5,12 +5,18 @@ Pure tool functions — no routing, no intent classification.
 All routing is done by the Single Router LLM in agent_graph.py.
 
 Tools:
-  tool_search()        — vector search + LLM answer
+  tool_search()        — vector search + LLM answer  [Redis answer cache ✅]
   tool_compare()       — 2-document side-by-side comparison
   tool_multi_compare() — 3+ document cross-comparison
   tool_analysis()      — gap/contradiction/audit analysis
   tool_refine()        — HyDE-based summary generation
   tool_full_doc()      — full document retrieval
+
+Redis fix (was broken):
+  _answer_key() was defined but never used.  tool_search() now does:
+    1. cache.get(answer_key)  → return cached answer immediately
+    2. on miss: run LLM, then cache.set(answer_key, result, TTL_ANSWER)
+  Retrieval results are still cached via _retrieval_key (unchanged).
 """
 
 
@@ -25,7 +31,7 @@ from backend.services.redis_service import cache
 COLLECTION_NAME = "rag_chunks"
 MIN_SCORE       = 0.20
 TTL_RETRIEVAL   = 600
-TTL_SESSION     = 1800
+TTL_SESSION     = 86400
 TTL_ANSWER      = 3600
 
 
@@ -213,9 +219,6 @@ RULES:
 Summary:"""
 
 
-
-
-
 ANALYSIS_PROMPT = """\
 You are CiteRAG — a senior legal and business document analyst for turabit.
 Analyze the provided documents and answer the question precisely.
@@ -278,6 +281,13 @@ RULES:
 - Severity must be justified by a real legal or operational consequence, not assigned by gut feel
 
 Analysis:"""
+
+EXPAND_PROMPT = """\
+Generate 3 alternative search queries for the following question.
+Each query should use different vocabulary but find the same information.
+Return ONLY the 3 queries, one per line, no numbering, no explanation.
+
+Question: {question}"""
 
 
 # ── Singleton clients (created once, reused) ────────────────────────────────────
@@ -536,7 +546,10 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
         final = sorted(final, key=lambda x: x["score"], reverse=True)[:top_k + 3]
         logger.info("📊 [Retrieve] After table recovery: %d chunks", len(final))
 
-    logger.info("✅ [Retrieve] Final: %d chunks found for %r", len(final), query[:50])
+    logger.info("✅ [Retrieve] Final: %d chunks found for %r", len(final), query[:80])
+
+    # Cache the retrieval result
+    await cache.set(key, final, ttl=TTL_RETRIEVAL)
     return final
 
 
@@ -557,7 +570,7 @@ def _citations(chunks: list) -> list:
     for c in top_chunks:
         cit     = c.get("citation", "")
         page_id = c.get("notion_page_id", "")
-        url     = f"https://www.notion.so/{page_id}" if page_id else ""
+        url     = f"https://www.notion.so/{page_id.replace('-', '')}" if page_id else ""
         dedup_key = c.get("doc_title", "") + "§" + c.get("heading", "")
         if cit and dedup_key not in seen:
             seen.add(dedup_key)
@@ -572,13 +585,18 @@ def _confidence(chunks: list) -> str:
     return "high" if avg >= 0.60 else "medium" if avg >= 0.40 else "low"
 
 
-
-
-
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 async def tool_search(question: str, filters: dict,
                       session_id: str, top_k: int = 8) -> dict:
+    # ── FIX: Check Redis answer cache before doing any work ───────────────────
+    a_key  = _answer_key(question, filters)
+    cached = await cache.get(a_key)
+    if cached is not None:
+        logger.info("⚡ [Cache HIT] answer for %r", question[:60])
+        # node_save_history() in agent_graph handles history persistence
+        return cached
+
     chunks = await _retrieve(question, filters, top_k)
 
     _hr_policy_signals = [
@@ -625,14 +643,18 @@ async def tool_search(question: str, filters: dict,
     quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
     if not quality_chunks:
         not_found_answer = "I could not find information about this in the available documents."
-        await _save_turn(session_id, question, not_found_answer)
-        return {
+        # node_save_history() in agent_graph handles history persistence
+        result = {
             "answer":     not_found_answer,
             "citations":  _citations(chunks),
             "chunks":     chunks,
             "tool_used":  "search",
             "confidence": "low",
         }
+        # Cache not-found answers with a shorter TTL (10 min) so they refresh
+        # if docs are ingested later
+        await cache.set(a_key, {k: v for k, v in result.items() if k != "chunks"}, ttl=600)
+        return result
 
     answer  = _get_llm().invoke(
         ANSWER_PROMPT.format(history=history, context=context, question=question)
@@ -641,14 +663,25 @@ async def tool_search(question: str, filters: dict,
     if not_found:
         # LLM said not found but we had chunks — return clean message
         answer = "I could not find information about this in the available documents."
-    await _save_turn(session_id, question, answer)
-    return {
+    # node_save_history() in agent_graph handles history persistence
+
+    result = {
         "answer":     answer,
         "citations":  _citations(chunks),
         "chunks":     chunks,
         "tool_used":  "search",
         "confidence": "low" if not_found else _confidence(chunks),
     }
+
+    # ── FIX: Write to Redis answer cache (exclude chunks — too large) ─────────
+    # chunks are excluded because they contain raw embeddings context;
+    # they are fetched fresh on cache-miss and not needed for the cached path.
+    cacheable = {k: v for k, v in result.items() if k != "chunks"}
+    ttl = 600 if not_found else TTL_ANSWER        # shorter TTL for not-found
+    await cache.set(a_key, cacheable, ttl=ttl)
+    logger.info("💾 [Cache SET] answer for %r (ttl=%ds)", question[:60], ttl)
+
+    return result
 
 
 async def tool_full_doc(question: str, filters: dict,
@@ -664,7 +697,7 @@ async def tool_full_doc(question: str, filters: dict,
         history=history, context=context, question=question)
     answer  = _get_llm().invoke(prompt).content.strip()
     not_found = "could not find" in answer.lower()
-    await _save_turn(session_id, question, answer)
+    # node_save_history() in agent_graph handles history persistence
     return {
         "answer":     answer,
         "citations":  _citations(chunks),
@@ -690,7 +723,7 @@ async def tool_refine(question: str, filters: dict,
         SUMMARY_PROMPT.format(context=context, question=question)
     ).content.strip()
     not_found = "could not find" in answer.lower()
-    await _save_turn(session_id, question, answer)
+    # node_save_history() in agent_graph handles history persistence
     return {
         "answer":     answer,
         "citations":  _citations(chunks),
@@ -770,7 +803,7 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
         side_a, side_b, comp_table = content_a[:600], content_b[:600], ""
 
     all_chunks = chunks_a + chunks_b
-    await _save_turn(session_id, question, summary or raw[:200])
+    # node_save_history() in agent_graph handles history persistence
     return {
         "answer":      raw,
         "side_a":      side_a,
@@ -782,8 +815,8 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
         "citations":  _citations(all_chunks),
         "chunks":     all_chunks,
         "tool_used":  "compare",
-        "confidence": _confidence(all_chunks),
     }
+    
 
 
 async def tool_multi_compare(
@@ -866,7 +899,7 @@ async def tool_multi_compare(
     if "SUMMARY:" in raw:
         summary = raw.split("SUMMARY:", 1)[1].strip()
 
-    await _save_turn(session_id, question, summary or raw[:200])
+    # node_save_history() in agent_graph handles history persistence
     return {
         "answer":      raw,
         "summary":     summary,
@@ -968,11 +1001,11 @@ async def tool_analysis(question: str, filters: dict,
         ANALYSIS_PROMPT.format(context=context, question=question)
     ).content.strip()
 
-    await _save_turn(session_id, question, answer)
+    # node_save_history() in agent_graph handles history persistence
     return {
         "answer":     answer,
         "citations":  _citations(chunks),
         "chunks":     chunks,
         "tool_used":  "analysis",
         "confidence": "high",
-    }
+    } 

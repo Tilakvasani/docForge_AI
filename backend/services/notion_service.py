@@ -579,6 +579,7 @@ async def fetch_library_from_notion() -> list:
                     return sel.get("name", "") if sel else ""
 
                 library.append({
+                    "id":         page.get("id", ""),
                     "title":      get_text("Title"),
                     "doc_type":   get_text("Doc Type"),
                     "department": get_select("Department"),

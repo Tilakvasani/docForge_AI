@@ -96,10 +96,16 @@ async def save_answers(
 ) -> bool:
     """
     Update section_que_ans with user answers.
+    Preserves section_type from original save_questions() call.
     """
+    # Read existing row to preserve section_type saved during question generation
+    existing = await get_qa_by_sec_id(sec_id)
+    section_type = (existing or {}).get("doc_sec_que_ans", {}).get("section_type", "text")
+
     pool = await get_pool()
     qa_data = json.dumps({
         "section_name": section_name,
+        "section_type": section_type,
         "questions": questions,
         "answers": answers
     })

@@ -42,32 +42,51 @@ KEY_NOTION_LIBRARY    = "docforge:notion_library"
 
 class RedisCache:
     """
-    Async Redis cache with graceful fallback.
+    Async Redis cache with graceful fallback and auto-reconnect.
     Call await cache.connect() on app startup.
+    On timeout/connection errors, retries every 30s automatically.
     """
+
+    _RECONNECT_COOLDOWN = 30  # seconds between reconnect attempts
 
     def __init__(self):
         self._redis = None
         self._available = False
+        self._url = "redis://localhost:6379"
+        self._last_fail_time = 0.0
 
     async def connect(self, url: str = "redis://localhost:6379") -> bool:
         """
         Try to connect to Redis. Returns True if successful.
         App continues normally if this returns False.
         """
+        self._url = url
         try:
             client = aioredis.from_url(url, encoding="utf-8",
                                        decode_responses=True,
-                                       socket_connect_timeout=2)
+                                       socket_connect_timeout=5,
+                                       socket_timeout=5,
+                                       max_connections=20,
+                                       retry_on_timeout=True)
             await client.ping()
             self._redis = client
             self._available = True
+            self._last_fail_time = 0.0
             logger.info("✅ Redis connected at %s", url)
             return True
         except Exception as e:
             self._available = False
+            import time; self._last_fail_time = time.time()
             logger.warning("⚠️  Redis unavailable (%s) — running without cache", e)
             return False
+
+    async def _try_reconnect(self) -> bool:
+        """Auto-reconnect after cooldown period. Returns True if reconnected."""
+        import time
+        if time.time() - self._last_fail_time < self._RECONNECT_COOLDOWN:
+            return False
+        logger.info("🔄 Redis auto-reconnect attempt...")
+        return await self.connect(self._url)
 
     async def disconnect(self):
         if self._redis:
@@ -84,7 +103,8 @@ class RedisCache:
     async def get(self, key: str) -> Optional[Any]:
         """Return deserialized value or None on miss / error."""
         if not self._available:
-            return None
+            if not await self._try_reconnect():
+                return None
         try:
             raw = await self._redis.get(key)
             if raw is None:
@@ -92,28 +112,39 @@ class RedisCache:
             return json.loads(raw)
         except Exception as e:
             logger.warning("Redis GET error for %s: %s", key, e)
+            if "Timeout" in str(e) or "Connection" in str(e):
+                import time; self._last_fail_time = time.time()
+                self._available = False
             return None
 
     async def set(self, key: str, value: Any, ttl: int = 3600) -> bool:
         """Serialize and store value with TTL. Returns False on error."""
         if not self._available:
-            return False
+            if not await self._try_reconnect():
+                return False
         try:
             await self._redis.setex(key, ttl, json.dumps(value, default=str))
             return True
         except Exception as e:
             logger.warning("Redis SET error for %s: %s", key, e)
+            if "Timeout" in str(e) or "Connection" in str(e):
+                import time; self._last_fail_time = time.time()
+                self._available = False
             return False
 
     async def delete(self, key: str) -> bool:
         """Delete a single key. Returns False if Redis is unavailable or on error."""
         if not self._available:
-            return False
+            if not await self._try_reconnect():
+                return False
         try:
             await self._redis.delete(key)
             return True
         except Exception as e:
             logger.warning("Redis DEL error for %s: %s", key, e)
+            if "Timeout" in str(e) or "Connection" in str(e):
+                import time; self._last_fail_time = time.time()
+                self._available = False
             return False
 
     async def flush_pattern(self, pattern: str) -> int:
@@ -123,7 +154,8 @@ class RedisCache:
         Returns count of deleted keys.
         """
         if not self._available:
-            return 0
+            if not await self._try_reconnect():
+                return 0
         try:
             deleted = 0
             cursor = 0
