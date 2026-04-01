@@ -34,7 +34,7 @@ import httpx  # async Notion API calls
 # NOTE: Internal imports (agent_routes, rag_service) are lazy-loaded inside
 # functions to prevent circular import chains at module startup.
 
-logger = logging.getLogger(__name__)
+from backend.core.logger import logger
 
 # Max tickets sent to LLM to avoid huge prompts
 _MAX_TICKETS_FOR_LLM = 50
@@ -75,7 +75,8 @@ async def _fetch_open_tickets() -> list[dict]:
     Returns [] on any error (fail-open — allow ticket creation).
     """
     try:
-        from backend.api.agent_routes import _notion_headers, NOTION_API, _get_ticket_db_id
+        from backend.services.notion_service import _headers as _notion_headers, NOTION_API_URL as NOTION_API
+        from backend.api.agent_routes import _get_ticket_db_id
 
         db_id   = _get_ticket_db_id()
         headers = _notion_headers()

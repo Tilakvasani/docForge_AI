@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 import redis.asyncio as aioredis  # async Redis client
 
-logger = logging.getLogger(__name__)
+from backend.core.logger import logger
 
 # ─── TTL constants (seconds) ──────────────────────────────────────────────────
 TTL_DEPARTMENTS   = 3600          # 1 hour  — department list rarely changes
@@ -52,15 +52,17 @@ class RedisCache:
     def __init__(self):
         self._redis = None
         self._available = False
-        self._url = "redis://localhost:6379"
+        import os
+        self._url = os.environ.get("REDIS_URL", "redis://localhost:6379")
         self._last_fail_time = 0.0
 
-    async def connect(self, url: str = "redis://localhost:6379") -> bool:
+    async def connect(self, url: Optional[str] = None) -> bool:
         """
         Try to connect to Redis. Returns True if successful.
         App continues normally if this returns False.
         """
-        self._url = url
+        if url:
+            self._url = url
         try:
             client = aioredis.from_url(url, encoding="utf-8",
                                        decode_responses=True,
@@ -235,11 +237,11 @@ class RedisCache:
             return {"available": False}
         try:
             info = await self._redis.info("server")
-            dept_keys      = len(await self._redis.keys("docforge:departments*"))
-            section_keys   = len(await self._redis.keys("docforge:sections:*"))
-            question_keys  = len(await self._redis.keys("docforge:questions:*"))
-            content_keys   = len(await self._redis.keys("docforge:section:*"))
-            notion_keys    = len(await self._redis.keys("docforge:notion*"))
+            dept_keys      = len([k async for k in self._redis.scan_iter("docforge:departments*")])
+            section_keys   = len([k async for k in self._redis.scan_iter("docforge:sections:*")])
+            question_keys  = len([k async for k in self._redis.scan_iter("docforge:questions:*")])
+            content_keys   = len([k async for k in self._redis.scan_iter("docforge:section:*")])
+            notion_keys    = len([k async for k in self._redis.scan_iter("docforge:notion*")])
             return {
                 "available":       True,
                 "version":         info.get("redis_version", "?"),

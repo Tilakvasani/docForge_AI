@@ -13,7 +13,7 @@ try:
 except ImportError:
     DOCX_AVAILABLE = False
 
-API_URL = "http://localhost:8000/api"
+API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/") + "/api"
 
 st.set_page_config(
     page_title="DocForge AI",

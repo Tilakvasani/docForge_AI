@@ -35,6 +35,7 @@ class EditSectionRequest(BaseModel):
     gen_id: int
     sec_id: int
     section_name: str
+    doc_type: Optional[str] = None
     current_content: str
     edit_instruction: str
 

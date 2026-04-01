@@ -212,6 +212,7 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
     sec_id = await save_questions(
         doc_sec_id=req.doc_sec_id, doc_id=req.doc_id,
         section_name=sec_name, questions=questions,
+        section_type=sec_type
     )
 
     logger.info(f"[{sec_type.upper()}] {len(questions)} questions saved for '{sec_name}'")

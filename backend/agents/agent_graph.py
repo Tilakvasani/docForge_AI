@@ -48,7 +48,7 @@ from langgraph.graph import StateGraph, END, START
 # ── Internal ──────────────────────────────────────────────────────────────────
 from backend.services.redis_service import cache
 
-logger = logging.getLogger(__name__)
+from backend.core.logger import logger
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MEMORY_TTL         = 86400
@@ -65,8 +65,8 @@ KNOWN_DOCS = [
 
 # ── Multi-query split patterns ────────────────────────────────────────────────
 _MQ_SPLITTERS = [
-    " and also ", " and what ", " also what ", " also how ",
-    " also when ", " also where ", " also who ", " also which ",
+    " and also ", " and what ", " and how ", " and who ", " and where ", " and when ",
+    " also what ", " also how ", " also when ", " also where ", " also who ", " also which ",
     " additionally ", " furthermore ", " moreover ", " plus ",
     " as well as ", " along with ",
 ]
@@ -281,6 +281,28 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "multi_query",
+            "description": (
+                "Split a complex message into 2-5 independent sub-questions. "
+                "Use when the user asks multiple distinct things: "
+                "'What are the working hours? Also, how do I create a ticket?'"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sub_questions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of 2-5 simplified sub-questions",
+                    }
+                },
+                "required": ["sub_questions"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "cancel",
             "description": (
                 "Cancel the current ticket flow. "
@@ -305,6 +327,7 @@ TOOL SELECTION RULES
   search        → specific facts, yes/no, lists, how/why/who/what/where
   compare       → exactly 2 named documents: "compare NDA vs SOW"
   multi_compare → 3+ named documents at once
+  multi_query   → 2+ distinct questions: "What is X? Also, how is Y?"
   analyze       → audit / gap / contradiction / risk questions
   summarize     → "summarize", "overview of", "key points", "TL;DR"
   full_doc      → "full contract", "entire NDA", "complete handbook"
@@ -673,7 +696,7 @@ async def _exec_create_all_tickets(session_id: str) -> str:
 
 
 async def _exec_update_ticket(status: str, session_id: str, ticket_index: int = 0) -> str:
-    from backend.api.agent_routes import _notion_headers, NOTION_API
+    from backend.services.notion_service import _headers as _notion_headers, NOTION_API_URL as NOTION_API
     memory  = await _load_memory(session_id)
     tickets = memory.get("created_tickets", [])
     if not tickets and memory.get("last_page_id"):
@@ -996,6 +1019,37 @@ async def node_execute_tool(state: AgentState) -> AgentState:
                 int(tool_args.get("ticket_index", 0)),
             )
             result = {"tool_used": "update_ticket", "confidence": "high", "citations": [], "chunks": []}
+
+        elif tool_name == "multi_query":
+            sub_qs  = tool_args.get("sub_questions", [])
+            doc_a   = state.get("doc_a", "")
+            doc_b   = state.get("doc_b", "")
+            doc_list= state.get("doc_list")
+            
+            async def _run_one_sub(q: str, inherit: bool) -> dict:
+                # Recursive sub-state (is_multi=False to prevent infinite loop)
+                sub: AgentState = {
+                    "question": q, "session_id": session_id,
+                    "doc_a": doc_a if inherit else "", "doc_b": doc_b if inherit else "",
+                    "doc_list": doc_list if inherit else None,
+                    "history": state.get("history", []), "memory": state.get("memory", {}),
+                    "tool_name": "", "tool_args": {}, "result": {}, "reply": "",
+                    "is_multi": False, "sub_questions": [], "sub_results": [],
+                }
+                sub = await node_route(sub)
+                sub = await node_execute_tool(sub)
+                return sub.get("result", {})
+
+            # Run in parallel
+            coros = [_run_one_sub(sub_qs[0], True)] + [_run_one_sub(q, False) for q in sub_qs[1:]]
+            raw_res = await asyncio.gather(*coros, return_exceptions=True)
+            
+            sub_results = [
+                (r if not isinstance(r, Exception) else {"answer": "Error", "chunks": [], "citations": []})
+                for r in raw_res
+            ]
+            result = _merge_multi_results(sub_qs, sub_results)
+            reply  = result["answer"]
 
         elif tool_name == "cancel":
             reply  = await _exec_cancel(session_id)

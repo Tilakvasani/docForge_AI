@@ -239,7 +239,8 @@ async def update_ticket(req: TicketUpdateRequest):
                 )
                 resp.raise_for_status()
                 for p in resp.json().get("results", []):
-                    if p["id"].replace("-", "")[:8].upper() == req.ticket_id:
+                    t_data = _page_to_ticket(p)
+                    if t_data.get("ticket_id") == req.ticket_id:
                         page_id = p["id"]
                         break
 
@@ -383,15 +384,4 @@ async def create_ticket(req: TicketCreateRequest):
         logger.error("create_ticket error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── DELETE /api/agent/dedup/flush (admin) ────────────────────────────────────
-
-@router.delete("/dedup/flush")
-async def flush_dedup():
-    """Clear the duplicate-detection cache (exact hashes + embeddings)."""
-    try:
-        from backend.rag.ticket_dedup import flush_dedup_cache
-        await flush_dedup_cache()
-        return {"success": True, "message": "Dedup cache flushed."}
-    except Exception as e:
-        logger.error("flush_dedup error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+# End of agent_routes.py

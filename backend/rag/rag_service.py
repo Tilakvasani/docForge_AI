@@ -651,14 +651,16 @@ async def tool_search(question: str, filters: dict,
             "tool_used":  "search",
             "confidence": "low",
         }
-        # Cache not-found answers with a shorter TTL (10 min) so they refresh
-        # if docs are ingested later
-        await cache.set(a_key, {k: v for k, v in result.items() if k != "chunks"}, ttl=600)
+        # ── FIX: Caching chunks even for not-found responses ──────────────────
+        # This ensures the "Show Sources" button appears even when we 
+        # fail to find a confident answer.
+        await cache.set(a_key, result, ttl=600)
         return result
 
-    answer  = _get_llm().invoke(
+    response = await _get_llm().ainvoke(
         ANSWER_PROMPT.format(history=history, context=context, question=question)
-    ).content.strip()
+    )
+    answer = response.content.strip()
     not_found = "could not find" in answer.lower()
     if not_found:
         # LLM said not found but we had chunks — return clean message
@@ -673,12 +675,11 @@ async def tool_search(question: str, filters: dict,
         "confidence": "low" if not_found else _confidence(chunks),
     }
 
-    # ── FIX: Write to Redis answer cache (exclude chunks — too large) ─────────
-    # chunks are excluded because they contain raw embeddings context;
-    # they are fetched fresh on cache-miss and not needed for the cached path.
-    cacheable = {k: v for k, v in result.items() if k != "chunks"}
+    # ── FIX: Write to Redis answer cache (include chunks for 'Show Sources') ─
+    # The 'Show Sources' button in the UI depends on having the 'chunks' key.
+    # We now cache the full result so repeated hits still show citations.
     ttl = 600 if not_found else TTL_ANSWER        # shorter TTL for not-found
-    await cache.set(a_key, cacheable, ttl=ttl)
+    await cache.set(a_key, result, ttl=ttl)
     logger.info("💾 [Cache SET] answer for %r (ttl=%ds)", question[:60], ttl)
 
     return result
@@ -695,7 +696,8 @@ async def tool_full_doc(question: str, filters: dict,
     context = _build_context(chunks)
     prompt  = ANSWER_PROMPT.format(
         history=history, context=context, question=question)
-    answer  = _get_llm().invoke(prompt).content.strip()
+    response = await _get_llm().ainvoke(prompt)
+    answer = response.content.strip()
     not_found = "could not find" in answer.lower()
     # node_save_history() in agent_graph handles history persistence
     return {
@@ -772,11 +774,12 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
     content_a = _build_context(chunks_a)
     content_b = _build_context(chunks_b)
 
-    raw = _get_llm().invoke(
+    response = await _get_llm().ainvoke(
         COMPARE_PROMPT.format(
             question=question, doc_a=doc_a, doc_b=doc_b,
             content_a=content_a, content_b=content_b)
-    ).content.strip()
+    )
+    raw = response.content.strip()
 
     def _extract(text, start_tag, end_tags):
         if start_tag not in text:
@@ -893,7 +896,8 @@ async def tool_multi_compare(
         doc_cells=doc_cells,
     )
 
-    raw = _get_llm().invoke(prompt).content.strip()
+    response = await _get_llm().ainvoke(prompt)
+    raw = response.content.strip()
 
     summary = ""
     if "SUMMARY:" in raw:
@@ -997,9 +1001,10 @@ async def tool_analysis(question: str, filters: dict,
     chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)
     context = _build_context(chunks[:20])
 
-    answer = _get_llm().invoke(
+    response = await _get_llm().ainvoke(
         ANALYSIS_PROMPT.format(context=context, question=question)
-    ).content.strip()
+    )
+    answer = response.content.strip()
 
     # node_save_history() in agent_graph handles history persistence
     return {

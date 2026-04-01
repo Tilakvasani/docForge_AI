@@ -97,6 +97,6 @@ def _setup_logging():
         logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
-_setup_logging()
+# _setup_logging() is now called by main.py lifespan
 
 logger = logging.getLogger("app")

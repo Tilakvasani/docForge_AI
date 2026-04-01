@@ -17,7 +17,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from backend.core.logger import logger
 
 # ── Path to labeled dataset ───────────────────────────────────────────────────
 QA_DATASET_PATH = Path(__file__).parent / "qa_dataset.json"
@@ -54,7 +54,7 @@ def _load_qa_dataset() -> dict:
         }
         logger.info("QA dataset loaded: %d pairs", len(_qa_map))
     except FileNotFoundError:
-        logger.warning("qa_dataset.json not found at %s", QA_DATASET_PATH)
+        logger.info("Optional qa_dataset.json not found — context_recall will be skipped.")
         _qa_map = {}
     except Exception as e:
         logger.warning("QA dataset load failed: %s", e)

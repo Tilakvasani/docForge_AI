@@ -31,6 +31,9 @@ async def lifespan(app: FastAPI):
     shutdown logic after yield. Replaces deprecated @app.on_event.
     """
     # ── Startup ───────────────────────────────────────────────────────────────
+    from backend.core.logger import _setup_logging
+    _setup_logging()
+    
     connected = await cache.connect(settings.REDIS_URL)
     if connected:
         logger.info("✅ Redis ready — deduplication and caching active")

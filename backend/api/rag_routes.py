@@ -130,27 +130,7 @@ class AskRequest(BaseModel):
         return q
 
 
-# ── Multi-question splitting ───────────────────────────────────────────────────
-
-def _split_questions(text: str) -> list[str]:
-    """
-    Split user input into individual questions (max 5).
-    "who is tilak? who is gujar?" → ["who is tilak?", "who is gujar?"]
-    "1. who is tilak 2. who is gujar" → ["who is tilak", "who is gujar"]
-    """
-    text = text.strip()
-
-    numbered = re.findall(r'\d+[\.\\)]\s*(.+?)(?=\s*\d+[\.\\)]|$)', text, re.DOTALL)
-    if len(numbered) > 1:
-        return [q.strip() for q in numbered if len(q.strip()) > 3][:5]
-
-    if text.count("?") > 1:
-        parts = re.split(r'(?<=\?)', text)
-        questions = [p.strip() for p in parts if p.strip() and len(p.strip()) > 3]
-        if len(questions) > 1:
-            return questions[:5]
-
-    return [text]
+# ── Multi-question splitting handled by agent_graph ───────────────
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -206,56 +186,38 @@ async def api_ask(req: AskRequest):
     logger.info("🚀 [%s] /ask | session=%s | q=%r", request_id, req.session_id, question[:80])
 
     try:
-        questions = _split_questions(question)
-
-        if len(questions) == 1:
-            # Single question → ONE agent call
-            result = await run_agent(
-                question=question,
-                session_id=req.session_id,
-                doc_a=req.doc_a,
-                doc_b=req.doc_b,
-                doc_list=req.doc_list,
-            )
-        else:
-            # Multi-question: run agents in parallel (each gets its own call)
-            logger.info("🔀 [%s] Split into %d questions", request_id, len(questions))
-            tasks = [
-                run_agent(
-                    question=q,
-                    session_id=req.session_id,
-                    doc_a=req.doc_a,
-                    doc_b=req.doc_b,
-                    doc_list=req.doc_list,
-                )
-                for q in questions
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Merge answers from all questions
-            parts      = []
-            citations  = []
-            confidence = "high"
-            for q, r in zip(questions, results):
-                if isinstance(r, Exception):
-                    logger.warning("⚠️ Sub-agent error for '%s': %s", q[:40], r)
-                    confidence = "low"
-                    continue
-                parts.append(f"**Q: {q}**\n\n{r.get('answer', '')}")
-                citations.extend(r.get("citations", []))
-                if r.get("confidence") == "low":
-                    confidence = "low"
-
-            result = {
-                "answer":     "\n\n---\n\n".join(parts),
-                "citations":  citations,
-                "chunks":     [],
-                "tool_used":  "search",
-                "confidence": confidence,
-                "intent":     "multi_question",
-            }
+        from backend.rag.rag_service import _answer_key
+        
+        # ── Early Fast-Path Cache Check ───────────────────────────────────────
+        a_key = _answer_key(question, {})
+        if not getattr(req, "skip_cache", False):
+            hit = await cache.get(a_key)
+            if hit:
+                logger.info("⚡ [%s] Fast-path Cache HIT for query", request_id)
+                await _save_turn(req.session_id, question, hit.get("answer", ""))
+                
+                # Standardize return dictionary
+                hit["run_id"]      = request_id
+                hit["tool_used"]   = hit.get("tool_used", "search")
+                hit["agent_reply"] = ""
+                return hit
+                
+        # Pass the full question to the agent graph, which will split it if needed.
+        result = await run_agent(
+            question=question,
+            session_id=req.session_id,
+            doc_a=req.doc_a,
+            doc_b=req.doc_b,
+            doc_list=req.doc_list,
+        )
 
         logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
+        
+        # ── Global Result Cache Save ──────────────────────────────────────────
+        # We now save the entire result (including chunks) so that 
+        # the "Show Sources" button works on repeat hits.
+        await cache.set(a_key, result, ttl=3600)
+        
         return result
 
     except HTTPException:
@@ -360,10 +322,12 @@ async def api_eval(req: EvalRequest):
             "scores":    ragas_scores,
             "error":     ragas_error,
         }
-        await cache.set(f"ragas:runs:{request_id}", run_snapshot, ttl=604800)
+        if not await cache.set(f"ragas:runs:{request_id}", run_snapshot, ttl=604800):
+            logger.warning(f"Cache write failed for ragas:runs:{request_id}")
         all_runs = await cache.get("ragas:run_index") or []
         all_runs.insert(0, {"run_id": request_id, "timestamp": run_snapshot["timestamp"], "question": req.question})
-        await cache.set("ragas:run_index", all_runs[:50], ttl=604800)
+        if not await cache.set("ragas:run_index", all_runs[:50], ttl=604800):
+            logger.warning("Cache write failed for ragas:run_index")
         logger.info("💾 [%s] Eval run stored (scores=%s)", request_id, ragas_scores is not None)
 
         return {**rag_result, "ragas_scores": ragas_scores, "ragas_error": ragas_error, "run_id": request_id}
