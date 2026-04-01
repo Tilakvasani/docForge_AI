@@ -24,15 +24,15 @@ _LEVEL_EMOJI = {
 
 # Shorten noisy module names for cleaner output
 _MODULE_ALIASES = {
-    "backend.agents.agent_graph":   "agent",
-    "backend.api.agent_routes":    "routes",
-    "backend.rag.rag_service":      "rag",
-    "backend.api.rag_routes":       "rag_api",
-    "backend.rag.ticket_dedup":     "dedup",
-    "backend.rag.ragas_scorer":     "ragas",
-    "backend.rag.ingest_service":    "ingest",
+    "backend.agents.agent_graph":         "agent",
+    "backend.api.agent_routes":           "routes",
+    "backend.rag.rag_service":            "rag",
+    "backend.api.rag_routes":             "rag_api",
+    "backend.rag.ticket_dedup":           "dedup",
+    "backend.rag.ragas_scorer":           "ragas",
+    "backend.rag.ingest_service":         "ingest",
     "backend.services.redis_service":     "redis",
-    "backend.core.logger":               "core",
+    "backend.core.logger":                "core",
     "ai-doc-generator":                   "app",
     "uvicorn":                            "uvicorn",
     "uvicorn.error":                      "uvicorn",
@@ -84,9 +84,12 @@ def _setup_logging():
     root.handlers.clear()
     root.addHandler(handler)
 
-    # Quiet down noisy third-party loggers
-    for noisy in ("httpx", "httpcore", "chromadb", "openai", "langchain",
-                  "langchain_core", "langsmith", "urllib3", "asyncio"):
+    # FIX: removed "chromadb", "langchain", "langchain_core", "openai" from
+    # this silence list — they were hiding ChromaDB collection logs, embedding
+    # progress, and Azure OpenAI errors which made it impossible to debug
+    # the ingest pipeline.
+    # Only truly useless HTTP noise is silenced here.
+    for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "langsmith"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Uvicorn access log — very noisy, keep at WARNING unless DEBUG mode

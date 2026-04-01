@@ -23,17 +23,15 @@ import uuid
 from typing import Dict
 
 # ── Third-party ───────────────────────────────────────────────────────────────
-import chromadb
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 # ── Internal ──────────────────────────────────────────────────────────────────
 from backend.core.logger import logger
-from backend.core.config import settings
 from backend.services.redis_service import cache
 from backend.rag.rag_service import tool_search, _save_turn
 from backend.rag.ragas_scorer import score as ragas_score
-from backend.rag.ingest_service import COLLECTION_NAME, ingest_from_notion
+from backend.rag.ingest_service import COLLECTION_NAME, ingest_from_notion, _get_collection
 from backend.agents.agent_graph import run_agent
 
 router = APIRouter(prefix="/rag", tags=["RAG"])
@@ -259,8 +257,8 @@ async def api_ask(req: AskRequest):
 async def api_rag_status():
     """Return ChromaDB collection stats (chunk count, doc count, ingest lock status)."""
     try:
-        client       = chromadb.PersistentClient(path=settings.CHROMA_PATH)
-        collection   = client.get_or_create_collection(COLLECTION_NAME)
+        # FIX: reuse singleton — two PersistentClients on same path = file-lock crash
+        collection   = _get_collection()
         total_chunks = collection.count()
         meta   = await cache.get("docforge:rag:ingest_meta") or {}
         locked = await cache.exists("docforge:rag:ingest_lock")

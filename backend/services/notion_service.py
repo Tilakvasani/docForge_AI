@@ -42,13 +42,39 @@ DEPT_MAP = {
 }
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIX: TOKEN HELPER — tries NOTION_TOKEN first, then NOTION_API_KEY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_notion_token() -> str:
+    token = settings.NOTION_TOKEN or settings.NOTION_API_KEY
+    if not token:
+        raise ValueError("Notion token not set. Add NOTION_TOKEN=secret_xxx to your .env")
+    return token
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIX: DB ID HELPER — strips ?v=... view suffix from NOTION_DATABASE_ID
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_notion_db_id() -> str:
+    raw = settings.NOTION_DATABASE_ID or ""
+    if "notion.so/" in raw:
+        raw = raw.split("notion.so/")[-1]
+    db_id = raw.split("?")[0].strip().rstrip("/")
+    if not db_id:
+        raise ValueError("NOTION_DATABASE_ID is not set in your .env")
+    return db_id
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  NOTION HEADERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _headers() -> dict:
     return {
-        "Authorization": f"Bearer {settings.NOTION_API_KEY}",
+        "Authorization": f"Bearer {_get_notion_token()}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28",
     }
@@ -414,7 +440,7 @@ async def _get_next_version(dept: str, doc_type: str) -> int:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"{NOTION_API_URL}/databases/{settings.NOTION_DATABASE_ID}/query",
+                f"{NOTION_API_URL}/databases/{_get_notion_db_id()}/query",
                 headers=_headers(),
                 json=query,
             )
@@ -480,7 +506,7 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
     all_blocks = await _plain_text_to_blocks(request.gen_doc_full, meta_callout)
 
     payload = {
-        "parent":     {"database_id": settings.NOTION_DATABASE_ID},
+        "parent":     {"database_id": _get_notion_db_id()},
         "properties": {
             "Title":      {"title":     [{"text": {"content": title}}]},
             "Department": {"select":    {"name": dept}},
@@ -533,7 +559,7 @@ async def fetch_library_from_notion() -> list:
             if cursor:
                 body["start_cursor"] = cursor
             resp = await client.post(
-                f"{NOTION_API_URL}/databases/{settings.NOTION_DATABASE_ID}/query",
+                f"{NOTION_API_URL}/databases/{_get_notion_db_id()}/query",
                 headers=_headers(), json=body,
             )
             if resp.status_code != 200:

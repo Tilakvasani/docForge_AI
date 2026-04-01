@@ -41,7 +41,7 @@ COLLECTION_NAME   = "rag_chunks"
 CHUNK_SIZE        = 800     # target chars per chunk
 CHUNK_OVERLAP     = 150     # overlap between consecutive chunks
 MIN_CHUNK_LEN     = 40      # discard very short fragments (lowered from 80)
-BATCH_EMBED_SIZE  = 64      # embed N chunks per API call
+BATCH_EMBED_SIZE  = 16      # reduced from 64 — Azure times out on large batches
 INGEST_LOCK_KEY   = "docforge:rag:ingest_lock"
 INGEST_META_KEY   = "docforge:rag:ingest_meta"
 INGEST_LOCK_TTL   = 1800    # 30 min — prevent concurrent ingests
@@ -62,6 +62,8 @@ def _get_embedder():
             api_key=settings.AZURE_OPENAI_EMB_KEY,
             azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
             api_version=settings.AZURE_EMB_API_VERSION,
+            timeout=60,        # FIX: prevent silent hang on slow Azure response
+            max_retries=2,     # FIX: retry on transient errors instead of hanging
         )
     return _embedder_instance
 
@@ -428,8 +430,10 @@ def _embed_and_upsert(chunks_batch: list[dict], collection) -> int:
     embedder = _get_embedder()
     texts    = [c["text"] for c in chunks_batch]
 
+    logger.info("Embedding %d chunks via Azure OpenAI...", len(texts))
     try:
         embeddings = embedder.embed_documents(texts)
+        logger.info("Embedding done — got %d vectors", len(embeddings))
     except Exception as e:
         logger.error("Embedding failed for batch of %d: %s", len(texts), e)
         return 0
