@@ -14,9 +14,32 @@ All matched metrics run in parallel via asyncio.gather.
 import json
 import logging
 import asyncio
+import contextlib
+import importlib.metadata
+import io
+import os
 from pathlib import Path
 from typing import Optional
 
+from datasets import Dataset
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from ragas import evaluate as ragas_evaluate, EvaluationDataset
+from ragas.metrics import (
+    Faithfulness,
+    AnswerRelevancy,
+    ContextPrecision,
+    ContextRecall,
+)
+from ragas.metrics import (
+    faithfulness,
+    answer_relevancy,
+    context_precision,
+    context_recall,
+)
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+
+from backend.core.config import settings
 from backend.core.logger import logger
 
 # ── Path to labeled dataset ───────────────────────────────────────────────────
@@ -109,7 +132,7 @@ def _lookup_ground_truth(question: str) -> Optional[str]:
 def _get_ragas_version() -> tuple[int, int]:
     """Return (major, minor) of installed ragas package."""
     try:
-        import importlib.metadata
+        
         v = importlib.metadata.version("ragas")
         parts = v.split(".")
         return int(parts[0]), int(parts[1])
@@ -127,8 +150,7 @@ def _init_ragas() -> bool:
         return True
 
     try:
-        from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
-        from backend.core.config import settings
+
 
         major, minor = _get_ragas_version()
         logger.info("Detected RAGAS version %d.%d", major, minor)
@@ -149,14 +171,7 @@ def _init_ragas() -> bool:
 
         if major == 0 and minor >= 2:
             # ── RAGAS v0.2+ API ──────────────────────────────────────────────
-            from ragas.metrics import (
-                Faithfulness,
-                AnswerRelevancy,
-                ContextPrecision,
-                ContextRecall,
-            )
-            from ragas.llms import LangchainLLMWrapper
-            from ragas.embeddings import LangchainEmbeddingsWrapper
+
 
             _ragas_llm = LangchainLLMWrapper(judge_llm)
             _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
@@ -168,14 +183,7 @@ def _init_ragas() -> bool:
 
         else:
             # ── RAGAS v0.1 API ───────────────────────────────────────────────
-            from ragas.metrics import (
-                faithfulness,
-                answer_relevancy,
-                context_precision,
-                context_recall,
-            )
-            from ragas.llms import LangchainLLMWrapper
-            from ragas.embeddings import LangchainEmbeddingsWrapper
+
 
             _ragas_llm = LangchainLLMWrapper(judge_llm)
             _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
@@ -212,7 +220,6 @@ def _run_single_metric(metric, data) -> Optional[float]:
     For v0.2, `data` is already an EvaluationDataset built in score().
     For v0.1, `data` is a HuggingFace Dataset.
     """
-    import os
     os.environ["TQDM_DISABLE"] = "1"
 
     major, minor = _get_ragas_version()
@@ -221,9 +228,7 @@ def _run_single_metric(metric, data) -> Optional[float]:
     try:
         if major == 0 and minor >= 2:
             # v0.2+: data is already an EvaluationDataset — pass directly
-            from ragas import evaluate as ragas_evaluate
 
-            import contextlib, io
             with contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
                 result = ragas_evaluate(data, metrics=[metric])
@@ -246,8 +251,7 @@ def _run_single_metric(metric, data) -> Optional[float]:
 
         else:
             # v0.1: data is a HuggingFace Dataset
-            from ragas import evaluate
-            import contextlib, io
+
             with contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
                 result = evaluate(data, metrics=[metric])
@@ -310,7 +314,7 @@ async def score(
 
     if major == 0 and minor >= 2:
         # RAGAS v0.2+ — EvaluationDataset field names
-        from ragas import EvaluationDataset
+
 
         eval_no_gt = EvaluationDataset.from_list([{
             "user_input":         question,
@@ -329,7 +333,7 @@ async def score(
         data_with_gt = eval_with_gt
     else:
         # RAGAS v0.1 — HuggingFace Dataset field names
-        from datasets import Dataset
+
 
         data_no_gt = Dataset.from_dict({
             "question": [question],

@@ -26,6 +26,7 @@ import time
 from typing import Optional
 
 from backend.core.logger import logger
+from backend.rag.rag_service import _get_collection
 
 
 # ── Fallback doc list used when ChromaDB is unreachable ──────────────────────
@@ -61,7 +62,6 @@ async def _fetch_live_doc_list() -> list[str]:
         return _doc_cache
 
     try:
-        from backend.rag.rag_service import _get_collection
 
         collection = _get_collection()
         count      = collection.count()

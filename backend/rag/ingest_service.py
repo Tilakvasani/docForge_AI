@@ -33,6 +33,10 @@ import re
 import time
 from typing import Optional
 
+import chromadb
+from langchain_openai import AzureOpenAIEmbeddings
+from notion_client import Client
+
 from backend.core.config import settings
 from backend.core.logger import logger
 from backend.services.redis_service import cache
@@ -56,7 +60,6 @@ _collection_instance = None
 def _get_embedder():
     global _embedder_instance
     if _embedder_instance is None:
-        from langchain_openai import AzureOpenAIEmbeddings
         _embedder_instance = AzureOpenAIEmbeddings(
             azure_endpoint=settings.AZURE_EMB_ENDPOINT,
             api_key=settings.AZURE_OPENAI_EMB_KEY,
@@ -71,7 +74,6 @@ def _get_embedder():
 def _get_collection():
     global _collection_instance
     if _collection_instance is None:
-        import chromadb
         client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
         _collection_instance = client.get_or_create_collection(
             name=COLLECTION_NAME,
@@ -125,7 +127,6 @@ def _get_db_id() -> str:
 
 
 def _get_notion():
-    from notion_client import Client
     return Client(auth=_get_notion_token())
 
 

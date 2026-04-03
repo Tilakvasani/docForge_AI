@@ -49,6 +49,13 @@ from langgraph.graph import StateGraph, END, START
 from backend.services.redis_service import cache
 from backend.rag.system_prompt import build_system_prompt
 from backend.core.logger import logger
+from backend.rag.rag_service import (
+    _get_llm, tool_search, tool_compare, tool_multi_compare,
+    tool_analysis, tool_refine, tool_full_doc, _save_turn,
+)
+from backend.services.notion_service import _headers as _notion_headers, NOTION_API_URL as NOTION_API
+from backend.rag.ticket_dedup import find_duplicate
+from backend.api.agent_routes import _create_notion_ticket, TicketCreateRequest
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MEMORY_TTL         = 86400
@@ -469,7 +476,7 @@ async def _detect_priority_async(question: str) -> str:
     Falls back to keyword matching if LLM fails.
     """
     try:
-        from backend.rag.rag_service import _get_llm
+
         _priority_prompt = (
             f"Classify the urgency of this support question as HIGH or LOW.\n"
             f"HIGH = involves: security, legal risk, contract breach, unpaid salary, "
@@ -568,38 +575,31 @@ def _block_response(reason: str) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _exec_search(question: str, session_id: str) -> dict:
-    from backend.rag.rag_service import tool_search
     return await tool_search(question, {}, session_id)
 
 
 async def _exec_compare(doc_a: str, doc_b: str, question: str, session_id: str) -> dict:
-    from backend.rag.rag_service import tool_compare
     return await tool_compare(question, doc_a, doc_b, {}, session_id)
 
 
 async def _exec_multi_compare(doc_names: list, question: str, session_id: str) -> dict:
-    from backend.rag.rag_service import tool_multi_compare
     return await tool_multi_compare(question, doc_names, {}, session_id)
 
 
 async def _exec_analyze(question: str, session_id: str) -> dict:
-    from backend.rag.rag_service import tool_analysis
     return await tool_analysis(question, {}, session_id)
 
 
 async def _exec_summarize(doc_name: str, question: str, session_id: str) -> dict:
-    from backend.rag.rag_service import tool_refine
     q = f"{doc_name}: {question}" if doc_name else question
     return await tool_refine(q, {}, session_id)
 
 
 async def _exec_full_doc(question: str, session_id: str) -> dict:
-    from backend.rag.rag_service import tool_full_doc
     return await tool_full_doc(question, {}, session_id)
 
 
 async def _exec_block(reason: str, question: str, session_id: str) -> dict:
-    from backend.rag.rag_service import _save_turn
     msg, ticket_allowed = _block_response(reason)
     await _save_turn(session_id, question, msg)
     return {
@@ -713,7 +713,6 @@ async def _exec_create_all_tickets(session_id: str) -> str:
 
 
 async def _exec_update_ticket(status: str, session_id: str, ticket_index: int = 0) -> str:
-    from backend.services.notion_service import _headers as _notion_headers, NOTION_API_URL as NOTION_API
     memory  = await _load_memory(session_id)
     tickets = memory.get("created_tickets", [])
     if not tickets and memory.get("last_page_id"):
@@ -779,8 +778,6 @@ async def _exec_cancel(session_id: str) -> str:
 async def _make_ticket(
     question: str, session_id: str, memory: dict, ticket_id: str = None
 ) -> tuple:
-    from backend.rag.ticket_dedup import find_duplicate
-    from backend.api.agent_routes import _create_notion_ticket, TicketCreateRequest
     dup = await find_duplicate(question)
     if dup:
         tid = dup["ticket_id"]
@@ -838,7 +835,7 @@ async def node_route(state: AgentState) -> AgentState:
     Node 3b: Single LLM call that selects ONE tool.
     Populates state.tool_name and state.tool_args.
     """
-    from backend.rag.rag_service import _get_llm
+
 
     question = state["question"]
     history  = state.get("history", [])

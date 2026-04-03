@@ -19,6 +19,8 @@ Usage:
 """
 import json
 import logging
+import os
+import time
 from typing import Any, Optional
 
 import redis.asyncio as aioredis  # async Redis client
@@ -52,7 +54,6 @@ class RedisCache:
     def __init__(self):
         self._redis = None
         self._available = False
-        import os
         self._url = os.environ.get("REDIS_URL", "redis://localhost:6379")
         self._last_fail_time = 0.0
 
@@ -78,13 +79,12 @@ class RedisCache:
             return True
         except Exception as e:
             self._available = False
-            import time; self._last_fail_time = time.time()
+            self._last_fail_time = time.time()
             logger.warning("⚠️  Redis unavailable (%s) — running without cache", e)
             return False
 
     async def _try_reconnect(self) -> bool:
         """Auto-reconnect after cooldown period. Returns True if reconnected."""
-        import time
         if time.time() - self._last_fail_time < self._RECONNECT_COOLDOWN:
             return False
         logger.info("🔄 Redis auto-reconnect attempt...")
@@ -115,7 +115,7 @@ class RedisCache:
         except Exception as e:
             logger.warning("Redis GET error for %s: %s", key, e)
             if "Timeout" in str(e) or "Connection" in str(e):
-                import time; self._last_fail_time = time.time()
+                self._last_fail_time = time.time()
                 self._available = False
             return None
 
@@ -130,7 +130,7 @@ class RedisCache:
         except Exception as e:
             logger.warning("Redis SET error for %s: %s", key, e)
             if "Timeout" in str(e) or "Connection" in str(e):
-                import time; self._last_fail_time = time.time()
+                self._last_fail_time = time.time()
                 self._available = False
             return False
 
@@ -145,7 +145,7 @@ class RedisCache:
         except Exception as e:
             logger.warning("Redis DEL error for %s: %s", key, e)
             if "Timeout" in str(e) or "Connection" in str(e):
-                import time; self._last_fail_time = time.time()
+                self._last_fail_time = time.time()
                 self._available = False
             return False
 

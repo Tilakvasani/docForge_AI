@@ -19,9 +19,12 @@ from fastapi import FastAPI                          # Web framework
 from fastapi.middleware.cors import CORSMiddleware   # Allow cross-origin requests (Streamlit → backend)
 
 # ── Internal ──────────────────────────────────────────────────────────────────
-from backend.core.logger import logger               # Structured logger
+from backend.core.logger import logger, _setup_logging  # Structured logger
 from backend.services.redis_service import cache     # Redis client (dedup, caching, chat history)
 from backend.core.config import settings             # App settings loaded from .env
+from backend.api.routes import router as docforge_router
+from backend.api.rag_routes import router as rag_router
+from backend.api.agent_routes import router as agent_router
 
 
 @asynccontextmanager
@@ -31,7 +34,6 @@ async def lifespan(app: FastAPI):
     shutdown logic after yield. Replaces deprecated @app.on_event.
     """
     # ── Startup ───────────────────────────────────────────────────────────────
-    from backend.core.logger import _setup_logging
     _setup_logging()
     
     connected = await cache.connect(settings.REDIS_URL)
@@ -67,15 +69,12 @@ app.add_middleware(
 )
 
 # ── DocForge generation routes ─────────────────────────────────────────────────
-from backend.api.routes import router as docforge_router
 app.include_router(docforge_router, prefix="/api")
 
 # ── RAG routes (ingest, ask, status, eval, scores) ────────────────────────────
-from backend.api.rag_routes import router as rag_router
 app.include_router(rag_router, prefix="/api")
 
 # ── Agent routes (tickets, memory) ────────────────────────────────────────────
-from backend.api.agent_routes import router as agent_router
 app.include_router(agent_router, prefix="/api")
 
 

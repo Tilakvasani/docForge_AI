@@ -29,7 +29,7 @@ from pydantic import BaseModel
 # ── Internal ──────────────────────────────────────────────────────────────────
 from backend.core.logger import logger
 from backend.services.redis_service import cache
-from backend.rag.rag_service import tool_search, _save_turn
+from backend.rag.rag_service import tool_search, _save_turn, _answer_key
 from backend.rag.ragas_scorer import score as ragas_score
 from backend.rag.ingest_service import COLLECTION_NAME, ingest_from_notion, _get_collection
 from backend.agents.agent_graph import run_agent
@@ -186,8 +186,7 @@ async def api_ask(req: AskRequest):
     logger.info("🚀 [%s] /ask | session=%s | q=%r", request_id, req.session_id, question[:80])
 
     try:
-        from backend.rag.rag_service import _answer_key
-        
+
         # ── Early Fast-Path Cache Check ───────────────────────────────────────
         # Only allow fast-path for simple, single-sentence questions.
         # Bypass if it looks like a multi-query (conjunctions) or an action (ticket, create).

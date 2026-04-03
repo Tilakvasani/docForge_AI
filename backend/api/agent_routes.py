@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException  # FastAPI routing + error response
 from pydantic import BaseModel                 # Request/response schema validation
 
 # ── Internal ──────────────────────────────────────────────────────────────────
+from backend.core.config import settings       # App settings (.env)
 from backend.core.logger import logger         # Structured logger
 from backend.services.redis_service import cache  # Redis client for caching tickets
 
@@ -63,7 +64,7 @@ def _notion_headers() -> dict:
     Supports both NOTION_TOKEN and legacy NOTION_API_KEY env variable names.
     Raises ValueError if no token is found.
     """
-    from backend.core.config import settings  # lazy: avoids circular import on startup
+
     token = (
         getattr(settings, "NOTION_TOKEN", "")
         or getattr(settings, "NOTION_API_KEY", "")
@@ -81,7 +82,7 @@ def _notion_headers() -> dict:
 
 def _get_ticket_db_id() -> str:
     """Return the Notion database ID for support tickets (NOTION_TICKET_DB_ID), falling back to NOTION_DATABASE_ID."""
-    from backend.core.config import settings  # lazy: avoids circular import on startup
+
     return getattr(settings, "NOTION_TICKET_DB_ID", None) or settings.NOTION_DATABASE_ID
 
 
@@ -148,7 +149,6 @@ async def get_tickets():
         return {"tickets": cached, "source": "cache"}
 
     # If no dedicated ticket DB is configured, return empty gracefully
-    from backend.core.config import settings
     ticket_db_id = getattr(settings, "NOTION_TICKET_DB_ID", None)
     if not ticket_db_id:
         logger.info("NOTION_TICKET_DB_ID not set — returning empty ticket list")

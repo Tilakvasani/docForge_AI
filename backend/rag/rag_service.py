@@ -51,6 +51,10 @@ Redis fix (was broken in older version):
 import hashlib
 import json
 import asyncio
+
+import chromadb
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+
 from backend.core.config import settings
 from backend.core.logger import logger
 from backend.services.redis_service import cache
@@ -361,7 +365,6 @@ _collection_instance = None
 def _get_llm():
     global _llm_instance
     if _llm_instance is None:
-        from langchain_openai import AzureChatOpenAI
         _llm_instance = AzureChatOpenAI(
             azure_endpoint=settings.AZURE_LLM_ENDPOINT,
             api_key=settings.AZURE_OPENAI_LLM_KEY,
@@ -376,7 +379,6 @@ def _get_llm():
 def _get_embedder():
     global _embedder_instance
     if _embedder_instance is None:
-        from langchain_openai import AzureOpenAIEmbeddings
         _embedder_instance = AzureOpenAIEmbeddings(
             azure_endpoint=settings.AZURE_EMB_ENDPOINT,
             api_key=settings.AZURE_OPENAI_EMB_KEY,
@@ -389,7 +391,6 @@ def _get_embedder():
 def _get_collection():
     global _collection_instance
     if _collection_instance is None:
-        import chromadb
         client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
         _collection_instance = client.get_or_create_collection(
             name=COLLECTION_NAME,
