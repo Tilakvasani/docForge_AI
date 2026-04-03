@@ -786,7 +786,7 @@ if st.session_state.active_tab == "ask":
                     score   = info["score"]
                     page_id = info["page_id"]
                     section = info.get("section", "")
-                    url     = f"https://www.notion.so/{page_id}" if page_id else ""
+                    url     = f"https://www.notion.so/{page_id.replace('-', '')}" if page_id else ""
                     dot_col = "#22c55e" if score >= 0.6 else "#f59e0b" if score >= 0.4 else "#ef4444"
                     title_html = (
                         f'<a href="{url}" target="_blank" '

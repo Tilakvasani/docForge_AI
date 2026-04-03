@@ -38,9 +38,9 @@ from backend.core.logger import logger
 from backend.services.redis_service import cache
 
 COLLECTION_NAME   = "rag_chunks"
-CHUNK_SIZE        = 800     # target chars per chunk
-CHUNK_OVERLAP     = 150     # overlap between consecutive chunks
-MIN_CHUNK_LEN     = 40      # discard very short fragments (lowered from 80)
+CHUNK_SIZE        = 350     # target chars per chunk
+CHUNK_OVERLAP     = 100     # overlap between consecutive chunks
+MIN_CHUNK_LEN     = 50      # discard very short fragments (lowered from 80)
 BATCH_EMBED_SIZE  = 16      # reduced from 64 — Azure times out on large batches
 INGEST_LOCK_KEY   = "docforge:rag:ingest_lock"
 INGEST_META_KEY   = "docforge:rag:ingest_meta"

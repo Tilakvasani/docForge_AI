@@ -76,23 +76,16 @@ def _setup_logging():
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(_PrettyFormatter())
 
-    # Root logger — catches everything
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Remove any existing handlers (uvicorn adds its own on import)
-    root.handlers.clear()
-    root.addHandler(handler)
+    # FIX: use force=True instead of root.handlers.clear()
+    # clear() was crashing uvicorn SpawnProcess on Windows (Python 3.11)
+    logging.basicConfig(handlers=[handler], level=level, force=True)
 
-    # FIX: removed "chromadb", "langchain", "langchain_core", "openai" from
-    # this silence list — they were hiding ChromaDB collection logs, embedding
-    # progress, and Azure OpenAI errors which made it impossible to debug
-    # the ingest pipeline.
-    # Only truly useless HTTP noise is silenced here.
     for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "langsmith"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # Uvicorn access log — very noisy, keep at WARNING unless DEBUG mode
     if level > logging.DEBUG:
         logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 

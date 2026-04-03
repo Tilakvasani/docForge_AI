@@ -703,17 +703,60 @@ def _merge_multi_results(sub_questions: list, sub_results: list) -> dict:
 #  PRIORITY / BLOCK HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_HIGH_SIGNALS = [
-    "password", "login", "access denied", "blocked", "unauthorized",
-    "security", "breach", "data leak", "hacked", "legal", "lawsuit",
-    "compliance", "gdpr", "audit", "contract", "nda", "termination",
-    "salary", "payment", "payroll", "invoice", "not paid", "overdue",
-    "urgent", "asap", "critical", "emergency", "broken", "down", "outage",
-]
+# _HIGH_SIGNALS static list removed — priority is now determined dynamically by LLM.
+# See _detect_priority() below.
+
+async def _detect_priority_async(question: str) -> str:
+    """
+    Dynamically classify ticket priority using the LLM.
+    Replaces the static _HIGH_SIGNALS keyword list so any urgent/sensitive
+    topic is correctly flagged — not just hardcoded English keywords.
+    Falls back to keyword matching if LLM fails.
+    """
+    try:
+        from backend.rag.rag_service import _get_llm
+        _priority_prompt = (
+            f"Classify the urgency of this support question as HIGH or LOW.\n"
+            f"HIGH = involves: security, legal risk, contract breach, unpaid salary, "
+            f"data loss, system outage, compliance violation, termination, fraud, "
+            f"emergency, or anything blocking work.\n"
+            f"LOW = general policy questions, information lookup, HR procedures, "
+            f"document summaries, or non-blocking queries.\n"
+            f"Question: '{question}'\n"
+            f"Reply with ONLY the word HIGH or LOW."
+        )
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _get_llm().invoke(_priority_prompt).content.strip().upper()
+        )
+        priority = "High" if result.startswith("HIGH") else "Low"
+        logger.info("🎯 [Priority] LLM classified: %s for: %s", priority, question[:60])
+        return priority
+    except Exception as e:
+        logger.warning("Priority LLM failed: %s — keyword fallback", e)
+        _fallback_signals = [
+            "password", "login", "access denied", "blocked", "unauthorized",
+            "security", "breach", "data leak", "hacked", "legal", "lawsuit",
+            "compliance", "gdpr", "audit", "contract", "nda", "termination",
+            "salary", "payment", "payroll", "invoice", "not paid", "overdue",
+            "urgent", "asap", "critical", "emergency", "broken", "down", "outage",
+        ]
+        return "High" if any(s in question.lower() for s in _fallback_signals) else "Low"
 
 
 def _detect_priority(question: str) -> str:
-    return "High" if any(s in question.lower() for s in _HIGH_SIGNALS) else "Low"
+    """
+    Sync wrapper kept for backward compatibility.
+    Prefer _detect_priority_async() in async contexts.
+    Falls back to keyword matching directly (LLM not available synchronously here).
+    """
+    _fallback_signals = [
+        "password", "login", "access denied", "blocked", "unauthorized",
+        "security", "breach", "data leak", "hacked", "legal", "lawsuit",
+        "compliance", "gdpr", "audit", "contract", "nda", "termination",
+        "salary", "payment", "payroll", "invoice", "not paid", "overdue",
+        "urgent", "asap", "critical", "emergency", "broken", "down", "outage",
+    ]
+    return "High" if any(s in question.lower() for s in _fallback_signals) else "Low"
 
 _GREETING_MSG = (
     "Hi! I'm CiteRAG — Turabit's document assistant. "
@@ -988,7 +1031,7 @@ async def _make_ticket(
         tid = dup["ticket_id"]
         logger.info("🚫 Dedup blocked ticket=%s q='%s'", tid, question[:50])
         return f"🎫 Ticket already exists for: **{question}**", tid
-    priority  = _detect_priority(question)
+    priority  = await _detect_priority_async(question)
     user_name = memory.get("user_name", "Admin")
     industry  = memory.get("industry", "")
     user_info = f"{user_name} ({industry})" if industry else user_name

@@ -679,30 +679,227 @@ async def tool_search(question: str, filters: dict,
 
     chunks = await _retrieve(question, filters, top_k)
 
-    # ── HR policy second-pass ─────────────────────────────────────────────────
-    _hr_policy_signals = [
-        "leave", "policy", "handbook", "employee", "hr ", "salary",
-        "working hours", "holiday", "benefit", "attendance", "overtime",
-        "probation", "notice", "resignation", "reimbursement", "appraisal",
-    ]
-    q_lower = question.lower()
-    _is_hr_policy = any(sig in q_lower for sig in _hr_policy_signals)
+    # ══════════════════════════════════════════════════════════════════════════
+    #  DEPARTMENT SECOND-PASS
+    #  Fires when first-pass returns < 8 chunks AND the question matches
+    #  department-specific keywords. All departments run in parallel.
+    #  Each department adds up to 4 extra chunks per fallback query.
+    #
+    #  Departments covered:
+    #    HR         — leave, salary, appraisal, handbook, attendance, etc.
+    #    Legal      — contract, clause, NDA, termination, liability, etc.
+    #    Finance    — invoice, budget, tax, payroll, expense, payment, etc.
+    #    Sales      — CRM, pipeline, quota, deal, revenue, commission, etc.
+    #    IT         — system, software, access, security, infrastructure, etc.
+    #    Operations — vendor, SLA, procurement, delivery, process, audit, etc.
+    #    Marketing  — campaign, brand, content, SEO, lead, advertising, etc.
+    #    Customer Support — ticket, SLA, escalation, refund, complaint, etc.
+    #    Product    — roadmap, feature, sprint, release, backlog, etc.
+    #    Procurement — purchase order, supplier, RFQ, sourcing, bid, etc.
+    # ══════════════════════════════════════════════════════════════════════════
 
-    if _is_hr_policy:
-        _hr_fallback_queries = [
-            f"{question} employee handbook turabit policy",
-            f"{question} HR policy leave entitlement days",
-            f"{question} employment contract terms conditions",
-        ]
+    q_lower = question.lower()
+
+    # ── Department keyword maps ───────────────────────────────────────────────
+    _DEPT_SIGNALS = {
+        "HR": [
+            "leave policy", "leave balance", "leave encashment",
+            "leave entitlement", "sick leave", "casual leave",
+            "maternity leave", "paternity leave", "annual leave",
+            "salary structure", "salary slip", "salary revision",
+            "notice period", "resignation process", "exit process",
+            "probation period", "probation review",
+            "appraisal cycle", "performance review",
+            "employee handbook", "hr policy",
+            "working hours", "overtime pay", "attendance policy",
+            "reimbursement claim", "travel reimbursement",
+            "employee benefit", "gratuity", "pf ", "provident fund",
+            "offer letter", "joining formality",
+        ],
+        "Legal": [
+            "termination clause", "notice clause", "exit clause",
+            "liability clause", "indemnity clause", "penalty clause",
+            "confidentiality clause", "non-disclosure", "nda",
+            "intellectual property", "ip rights", "ip ownership",
+            "governing law", "jurisdiction", "dispute resolution",
+            "force majeure", "breach of contract", "remedy",
+            "non-compete", "non-solicitation",
+            "contract terms", "contract period", "agreement terms",
+            "legal obligation", "compliance requirement",
+            "arbitration", "mediation", "litigation",
+        ],
+        "Finance": [
+            "invoice", "billing", "payment terms", "payment schedule",
+            "budget", "budget allocation", "cost centre",
+            "tax", "gst", "tds", "withholding tax",
+            "payroll", "payroll cycle", "salary disbursement",
+            "expense claim", "expense reimbursement",
+            "purchase order", "po approval",
+            "financial report", "balance sheet", "profit loss",
+            "accounts payable", "accounts receivable",
+            "revenue recognition", "deferred revenue",
+            "audit", "financial audit", "internal audit",
+            "forex", "currency", "exchange rate",
+        ],
+        "Sales": [
+            "sales contract", "sales agreement", "sales policy",
+            "commission", "incentive structure", "variable pay",
+            "quota", "sales target", "revenue target",
+            "deal approval", "discount approval", "pricing policy",
+            "crm", "pipeline", "lead", "opportunity",
+            "customer agreement", "client contract",
+            "renewal", "upsell", "cross-sell",
+            "sales process", "sales cycle", "deal stage",
+            "territory", "account management",
+        ],
+        "IT": [
+            "system access", "access control", "user access",
+            "software license", "license agreement",
+            "data security", "information security", "cybersecurity",
+            "it policy", "acceptable use policy",
+            "infrastructure", "cloud", "server", "network",
+            "password policy", "mfa", "two-factor",
+            "data backup", "disaster recovery", "business continuity",
+            "it support", "helpdesk", "ticket system",
+            "software development", "deployment", "release process",
+            "api", "integration", "system architecture",
+        ],
+        "Operations": [
+            "vendor management", "vendor agreement", "vendor policy",
+            "sla", "service level agreement", "service level",
+            "procurement process", "sourcing process",
+            "delivery schedule", "logistics", "supply chain",
+            "quality control", "quality assurance", "qc process",
+            "operational process", "standard operating procedure", "sop",
+            "facility management", "office policy",
+            "asset management", "inventory",
+            "outsourcing", "third party",
+        ],
+        "Marketing": [
+            "marketing campaign", "campaign policy",
+            "brand guideline", "brand policy", "brand identity",
+            "content policy", "social media policy",
+            "advertising", "ad spend", "marketing budget",
+            "seo", "digital marketing", "email marketing",
+            "lead generation", "demand generation",
+            "marketing approval", "creative approval",
+            "event", "sponsorship", "pr policy",
+            "press release", "media policy",
+        ],
+        "Customer Support": [
+            "support ticket", "customer complaint", "complaint process",
+            "escalation policy", "escalation process",
+            "refund policy", "return policy", "cancellation policy",
+            "customer sla", "response time", "resolution time",
+            "support process", "support policy",
+            "customer satisfaction", "csat", "nps",
+            "warranty", "service warranty",
+            "knowledge base", "faq policy",
+        ],
+        "Product": [
+            "product roadmap", "feature request", "feature prioritization",
+            "sprint", "sprint planning", "backlog",
+            "release", "release process", "release notes",
+            "product policy", "product requirement",
+            "user story", "acceptance criteria",
+            "product launch", "go to market", "gtm",
+            "beta", "pilot", "mvp",
+            "product feedback", "user feedback",
+        ],
+        "Procurement": [
+            "purchase order", "po process", "po approval",
+            "supplier", "vendor selection", "vendor evaluation",
+            "rfq", "rfp", "request for proposal", "request for quotation",
+            "sourcing", "bid", "tender",
+            "contract award", "supplier contract",
+            "procurement policy", "buying policy",
+            "approved vendor list", "preferred supplier",
+            "goods receipt", "delivery terms", "incoterms",
+        ],
+    }
+
+    # ── Fallback query templates per department ───────────────────────────────
+    _DEPT_FALLBACK_TEMPLATES = {
+        "HR": [
+            "{q} employee handbook turabit HR policy",
+            "{q} leave entitlement salary employment terms",
+            "{q} resignation notice period probation appraisal",
+        ],
+        "Legal": [
+            "{q} contract clause legal terms obligations",
+            "{q} NDA non-disclosure agreement termination liability",
+            "{q} governing law jurisdiction dispute resolution indemnity",
+        ],
+        "Finance": [
+            "{q} invoice payment tax financial policy",
+            "{q} budget expense reimbursement payroll audit",
+            "{q} accounts billing purchase order finance procedure",
+        ],
+        "Sales": [
+            "{q} sales contract commission incentive policy",
+            "{q} deal approval pricing discount revenue target",
+            "{q} customer agreement renewal sales process",
+        ],
+        "IT": [
+            "{q} IT policy system access software license security",
+            "{q} data security infrastructure acceptable use",
+            "{q} helpdesk support deployment release process",
+        ],
+        "Operations": [
+            "{q} vendor SLA service level operational process",
+            "{q} procurement sourcing supply chain delivery",
+            "{q} standard operating procedure quality control",
+        ],
+        "Marketing": [
+            "{q} marketing policy brand guideline campaign approval",
+            "{q} content social media advertising spend",
+            "{q} digital marketing lead generation event sponsorship",
+        ],
+        "Customer Support": [
+            "{q} support policy escalation refund complaint process",
+            "{q} customer SLA response resolution time warranty",
+            "{q} ticket handling satisfaction feedback",
+        ],
+        "Product": [
+            "{q} product roadmap feature release sprint backlog",
+            "{q} product requirement user story acceptance criteria",
+            "{q} launch go-to-market feedback prioritization",
+        ],
+        "Procurement": [
+            "{q} purchase order supplier procurement policy",
+            "{q} RFQ RFP bid tender vendor selection contract award",
+            "{q} sourcing approved vendor delivery terms",
+        ],
+    }
+
+    # ── Detect which departments match this question ──────────────────────────
+    matched_depts = [
+        dept for dept, signals in _DEPT_SIGNALS.items()
+        if any(sig in q_lower for sig in signals)
+    ]
+
+    # ── Run second-pass only when first-pass is thin AND dept matched ─────────
+    if matched_depts and len(chunks) < 8:
         seen       = {c["notion_page_id"] + c["heading"] for c in chunks}
         embedder   = _get_embedder()
         collection = _get_collection()
-        # PERF: run HR fallback queries in parallel
-        hr_results = await asyncio.gather(
-            *[_retrieve_single(fq, {}, 4, embedder, collection) for fq in _hr_fallback_queries],
+
+        # Build all fallback queries for all matched departments
+        all_fallback_queries = []
+        for dept in matched_depts:
+            templates = _DEPT_FALLBACK_TEMPLATES.get(dept, [])
+            for tmpl in templates:
+                all_fallback_queries.append(tmpl.format(q=question))
+
+        # Run all queries in parallel
+        dept_results = await asyncio.gather(
+            *[_retrieve_single(fq, {}, 4, embedder, collection)
+              for fq in all_fallback_queries],
             return_exceptions=True,
         )
-        for extras in hr_results:
+
+        added = 0
+        for extras in dept_results:
             if isinstance(extras, Exception):
                 continue
             for c in extras:
@@ -710,9 +907,14 @@ async def tool_search(question: str, filters: dict,
                 if uid not in seen:
                     seen.add(uid)
                     chunks.append(c)
+                    added += 1
+
         chunks = sorted(chunks, key=lambda x: x["score"], reverse=True)[:top_k + 4]
-        logger.info("HR second-pass: now %d chunks from %d docs",
-                    len(chunks), len({c["doc_title"] for c in chunks}))
+        logger.info(
+            "Dept second-pass [%s]: +%d chunks → now %d chunks from %d docs",
+            ", ".join(matched_depts), added,
+            len(chunks), len({c["doc_title"] for c in chunks}),
+        )
 
     # ── Build context + fetch history in parallel ─────────────────────────────
     context = _build_context(chunks)
