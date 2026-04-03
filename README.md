@@ -43,7 +43,7 @@ A second major subsystem — **CiteRAG** — is a tool-calling conversational RA
 
 ### Document Generation
 - AI-powered generation via Azure OpenAI (GPT-4.1 Mini)
-- 13 document types — NDA, Privacy Policy, SLA, Employment Contract, and more
+- 100 document types — NDA, Privacy Policy, SLA, Employment Contract, and more
 - Multi-department support — HR, Finance, Legal, Sales, IT, Operations, and more
 - One-click Notion publishing with full metadata (title, type, department, version, word count)
 - Automatic version control — same Department + Doc Type increments automatically
