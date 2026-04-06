@@ -23,7 +23,9 @@ import uuid
 from typing import Dict
 
 # ── Third-party ───────────────────────────────────────────────────────────────
+import json
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ── Internal ──────────────────────────────────────────────────────────────────
@@ -37,18 +39,22 @@ from backend.agents.agent_graph import run_agent
 router = APIRouter(prefix="/rag", tags=["RAG"])
 
 
+from typing import Dict, List, Optional
+from pydantic import BaseModel
+
 class IngestRequest(BaseModel):
     force: bool = False
 
 
 class AskRequest(BaseModel):
-    question:   str
-    filters:    Dict[str, str] = {}
-    session_id: str = "default"
-    top_k:      int = 5
-    doc_a:      str = ""
-    doc_b:      str = ""
-    doc_list:   list[str] = []   # for multi-doc compare (3+ documents)
+    question:       str
+    filters:        Dict[str, str] = {}
+    session_id:     str = "default"
+    top_k:          int = 5
+    doc_a:          str = ""
+    doc_b:          str = ""
+    doc_list:       list[str] = []   # for multi-doc compare (3+ documents)
+    stream:         bool = False
 
     def sanitized_question(self) -> str:
         """Strip whitespace, collapse internal whitespace, cap at 2000 chars.
@@ -137,11 +143,27 @@ class AskRequest(BaseModel):
 
 @router.post("/ingest")
 async def api_ingest(req: IngestRequest):
-    """Trigger Notion → ChromaDB ingest pipeline. Pass force=True to re-ingest all pages."""
+    """Trigger Notion → ChromaDB ingest pipeline.
+    
+    Smart auto-detect:
+      - If ChromaDB has 0 chunks → auto-force ingest (first time)
+      - If chunks exist → respect the force flag (default=False skips, True re-ingests)
+    """
     try:
-        result  = await ingest_from_notion(force=req.force)
+        # Auto-detect: if no chunks exist, force ingest automatically
+        collection = _get_collection()
+        chunk_count = collection.count()
+        auto_force = req.force
+        if chunk_count == 0:
+            logger.info("📦 [Ingest] No chunks found in ChromaDB — auto-forcing ingest")
+            auto_force = True
+        else:
+            logger.info("📦 [Ingest] %d chunks already in ChromaDB (force=%s)", chunk_count, req.force)
+        
+        result  = await ingest_from_notion(force=auto_force)
         flushed = await cache.flush_pattern("docforge:rag:answer:*")
         logger.info("🧹 [Cache] Flushed after ingest (%d keys)", flushed)
+        result["existing_chunks"] = chunk_count
         return result
     except Exception as e:
         logger.error("❌ [Ingest] Error: %s", e)
@@ -204,17 +226,52 @@ async def api_ask(req: AskRequest):
                 hit["run_id"]      = request_id
                 hit["tool_used"]   = hit.get("tool_used", "search")
                 hit["agent_reply"] = ""
+                
+                if getattr(req, "stream", False):
+                    async def cache_streamer():
+                        yield json.dumps({"type": "token", "content": hit.get("answer", "")}) + "\n"
+                        yield json.dumps({"type": "done", "result": hit}) + "\n"
+                    return StreamingResponse(cache_streamer(), media_type="application/x-ndjson")
                 return hit
         elif _complex:
             logger.info("⏩ [%s] Fast-path bypass: complex query detected", request_id)
+
+        if getattr(req, "stream", False):
+            stream_queue = asyncio.Queue()
+            
+            async def streaming_generator():
+                task = asyncio.create_task(run_agent(
+                    question=question,
+                    session_id=req.session_id,
+                    doc_a=req.doc_a,
+                    doc_b=req.doc_b,
+                    doc_list=req.doc_list,
+                    stream_queue=stream_queue
+                ))
                 
+                while True:
+                    if task.done() and stream_queue.empty():
+                        result = task.result()
+                        logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
+                        await cache.set(a_key, result, ttl=3600)
+                        yield json.dumps({"type": "done", "result": result}) + "\n"
+                        break
+                        
+                    try:
+                        item = await asyncio.wait_for(stream_queue.get(), timeout=0.1)
+                        yield json.dumps(item) + "\n"
+                    except asyncio.TimeoutError:
+                        continue
+                        
+            return StreamingResponse(streaming_generator(), media_type="application/x-ndjson")
+            
         # Pass the full question to the agent graph, which will split it if needed.
         result = await run_agent(
             question=question,
             session_id=req.session_id,
             doc_a=req.doc_a,
             doc_b=req.doc_b,
-            doc_list=req.doc_list,
+            doc_list=req.doc_list
         )
 
         logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))

@@ -44,6 +44,7 @@ class TicketCreateRequest(BaseModel):
     confidence:        str = "low"
     user_info:         str = "Admin"
     ticket_id:         Optional[str] = None  # Manual override (e.g. 33312206)
+    raw_chunks:        list = []
 
 
 class MemorySaveRequest(BaseModel):
@@ -336,11 +337,39 @@ async def _create_notion_ticket(req: "TicketCreateRequest") -> dict:
         "rich_text": [{"type": "text", "text": {"content": str(ticket_id)}}]
     }
 
+    payload = {"parent": {"database_id": db_id}, "properties": properties}
+    
+    # ── Render chunks as blocks ──────────────────────────────────────────────
+    if req.raw_chunks:
+        children = []
+        children.append({
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": "Attempted Context (Snippets)"}}]
+            }
+        })
+        for c in req.raw_chunks[:5]:
+            doc_id = c.get("doc_id", "Unknown")
+            text = c.get("text", "")[:1500]
+            children.append({
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": [
+                        {"type": "text", "text": {"content": f"Source: {doc_id}\n\n", "annotations": {"bold": True}}},
+                        {"type": "text", "text": {"content": text}}
+                    ],
+                    "icon": {"type": "emoji", "emoji": "📄"}
+                }
+            })
+        payload["children"] = children
+
     async with _httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{NOTION_API}/pages",
             headers=headers,
-            json={"parent": {"database_id": db_id}, "properties": properties},
+            json=payload,
         )
     resp.raise_for_status()
     page = resp.json()

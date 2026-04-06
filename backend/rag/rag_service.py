@@ -50,6 +50,7 @@ Redis fix (was broken in older version):
 
 import hashlib
 import json
+import re
 import asyncio
 
 import chromadb
@@ -93,15 +94,18 @@ ANSWER RULES — follow every rule strictly:
      context, even if it is incomplete or indirect.
 
 2. FORMAT BY QUESTION TYPE
-   Single fact  → 1-2 sentences with the exact value + [Document § Section]
-   What/How/Why → 2-4 sentences with key facts and inline citations
-   List / Steps → numbered list, one citation per item — never as inline prose
+   Single fact  → 1-2 sentences with the exact value
+   What/How/Why → 2-4 sentences with key facts
+   List / Steps → numbered list — never as inline prose
    Yes / No     → start with YES or NO, then 1-2 supporting sentences
    Person lookup→ state their name, role, department, and any details present
 
-3. CITATIONS — MANDATORY
-   - After each key fact write the source in brackets: [Employee Handbook § Leave Policy]
-   - Never skip citations when the source is identifiable from the context.
+3. TABLES — REPRODUCE EXACTLY
+   - If the context contains a markdown table (rows with | pipes |), you MUST
+     reproduce the FULL table in your answer — do not summarize or omit rows.
+   - Keep all columns, headers, and data exactly as they appear.
+   - If the user asks for a table, section, or schedule, prioritize showing
+     the raw table data from the context.
 
 4. EXACT VALUES
    - Always include exact numbers, dates, names, percentages, durations from context.
@@ -510,15 +514,73 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
     embedder   = _get_embedder()
     collection = _get_collection()
 
+    # Step 0: Section/clause number detection — boost retrieval for numeric references
+    # Queries like "section 27", "clause 5.2", "article 3" don't embed well,
+    # so we also do a direct text search in chunk content for the exact reference.
+    _section_pattern = re.compile(
+        r'\b(section|clause|article|para|paragraph|schedule|annexure|appendix)'
+        r'\s*[\-–—]?\s*(\d+(?:\.\d+)*)\b',
+        re.IGNORECASE,
+    )
+    _section_match = _section_pattern.search(query)
+    section_boost_chunks: list = []
+    if _section_match:
+        sec_label = _section_match.group(1)  # e.g. "section"
+        sec_num   = _section_match.group(2)  # e.g. "27"
+        sec_ref   = f"{sec_label} {sec_num}"  # e.g. "section 27"
+        logger.info("📑 [Section Boost] Detected reference: '%s'", sec_ref)
+        # Search ChromaDB with a larger pool and filter by content containing the reference
+        try:
+            count = collection.count()
+            if count > 0:
+                broad_results = collection.get(
+                    include=["documents", "metadatas"],
+                    limit=min(count, 200),
+                )
+                docs = broad_results.get("documents", [])
+                metas = broad_results.get("metadatas", [])
+                for doc_text, meta in zip(docs, metas):
+                    # Check if this chunk's content or heading contains the section reference
+                    text_lower = doc_text.lower()
+                    heading_lower = (meta.get("heading", "") or "").lower()
+                    if sec_ref.lower() in text_lower or sec_ref.lower() in heading_lower:
+                        section_boost_chunks.append({
+                            "score":          0.85,  # High synthetic score — exact match
+                            "notion_page_id": meta.get("notion_page_id", ""),
+                            "doc_title":      meta.get("doc_title", ""),
+                            "doc_type":       meta.get("doc_type", ""),
+                            "department":     meta.get("department", ""),
+                            "version":        meta.get("version", ""),
+                            "heading":        meta.get("heading", ""),
+                            "content":        doc_text,
+                            "citation":       meta.get("citation", ""),
+                        })
+                if section_boost_chunks:
+                    logger.info("📑 [Section Boost] Found %d chunks containing '%s'",
+                                len(section_boost_chunks), sec_ref)
+        except Exception as e:
+            logger.warning("📑 [Section Boost] Failed: %s", e)
+
     # Step 1: search with original query
     all_chunks = await _retrieve_single(query, filters, top_k, embedder, collection)
+
+    # Merge section-boost chunks (prioritized) with embedding results
+    if section_boost_chunks:
+        seen_ids = {c["notion_page_id"] + c["heading"] for c in all_chunks}
+        for c in section_boost_chunks:
+            uid = c["notion_page_id"] + c["heading"]
+            if uid not in seen_ids:
+                seen_ids.add(uid)
+                all_chunks.insert(0, c)  # Insert at front for priority
 
     # Step 2: expand query with synonyms (only if original returns < 5 results)
     if len(all_chunks) < 5:
         try:
-            expanded = _get_llm().invoke(
+            # Fixed: use async instead of blocking sync .invoke()
+            expand_resp = await _get_llm().ainvoke(
                 EXPAND_PROMPT.format(question=query)
-            ).content.strip()
+            )
+            expanded = expand_resp.content.strip()
             variants = [v.strip() for v in expanded.splitlines() if v.strip()][:4]
             logger.info("🌿 [Expand] Query expanded to: %s", variants)
 
@@ -621,9 +683,9 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
 def _build_context(chunks: list) -> str:
     if not chunks:
         return "No relevant documents found."
-    quality = [c for c in chunks if c.get("score", 0) >= 0.20]
+    quality = [c for c in chunks if c.get("score", 0) >= 0.35]
     if not quality:
-        quality = chunks[:5]
+        quality = chunks[:3]  # fewer bad chunks = less noise
     return "\n\n---\n\n".join(
         f"Source: {c['citation']}\n{c['content']}"
         for c in quality)
@@ -643,11 +705,94 @@ def _citations(chunks: list) -> list:
     return out
 
 
-def _confidence(chunks: list) -> str:
+def _confidence(chunks: list, answer: str = "") -> str:
+    """Answer-aware confidence scoring using top + avg chunk scores."""
     if not chunks:
         return "low"
+    if answer and "could not find" in answer.lower():
+        return "low"
     avg = sum(c["score"] for c in chunks) / len(chunks)
-    return "high" if avg >= 0.60 else "medium" if avg >= 0.40 else "low"
+    top = max(c["score"] for c in chunks)
+    if top >= 0.70 and avg >= 0.50:
+        return "high"
+    elif top >= 0.50 or avg >= 0.35:
+        return "medium"
+    return "low"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SELF-VERIFY + RERANK  (Phase 1 & 2 accuracy improvements)
+# ══════════════════════════════════════════════════════════════════════════════
+
+VERIFY_PROMPT = """\
+Question: {question}
+Answer: {answer}
+
+Does this answer directly address the question using specific facts?
+Reply ONLY: GOOD, PARTIAL, or BAD
+- GOOD: Answer has specific facts that address the question
+- PARTIAL: Answer is related but missing key details
+- BAD: Answer is vague, generic, or doesn't address the question"""
+
+RERANK_PROMPT = """\
+Question: {question}
+
+Rank these passages by relevance to the question (most relevant first).
+Return ONLY the numbers in order, comma-separated. Example: 3,1,2
+
+{passages}"""
+
+
+async def _self_verify(question: str, answer: str) -> str:
+    """Quick LLM self-check (~0.5s). Returns GOOD/PARTIAL/BAD."""
+    try:
+        resp = await _get_llm().ainvoke(
+            VERIFY_PROMPT.format(question=question, answer=answer)
+        )
+        verdict = resp.content.strip().upper().split()[0]
+        if verdict in ("GOOD", "PARTIAL", "BAD"):
+            return verdict
+    except Exception:
+        pass
+    return "GOOD"  # fail-open
+
+
+async def _rerank(question: str, chunks: list, top_n: int = 8) -> list:
+    """LLM-based reranking of retrieved chunks. Always-on."""
+    if len(chunks) <= 3:
+        return chunks
+    passages = "\n\n".join(
+        f"[{i+1}] {c['content'][:200]}" for i, c in enumerate(chunks[:12])
+    )
+    try:
+        resp = await _get_llm().ainvoke(
+            RERANK_PROMPT.format(question=question, passages=passages)
+        )
+        order = [int(x.strip()) - 1 for x in resp.content.strip().split(",")]
+        reranked = [chunks[i] for i in order if 0 <= i < len(chunks)]
+        return reranked[:top_n] if reranked else chunks[:top_n]
+    except Exception:
+        return chunks[:top_n]
+
+
+async def _hyde_retry(question, filters, history, stream_queue=None):
+    """HyDE-based retry: generate hypothetical answer, re-retrieve, re-answer."""
+    hyp_resp = await _get_llm().ainvoke(HYDE_PROMPT.format(question=question))
+    hyp = hyp_resp.content.strip()
+    new_chunks = await _retrieve(hyp, filters, top_k=10)
+    new_context = _build_context(new_chunks)
+    prompt_str = ANSWER_PROMPT.format(history=history, context=new_context, question=question)
+
+    if stream_queue:
+        answer_chunks = []
+        async for chunk in _get_llm().astream(prompt_str):
+            if chunk.content:
+                answer_chunks.append(chunk.content)
+                await stream_queue.put({"type": "token", "content": chunk.content})
+        return "".join(answer_chunks).strip(), new_chunks
+    else:
+        resp = await _get_llm().ainvoke(prompt_str)
+        return resp.content.strip(), new_chunks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -655,7 +800,8 @@ def _confidence(chunks: list) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def tool_search(question: str, filters: dict,
-                      session_id: str, top_k: int = 8) -> dict:
+                      session_id: str, top_k: int = 8,
+                      stream_queue: asyncio.Queue = None) -> dict:
     """
     Vector search + LLM answer.
 
@@ -917,15 +1063,14 @@ async def tool_search(question: str, filters: dict,
             len(chunks), len({c["doc_title"] for c in chunks}),
         )
 
+    # ── Rerank chunks for better context ────────────────────────────────────────
+    chunks = await _rerank(question, chunks)
+
     # ── Build context + fetch history in parallel ─────────────────────────────
     context = _build_context(chunks)
     history = await _get_history(session_id)
 
     # ── Early not-found guard ─────────────────────────────────────────────────
-    # INTENTIONALLY NARROW: only fires when ZERO chunks pass MIN_SCORE.
-    # This means "nothing was retrieved at all" — empty knowledge base or
-    # completely out-of-scope question. When chunks DO exist, we always
-    # let the LLM answer from them (shield removed).
     quality_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE]
     if not quality_chunks:
         not_found_answer = "I could not find information about this in the available documents."
@@ -940,13 +1085,25 @@ async def tool_search(question: str, filters: dict,
         return result
 
     # ── LLM generates the answer from retrieved context ───────────────────────
-    response = await _get_llm().ainvoke(
-        ANSWER_PROMPT.format(history=history, context=context, question=question)
-    )
-    answer = response.content.strip()
+    prompt_str = ANSWER_PROMPT.format(history=history, context=context, question=question)
+    
+    if stream_queue:
+        answer_chunks = []
+        async for chunk in _get_llm().astream(prompt_str):
+            if chunk.content:
+                answer_chunks.append(chunk.content)
+                await stream_queue.put({"type": "token", "content": chunk.content})
+        answer = "".join(answer_chunks).strip()
+    else:
+        response = await _get_llm().ainvoke(prompt_str)
+        answer = response.content.strip()
 
-    # Confidence: if LLM itself says not found, mark low confidence.
-    # But we no longer REPLACE the answer — the LLM's response stands as-is.
+    # ── Self-verify: catch bad answers before returning ────────────────────────
+    verdict = await _self_verify(question, answer)
+    if verdict == "BAD" and quality_chunks:
+        logger.info("🔄 Self-verify=BAD → retrying with HyDE for: %s", question[:60])
+        answer, chunks = await _hyde_retry(question, {}, history, stream_queue)
+
     not_found = "could not find" in answer.lower()
 
     result = {
@@ -954,7 +1111,7 @@ async def tool_search(question: str, filters: dict,
         "citations":  _citations(chunks),
         "chunks":     chunks,
         "tool_used":  "search",
-        "confidence": "low" if not_found else _confidence(chunks),
+        "confidence": "low" if not_found else _confidence(chunks, answer),
     }
 
     ttl = 600 if not_found else TTL_ANSWER
@@ -965,7 +1122,7 @@ async def tool_search(question: str, filters: dict,
 
 
 async def tool_full_doc(question: str, filters: dict,
-                        session_id: str) -> dict:
+                        session_id: str, stream_queue: asyncio.Queue = None) -> dict:
     """For full document requests — retrieve more chunks with higher top_k."""
     # PERF: run retrieval and history in parallel
     chunks_coro  = _retrieve(question, filters, top_k=15)
@@ -975,49 +1132,71 @@ async def tool_full_doc(question: str, filters: dict,
     context  = _build_context(chunks)
     prompt   = ANSWER_PROMPT.format(
         history=history, context=context, question=question)
-    response = await _get_llm().ainvoke(prompt)
-    answer   = response.content.strip()
+    if stream_queue:
+        answer_chunks = []
+        async for chunk in _get_llm().astream(prompt):
+            if chunk.content:
+                answer_chunks.append(chunk.content)
+                await stream_queue.put({"type": "token", "content": chunk.content})
+        answer = "".join(answer_chunks).strip()
+    else:
+        response = await _get_llm().ainvoke(prompt)
+        answer   = response.content.strip()
+
+    # ── Self-verify ───────────────────────────────────────────────────────────
+    verdict = await _self_verify(question, answer)
+    if verdict == "BAD" and chunks:
+        logger.info("🔄 Full-doc self-verify=BAD → retrying with HyDE")
+        answer, chunks = await _hyde_retry(question, filters, history, stream_queue)
+
     not_found = "could not find" in answer.lower()
-    # node_save_history() in agent_graph handles history persistence
     return {
         "answer":     answer,
         "citations":  _citations(chunks),
         "chunks":     chunks,
         "tool_used":  "full_doc",
-        "confidence": "low" if not_found else _confidence(chunks),
+        "confidence": "low" if not_found else _confidence(chunks, answer),
     }
 
 
 async def tool_refine(question: str, filters: dict,
-                      session_id: str, top_k: int = 15) -> dict:
+                      session_id: str, top_k: int = 15, stream_queue: asyncio.Queue = None) -> dict:
     """HyDE for summaries — generate hypothetical answer first for better retrieval."""
-    # PERF: run HyDE generation and history fetch in parallel
-    hyp_coro     = asyncio.get_running_loop().run_in_executor(
-        None, lambda: _get_llm().invoke(HYDE_PROMPT.format(question=question)).content.strip()
-    )
-    history_coro = _get_history(session_id)
-    hyp, history = await asyncio.gather(hyp_coro, history_coro)
+    # Fixed: use async instead of blocking run_in_executor
+    hyp_resp = await _get_llm().ainvoke(HYDE_PROMPT.format(question=question))
+    hyp = hyp_resp.content.strip()
+    history = await _get_history(session_id)
 
     chunks  = await _retrieve(hyp, filters, top_k)
     context = _build_context(chunks)
-    answer  = _get_llm().invoke(
-        SUMMARY_PROMPT.format(context=context, question=question)
-    ).content.strip()
+    prompt_str = SUMMARY_PROMPT.format(context=context, question=question)
+    if stream_queue:
+        answer_chunks = []
+        async for chunk in _get_llm().astream(prompt_str):
+            if chunk.content:
+                answer_chunks.append(chunk.content)
+                await stream_queue.put({"type": "token", "content": chunk.content})
+        answer = "".join(answer_chunks).strip()
+    else:
+        answer = await _get_llm().ainvoke(prompt_str)
+        answer = answer.content.strip()
     not_found = "could not find" in answer.lower()
-    # node_save_history() in agent_graph handles history persistence
     return {
         "answer":     answer,
         "citations":  _citations(chunks),
         "chunks":     chunks,
         "tool_used":  "refine",
-        "confidence": "low" if not_found else _confidence(chunks),
+        "confidence": "low" if not_found else _confidence(chunks, answer),
     }
 
 
 async def tool_compare(question: str, doc_a: str, doc_b: str,
-                       filters: dict, session_id: str, top_k: int = 6) -> dict:
+                       filters: dict, session_id: str, top_k: int = 6, stream_queue: asyncio.Queue = None) -> dict:
 
-    _boost  = "contract agreement clause legal terms obligations"
+    # Dynamic boost: only use legal terms if the question isn't specific
+    _specialized = any(w in question.lower() for w in ["policy", "payment", "date", "term", "clause", "notice", "leave"])
+    _boost = "" if _specialized else "contract agreement clause legal terms obligations"
+    
     query_a = f"{question} {_boost} {doc_a}"
     query_b = f"{question} {_boost} {doc_b}"
 
@@ -1053,27 +1232,57 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
     content_a = _build_context(chunks_a)
     content_b = _build_context(chunks_b)
 
-    response = await _get_llm().ainvoke(
-        COMPARE_PROMPT.format(
+    prompt_str = COMPARE_PROMPT.format(
             question=question, doc_a=doc_a, doc_b=doc_b,
             content_a=content_a, content_b=content_b)
-    )
-    raw = response.content.strip()
+    
+    if stream_queue:
+        answer_chunks = []
+        async for chunk in _get_llm().astream(prompt_str):
+            if chunk.content:
+                answer_chunks.append(chunk.content)
+                await stream_queue.put({"type": "token", "content": chunk.content})
+        raw = "".join(answer_chunks).strip()
+    else:
+        response = await _get_llm().ainvoke(prompt_str)
+        raw = response.content.strip()
 
     def _extract(text, start_tag, end_tags):
-        if start_tag not in text:
+        """Case-insensitive tag extraction — handles LLM formatting variations."""
+        text_lower = text.lower()
+        start_lower = start_tag.lower()
+        if start_lower not in text_lower:
             return ""
-        part = text.split(start_tag, 1)[1]
+        idx = text_lower.index(start_lower)
+        part = text[idx + len(start_tag):]
         for tag in end_tags:
-            if tag in part:
-                part = part.split(tag, 1)[0]
+            tag_lower = tag.lower()
+            if tag_lower in part.lower():
+                end_idx = part.lower().index(tag_lower)
+                part = part[:end_idx]
         return part.strip()
 
-    doc_a_tag = f"DOCUMENT A -- {doc_a}"
-    doc_b_tag = f"DOCUMENT B -- {doc_b}"
-    if doc_a_tag in raw:
-        side_a     = _extract(raw, doc_a_tag, [doc_b_tag, "COMPARISON TABLE", "GAP IDENTIFIED:"])
-        side_b     = _extract(raw, doc_b_tag, ["COMPARISON TABLE", "GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"])
+    # Try multiple tag formats the LLM might produce
+    doc_a_tag = None
+    doc_b_tag = None
+    for fmt_a in [f"DOCUMENT A -- {doc_a}", f"DOCUMENT A: {doc_a}",
+                  f"DOCUMENT A — {doc_a}", f"**DOCUMENT A** -- {doc_a}",
+                  f"## {doc_a}", f"DOCUMENT A - {doc_a}"]:
+        if fmt_a.lower() in raw.lower():
+            doc_a_tag = fmt_a
+            break
+    for fmt_b in [f"DOCUMENT B -- {doc_b}", f"DOCUMENT B: {doc_b}",
+                  f"DOCUMENT B — {doc_b}", f"**DOCUMENT B** -- {doc_b}",
+                  f"## {doc_b}", f"DOCUMENT B - {doc_b}"]:
+        if fmt_b.lower() in raw.lower():
+            doc_b_tag = fmt_b
+            break
+
+    if doc_a_tag:
+        end_tags_a = [doc_b_tag or "DOCUMENT B", "COMPARISON TABLE", "GAP IDENTIFIED:"]
+        side_a     = _extract(raw, doc_a_tag, end_tags_a)
+        end_tags_b = ["COMPARISON TABLE", "GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"]
+        side_b     = _extract(raw, doc_b_tag or f"DOCUMENT B -- {doc_b}", end_tags_b)
         comp_table = _extract(raw, "COMPARISON TABLE", ["GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:"])
     else:
         side_a     = _extract(raw, "DOCUMENT_A:", ["DOCUMENT_B:"])
@@ -1085,7 +1294,6 @@ async def tool_compare(question: str, doc_a: str, doc_b: str,
         side_a, side_b, comp_table = content_a[:600], content_b[:600], ""
 
     all_chunks = chunks_a + chunks_b
-    # node_save_history() in agent_graph handles history persistence
     return {
         "answer":      raw,
         "side_a":      side_a,
@@ -1106,6 +1314,7 @@ async def tool_multi_compare(
     filters: dict,
     session_id: str,
     top_k: int = 6,
+    stream_queue: asyncio.Queue = None,
 ) -> dict:
     """
     Compare N documents against a single question.
@@ -1172,8 +1381,16 @@ async def tool_multi_compare(
         doc_cells=doc_cells,
     )
 
-    response = await _get_llm().ainvoke(prompt)
-    raw      = response.content.strip()
+    if stream_queue:
+        answer_chunks = []
+        async for chunk in _get_llm().astream(prompt):
+            if chunk.content:
+                answer_chunks.append(chunk.content)
+                await stream_queue.put({"type": "token", "content": chunk.content})
+        raw = "".join(answer_chunks).strip()
+    else:
+        response = await _get_llm().ainvoke(prompt)
+        raw      = response.content.strip()
 
     summary = ""
     if "SUMMARY:" in raw:
@@ -1192,7 +1409,7 @@ async def tool_multi_compare(
 
 
 async def tool_analysis(question: str, filters: dict,
-                        session_id: str) -> dict:
+                        session_id: str, stream_queue: asyncio.Queue = None) -> dict:
     """
     For analysis questions — retrieve broad context then reason over it.
     """
@@ -1277,16 +1494,69 @@ async def tool_analysis(question: str, filters: dict,
     chunks  = sorted(chunks, key=lambda x: x["score"], reverse=True)
     context = _build_context(chunks[:20])
 
-    response = await _get_llm().ainvoke(
-        ANALYSIS_PROMPT.format(context=context, question=question)
-    )
-    answer = response.content.strip()
+    prompt_str = ANALYSIS_PROMPT.format(context=context, question=question)
 
-    # node_save_history() in agent_graph handles history persistence
+    if stream_queue:
+        answer_chunks = []
+        async for chunk in _get_llm().astream(prompt_str):
+            if chunk.content:
+                answer_chunks.append(chunk.content)
+                await stream_queue.put({"type": "token", "content": chunk.content})
+        answer = "".join(answer_chunks).strip()
+    else:
+        response = await _get_llm().ainvoke(prompt_str)
+        answer = response.content.strip()
+
+    # ── Self-verify ───────────────────────────────────────────────────────────
+    verdict = await _self_verify(question, answer)
+    if verdict == "BAD" and chunks:
+        logger.info("🔄 Analysis self-verify=BAD → retrying with HyDE")
+        answer, chunks = await _hyde_retry(question, {}, history, stream_queue)
+
     return {
         "answer":     answer,
         "citations":  _citations(chunks),
         "chunks":     chunks,
         "tool_used":  "analysis",
-        "confidence": "high",
+        "confidence": _confidence(chunks, answer),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FOLLOW-UP GENERATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def generate_followups(question: str, answer: str) -> list[str]:
+    """Generate 3 likely follow-up questions based on the answer provided."""
+    if not answer or len(answer) < 20 or "Could not find information" in answer:
+        return []
+        
+    prompt = (
+        "You are a helpful assistant. Based on the user's question and your answer, "
+        "predict 3 highly relevant and specific follow-up questions the user is likely to ask next.\n\n"
+        f"User Question: {question}\n\n"
+        f"Your Answer: {answer}\n\n"
+        "Return ONLY a JSON array of 3 strings. Example: "
+        '["What is the penalty for late payment?", "Who do I contact for an extension?", "Can I see the SLA terms?"]'
+    )
+    
+    try:
+        import json
+        llm = _get_llm()
+        # Fixed: use async instead of blocking run_in_executor
+        resp = await llm.ainvoke(prompt)
+        res = resp.content
+        
+        # Strip markdown json blocks if present
+        res = res.strip()
+        if res.startswith("```json"):
+            res = res[7:-3].strip()
+        elif res.startswith("```"):
+            res = res[3:-3].strip()
+            
+        followups = json.loads(res)
+        if isinstance(followups, list):
+            return followups[:3]
+    except Exception as e:
+        logger.warning(f"Failed to generate followups: {e}")
+    return []

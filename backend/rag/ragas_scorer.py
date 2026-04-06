@@ -127,17 +127,22 @@ def _lookup_ground_truth(question: str) -> Optional[str]:
     return None
 
 
-# ── RAGAS version detection ───────────────────────────────────────────────────
+# ── RAGAS version detection (cached) ───────────────────────────────────────
+
+_ragas_version_cache = None
 
 def _get_ragas_version() -> tuple[int, int]:
-    """Return (major, minor) of installed ragas package."""
+    """Return (major, minor) of installed ragas package. Cached after first call."""
+    global _ragas_version_cache
+    if _ragas_version_cache is not None:
+        return _ragas_version_cache
     try:
-        
         v = importlib.metadata.version("ragas")
         parts = v.split(".")
-        return int(parts[0]), int(parts[1])
+        _ragas_version_cache = (int(parts[0]), int(parts[1]))
     except Exception:
-        return (0, 1)  # assume old if unknown
+        _ragas_version_cache = (0, 1)  # assume old if unknown
+    return _ragas_version_cache
 
 
 # ── RAGAS init ────────────────────────────────────────────────────────────────

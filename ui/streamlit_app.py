@@ -558,7 +558,7 @@ if st.session_state.active_tab == "ask":
         with st.chat_message(role):
             if role == "assistant" and confidence:
                 badge_cls = "cite-high" if confidence == "high" else "cite-medium" if confidence == "medium" else "cite-low"
-                badge_label = {"high": "CiteRAG · HIGH", "medium": "CiteRAG · MEDIUM", "low": "CiteRAG · LOW"}.get(confidence, "CiteRAG")
+                badge_label = "CiteRAG"
                 st.markdown(f'<span class="cite-badge {badge_cls}">{badge_label}</span>', unsafe_allow_html=True)
 
             if msg.get("tool_used") == "compare" and msg.get("side_a"):
@@ -633,37 +633,32 @@ if st.session_state.active_tab == "ask":
             # ── Copy button on assistant answers ──────────────────────────────
             if role == "assistant":
                 import streamlit.components.v1 as _components
-                _safe_text = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+                import base64 as _b64
+                _encoded = _b64.b64encode(text.encode("utf-8")).decode("ascii")
                 _components.html(
-                    f"""<button onclick="
-                        const el = document.createElement('textarea');
-                        el.value = `{_safe_text}`;
-                        document.body.appendChild(el);
-                        el.select();
-                        document.execCommand('copy');
-                        document.body.removeChild(el);
-                        this.textContent = '\u2705 Copied!';
-                        setTimeout(() => this.textContent = '\U0001f4cb Copy answer', 2000);
-                    " style="background:#131722;border:1px solid #1e2843;border-radius:6px;color:#94a3b8;font-size:12px;padding:4px 12px;cursor:pointer;font-family:inherit;">\U0001f4cb Copy answer</button>""",
+                    f"""<button id="cpbtn" onclick="
+                        try {{
+                            var t = atob('{_encoded}');
+                            navigator.clipboard.writeText(t).then(function(){{
+                                document.getElementById('cpbtn').textContent = '✅ Copied!';
+                                setTimeout(function(){{ document.getElementById('cpbtn').textContent = '📋 Copy answer'; }}, 2000);
+                            }}).catch(function(){{
+                                var el = document.createElement('textarea');
+                                el.value = t;
+                                document.body.appendChild(el);
+                                el.select();
+                                document.execCommand('copy');
+                                document.body.removeChild(el);
+                                document.getElementById('cpbtn').textContent = '✅ Copied!';
+                                setTimeout(function(){{ document.getElementById('cpbtn').textContent = '📋 Copy answer'; }}, 2000);
+                            }});
+                        }} catch(e) {{ console.error(e); }}
+                    " style="background:#131722;border:1px solid #1e2843;border-radius:6px;color:#94a3b8;font-size:12px;padding:4px 12px;cursor:pointer;font-family:inherit;">📋 Copy answer</button>""",
                     height=36,
                 )
 
-            if citations and role == "assistant":
-                seen, unique = set(), []
-                for c in citations:
-                    key = c if isinstance(c, str) else c.get("text", "")
-                    if key not in seen:
-                        seen.add(key)
-                        unique.append(c)
-                parts = []
-                for c in unique:
-                    if isinstance(c, dict) and c.get("url"):
-                        parts.append(f'<a href="{c["url"]}" target="_blank">{c["text"]}</a>')
-                    else:
-                        txt = c if isinstance(c, str) else c.get("text", str(c))
-                        parts.append(f'<span>{txt}</span>')
-                src_html = " &nbsp;·&nbsp; ".join(parts)
-                st.markdown(f'<div class="cite-sources">📎 {src_html}</div>', unsafe_allow_html=True)
+
+
 
             # ── Agent ticket replies ───────────────────────────────────────────
             # tool_used=="agent": full reply is in content (already rendered above)
@@ -695,10 +690,34 @@ if st.session_state.active_tab == "ask":
                         unsafe_allow_html=True,
                     )
 
-
+                # Render Follow-ups if present
+                f_ups = msg.get("followups", [])
+                if f_ups:
+                    st.markdown("<br/><span style='font-size:0.85rem;color:#94a3b8;'>**Suggested Follow-ups:**</span>", unsafe_allow_html=True)
+                    # Use pills or buttons
+                    cols = st.columns(len(f_ups))
+                    for i, follow_q in enumerate(f_ups):
+                        with cols[i]:
+                            if st.button(follow_q, key=f"fup_{msg.get('hash', hash(msg.get('content', '')))}_{i}"):
+                                st.session_state._prefill_q = follow_q
+                                st.rerun()
 
     _prefill = st.session_state.pop("_prefill_q", "")
+    
+
+
     user_q   = st.chat_input("Ask anything...")
+
+    # Hack to ensure we scroll to bottom when clicking follow-ups
+    if _prefill:
+        st.components.v1.html("""
+            <script>
+                var messages = window.parent.document.querySelectorAll('.stChatMessage');
+                if (messages.length > 0) {
+                    messages[messages.length - 1].scrollIntoView({behavior: 'smooth'});
+                }
+            </script>
+        """, height=0)
 
 
     if user_q or _prefill:
@@ -710,25 +729,75 @@ if st.session_state.active_tab == "ask":
         st.session_state.rag_chats[active_id]["messages"].append(
             {"role": "user", "content": question}
         )
-        with st.spinner("Thinking..."):
-            res = api_post("/rag/ask", {
-                "question":   question,
-                "session_id": active_id,
-                "top_k":      15,
-            }, timeout=120)
+        # New Streamlit Message Placeholder for assistant
+        ai_msg = {
+            "role":           "assistant",
+            "content":        "",
+            "citations":      [],
+            "confidence":     "",
+            "tool_used":      "",
+            "ticket_pending": False,
+            "orig_question":  question,
+            "ticket_id":      None,
+            "ticket_url":     None,
+            "agent_reply":    "",
+            "followups":      [],
+        }
+        
+        import requests
+        import json
+        with st.chat_message("assistant", avatar="🤖"):
+            stream_placeholder = st.empty()
+            res_box = {}
+            full_answer = ""
+            
+            try:
+                with requests.post(
+                    f"{API_URL}/rag/ask",
+                    json={
+                        "question":   question,
+                        "session_id": active_id,
+
+                        "top_k":      15,
+                        "stream":     True,
+                    },
+                    timeout=120,
+                    stream=True
+                ) as resp:
+                    resp.raise_for_status()
+                    
+                    def token_generator():
+                        for line in resp.iter_lines():
+                            if line:
+                                data = json.loads(line)
+                                if data.get("type") == "token":
+                                    yield data.get("content", "")
+                                elif data.get("type") == "done":
+                                    res_box["result"] = data.get("result", {})
+                                    
+                    full_answer = stream_placeholder.write_stream(token_generator())
+                    res = res_box.get("result")
+                    if not full_answer and res:
+                        full_answer = res.get("answer", "")
+                        stream_placeholder.write(full_answer)
+                        
+            except Exception as e:
+                err = f"Could not reach the RAG service. Make sure the backend is running. {e}"
+                stream_placeholder.write(f"⚠️ **Error:** {err}")
+                res = None
+
         if res:
-            ai_msg = {
-                "role":           "assistant",
-                "content":        res.get("answer", "No answer returned."),
+            ai_msg.update({
+                "content":        res.get("answer", full_answer or "No answer returned."),
                 "citations":      res.get("citations", []),
                 "confidence":     res.get("confidence", ""),
                 "tool_used":      res.get("tool_used", ""),
                 "ticket_pending": res.get("ticket_pending", False),
-                "orig_question":  question,
                 "ticket_id":      res.get("ticket_id"),
                 "ticket_url":     res.get("ticket_url"),
                 "agent_reply":    res.get("agent_reply", ""),  # ticket create/update reply
-            }
+                "followups":      res.get("followups", []),
+            })
             if res.get("tool_used") == "compare":
                 ai_msg.update({
                     "side_a":      res.get("side_a", ""),
@@ -777,30 +846,35 @@ if st.session_state.active_tab == "ask":
                     unsafe_allow_html=True,
                 )
 
-            # ── Build top-5 unique docs ───────────────────────────────────────
+            # ── Build top-10 unique doc sections ──────────────────────────────
             seen_docs = {}
             for c in chunks:
                 title   = c.get("doc_title", "")
                 score   = c.get("score", 0)
                 page_id = c.get("notion_page_id", "")
                 section = c.get("section", c.get("heading", ""))
-                if title and title not in seen_docs:
-                    seen_docs[title] = {
+                
+                # Dedupe by both title and section so multiple sections in same doc show up
+                unique_key = f"{title}::{section}"
+                if title and unique_key not in seen_docs:
+                    seen_docs[unique_key] = {
+                        "doc_title": title,
                         "score":   score,
                         "page_id": page_id,
                         "section": section,
                     }
-            top5 = sorted(
-                seen_docs.items(), key=lambda x: x[1]["score"], reverse=True
+            top_sources = sorted(
+                seen_docs.values(), key=lambda x: x["score"], reverse=True
             )[:5]
 
             # ── Source cards (100% inline styles — no CSS class dependency) ──
-            if top5:
+            if top_sources:
                 cards_html = (
                     '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));'
                     'gap:8px;margin-bottom:12px">'
                 )
-                for i, (doc, info) in enumerate(top5):
+                for i, info in enumerate(top_sources):
+                    doc     = info["doc_title"]
                     score   = info["score"]
                     page_id = info["page_id"]
                     section = info.get("section", "")

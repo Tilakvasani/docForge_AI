@@ -245,10 +245,16 @@ def _block_to_text(block: dict) -> tuple[str, str]:
     elif btype == "code":
         text = _rich_text_to_str(bdata.get("rich_text", []))
 
+    elif btype == "table":
+        # Parent table block — actual data is in table_row children.
+        # We handle reconstruction in _extract_page_content.
+        # Return empty here; rows will be collected there.
+        text = ""
+
     elif btype == "table_row":
         cells = bdata.get("cells", [])
         row   = " | ".join(_rich_text_to_str(cell) for cell in cells)
-        text  = row
+        text  = f"| {row} |"
 
     elif btype == "divider":
         text = "---"
@@ -298,8 +304,38 @@ def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
     current_heading  = title or "General"
     current_texts: list[str] = []
 
-    for block in blocks:
+    for i, block in enumerate(blocks):
+        btype = block.get("type", "")
         heading, text = _block_to_text(block)
+
+        # ── Table reconstruction: group table_row blocks into a markdown table ─
+        if btype == "table":
+            # Collect all subsequent table_row children into a markdown table
+            table_rows = []
+            for j in range(i + 1, len(blocks)):
+                child = blocks[j]
+                if child.get("type") == "table_row":
+                    _, row_text = _block_to_text(child)
+                    if row_text.strip():
+                        table_rows.append(row_text.strip())
+                else:
+                    break  # stop at first non-row block
+
+            if table_rows:
+                # Build markdown table with header separator
+                header = table_rows[0]
+                col_count = header.count("|") - 1  # minus outer pipes
+                separator = "| " + " | ".join(["---"] * max(col_count, 1)) + " |"
+                md_table = "\n".join([header, separator] + table_rows[1:])
+                # Mark table with special delimiter so chunker keeps it together:
+                # Using \x00TABLE\x00 as a preserve marker
+                current_texts.append(f"\x00TABLE_START\x00\n{md_table}\n\x00TABLE_END\x00")
+            continue
+
+        # Skip table_row blocks — they were consumed by the parent 'table' handler above
+        if btype == "table_row":
+            continue
+
         if not text.strip():
             continue
 
@@ -351,16 +387,35 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
     """
     Split text into overlapping chunks, preferring paragraph/sentence boundaries.
     Short text that fits within one chunk is returned as-is (single-item list).
+    TABLE PRESERVATION: Tables marked with TABLE_START/TABLE_END are never split.
     """
     if not text or len(text) < MIN_CHUNK_LEN:
         return [text] if text.strip() else []
 
+    # ── Extract tables first so they're never split across chunks ────────────
+    import re as _re
+    table_pattern = _re.compile(r"\x00TABLE_START\x00\n(.*?)\n\x00TABLE_END\x00", _re.DOTALL)
+    tables = table_pattern.findall(text)
+    # Replace tables with a placeholder
+    placeholder_text = table_pattern.sub("\x00TABLE_PLACEHOLDER\x00", text)
+
     # Split on double newlines first (paragraphs)
-    paragraphs = [p.strip() for p in re.split(r"\n\n+", text) if p.strip()]
+    paragraphs = [p.strip() for p in re.split(r"\n\n+", placeholder_text) if p.strip()]
     chunks: list[str] = []
     current = ""
+    table_idx = 0
 
     for para in paragraphs:
+        # If paragraph is a table placeholder, emit current chunk then table as its own chunk
+        if "\x00TABLE_PLACEHOLDER\x00" in para:
+            if current:
+                chunks.append(current)
+                current = ""
+            if table_idx < len(tables):
+                chunks.append(tables[table_idx])
+                table_idx += 1
+            continue
+
         if len(current) + len(para) + 1 <= size:
             current = (current + "\n\n" + para).strip()
         else:
@@ -387,13 +442,19 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
     if current:
         chunks.append(current)
 
-    # Apply overlap: prepend tail of previous chunk to next
+    # Apply overlap: prepend tail of previous chunk to next (skip table chunks)
     if overlap > 0 and len(chunks) > 1:
         overlapped = [chunks[0]]
         for i in range(1, len(chunks)):
-            tail    = chunks[i - 1][-overlap:]
-            merged  = (tail + " " + chunks[i]).strip()
-            overlapped.append(merged)
+            # Don't apply overlap to/from table chunks
+            if "|" in chunks[i] and "---" in chunks[i]:
+                overlapped.append(chunks[i])
+            elif "|" in chunks[i-1] and "---" in chunks[i-1]:
+                overlapped.append(chunks[i])
+            else:
+                tail    = chunks[i - 1][-overlap:]
+                merged  = (tail + " " + chunks[i]).strip()
+                overlapped.append(merged)
         chunks = overlapped
 
     return [c for c in chunks if len(c) >= MIN_CHUNK_LEN]
