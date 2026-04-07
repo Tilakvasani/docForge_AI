@@ -140,6 +140,7 @@ Content from {doc_b}:
 COMPARISON RULES:
 - Use ALL content provided — do not discard partial or indirect evidence.
 - If one document's content is limited or missing, use what is available and note it is partial.
+- If BOTH documents are completely silent on the topic, state that there is no document match and REFUSE to answer. Do NOT use general knowledge.
 - Each document section: 3-5 bullets of specific facts (numbers, dates, clause wording).
 - If a clause is identical in both, write the ACTUAL shared value — never just "Same".
 - Never say "Document B mirrors Document A" — state each finding with its own actual value.
@@ -1320,7 +1321,9 @@ async def tool_multi_compare(
     Compare N documents against a single question.
     Retrieves chunks per-doc in parallel, then sends one structured prompt.
     """
-    _boost = "contract agreement clause legal terms obligations"
+    # Dynamic boost: only use legal terms if the question isn't specific
+    _specialized = any(w in question.lower() for w in ["policy", "payment", "date", "term", "clause", "notice", "leave"])
+    _boost = "" if _specialized else "contract agreement clause legal terms obligations"
 
     # ── 1. Parallel retrieval for all docs ───────────────────────────────────
     async def _retrieve_for_doc(doc_name: str):

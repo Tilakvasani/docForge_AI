@@ -549,7 +549,7 @@ if st.session_state.active_tab == "ask":
     else:
         st.caption(f"💬  {active_chat.get('title', 'New chat')}")
 
-    for msg in messages:
+    for idx, msg in enumerate(messages):
         role       = msg["role"]
         text       = msg["content"]
         citations  = msg.get("citations", [])
@@ -698,7 +698,7 @@ if st.session_state.active_tab == "ask":
                     cols = st.columns(len(f_ups))
                     for i, follow_q in enumerate(f_ups):
                         with cols[i]:
-                            if st.button(follow_q, key=f"fup_{msg.get('hash', hash(msg.get('content', '')))}_{i}"):
+                            if st.button(follow_q, key=f"fup_{idx}_{i}"):
                                 st.session_state._prefill_q = follow_q
                                 st.rerun()
 
@@ -771,7 +771,10 @@ if st.session_state.active_tab == "ask":
                             if line:
                                 data = json.loads(line)
                                 if data.get("type") == "token":
-                                    yield data.get("content", "")
+                                    # Typewriter Effect: character-by-character
+                                    for char in data.get("content", ""):
+                                        yield char
+                                        _time_mod.sleep(0.01)
                                 elif data.get("type") == "done":
                                     res_box["result"] = data.get("result", {})
                                     
