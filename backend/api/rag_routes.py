@@ -199,10 +199,17 @@ async def api_ask(req: AskRequest):
                     except asyncio.TimeoutError:
                         continue
                 
-                # Retrieve final result and set cache
+                # ── Tool-based Cache Whitelist ────────────────────────────────
+                # We only cache idempotent "read" tools. Actions (create/update) are never cached.
+                _SAFE_TOOLS = {"search", "compare", "multi_compare", "multi_query", "full_doc", "analysis", "refine"}
+                
                 result = task.result()
-                logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
-                await cache.set(a_key, result, ttl=3600)
+                tool_used = result.get("tool_used", "chat")
+                logger.info("✅ [%s] Done | tool=%s", request_id, tool_used)
+                
+                if tool_used in _SAFE_TOOLS:
+                    await cache.set(a_key, result, ttl=3600)
+                
                 yield json.dumps({"type": "done", "result": result}) + "\n"
                         
             return StreamingResponse(streaming_generator(), media_type="application/x-ndjson")
@@ -219,9 +226,12 @@ async def api_ask(req: AskRequest):
         logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
         
         # ── Global Result Cache Save ──────────────────────────────────────────
-        # We now save the entire result (including chunks) so that 
-        # the "Show Sources" button works on repeat hits.
-        await cache.set(a_key, result, ttl=3600)
+        # We only cache if the tool used was an idempotent RAG tool.
+        _SAFE_TOOLS = {"search", "compare", "multi_compare", "multi_query", "full_doc", "analysis", "refine"}
+        tool_used = result.get("tool_used", "chat")
+        
+        if tool_used in _SAFE_TOOLS:
+            await cache.set(a_key, result, ttl=3600)
         
         return result
 

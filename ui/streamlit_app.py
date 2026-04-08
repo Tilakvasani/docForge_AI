@@ -14,6 +14,10 @@ try:
 except ImportError:
     DOCX_AVAILABLE = False
 
+import itertools
+import base64 as _b64
+import streamlit.components.v1 as _components
+
 API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/") + "/api"
 
 st.set_page_config(
@@ -23,262 +27,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-/* ── Global font ── */
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-/* ── Sidebar ── */
-section[data-testid="stSidebar"] {
-    background: #0f111a;
-    border-right: 1px solid #1e2433;
-}
-section[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
-section[data-testid="stSidebar"] .stRadio label { font-size: 0.85rem; }
 
-/* ── Main background ── */
-.main .block-container { background: #0d0f18; padding-top: 2rem; margin-top: 0.75rem; }
-
-/* ── Chat messages ── */
-[data-testid="stChatMessage"] {
-    background: #131722;
-    border: 1px solid #1e2843;
-    border-radius: 12px;
-    padding: 1rem 1.2rem;
-    margin-bottom: 0.75rem;
-}
-[data-testid="stChatMessage"][data-testid*="user"] {
-    background: #1a1f35;
-    border-color: #2a3a6e;
-}
-
-/* ── Chat input ── */
-[data-testid="stChatInput"] {
-    background: #131722 !important;
-    border: 1px solid #2a3a6e !important;
-    border-radius: 12px !important;
-    color: #e2e8f0 !important;
-}
-
-/* ── Tables in chat (comparison) ── */
-table {
-    width: 100%;
-    border-collapse: collapse;
-    margin: 0.75rem 0;
-    font-size: 0.85rem;
-}
-th {
-    background: #1e2843;
-    color: #93c5fd;
-    padding: 8px 12px;
-    text-align: left;
-    border: 1px solid #2a3a6e;
-    font-weight: 600;
-}
-td {
-    padding: 7px 12px;
-    border: 1px solid #1e2433;
-    color: #cbd5e1;
-}
-tr:nth-child(even) td { background: #131722; }
-tr:nth-child(odd) td { background: #0f111a; }
-tr:hover td { background: #1a2035; }
-
-/* ── Dividers ── */
-hr { border-color: #1e2433 !important; margin: 0.5rem 0 !important; }
-
-/* ── Buttons ── */
-.stButton > button {
-    border-radius: 8px;
-    font-size: 0.82rem;
-    font-weight: 500;
-    transition: all 0.15s;
-}
-.stButton > button[kind="primary"] {
-    background: linear-gradient(135deg, #3b82f6, #6366f1) !important;
-    border: none !important;
-    color: white !important;
-}
-.stButton > button[kind="primary"]:hover {
-    background: linear-gradient(135deg, #2563eb, #4f46e5) !important;
-    transform: translateY(-1px);
-}
-.stButton > button[kind="secondary"] {
-    background: #131722 !important;
-    border: 1px solid #1e2843 !important;
-    color: #94a3b8 !important;
-}
-.stButton > button[kind="secondary"]:hover {
-    border-color: #3b82f6 !important;
-    color: #93c5fd !important;
-}
-
-/* ── Info/warning boxes ── */
-[data-testid="stInfo"] {
-    background: #0c1a2e !important;
-    border: 1px solid #1e3a5f !important;
-    border-radius: 8px !important;
-    color: #93c5fd !important;
-}
-[data-testid="stWarning"] {
-    background: #1c1200 !important;
-    border: 1px solid #3d2a00 !important;
-    border-radius: 8px !important;
-    color: #fcd34d !important;
-}
-
-/* ── Caption text ── */
-.stCaption { color: #475569 !important; font-size: 0.75rem !important; }
-
-/* ── Confidence badge ── */
-.cite-badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 0.7rem;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    margin-bottom: 6px;
-}
-.cite-high   { background: #052e16; color: #4ade80; border: 1px solid #166534; }
-.cite-medium { background: #1c1a00; color: #facc15; border: 1px solid #854d0e; }
-.cite-low    { background: #1c0a0a; color: #f87171; border: 1px solid #7f1d1d; }
-
-/* ── Source citations ── */
-.cite-sources {
-    font-size: 0.72rem;
-    color: #475569;
-    margin-top: 8px;
-    padding-top: 8px;
-    border-top: 1px solid #1e2433;
-}
-.cite-sources a { color: #3b82f6 !important; text-decoration: none; }
-.cite-sources a:hover { text-decoration: underline; }
-
-/* ── Comparison columns ── */
-.compare-col {
-    background: #0f111a;
-    border: 1px solid #1e2843;
-    border-radius: 8px;
-    padding: 12px;
-    font-size: 0.85rem;
-}
-
-/* ── RAGAS quality section ── */
-.ragas-section {
-    margin-top: 1.25rem;
-    padding-top: 1rem;
-    border-top: 1px solid #1e2433;
-}
-.ragas-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 14px;
-}
-.ragas-title {
-    font-size: 0.78rem;
-    font-weight: 600;
-    color: #475569;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-}
-.ragas-badge {
-    font-size: 0.65rem;
-    font-weight: 700;
-    background: rgba(29,158,117,0.15);
-    color: #4ade80;
-    padding: 2px 7px;
-    border-radius: 4px;
-    letter-spacing: 0.05em;
-    border: 1px solid rgba(29,158,117,0.25);
-}
-.rq-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 9px;
-}
-.rq-label {
-    font-size: 0.75rem;
-    color: #94a3b8;
-    width: 138px;
-    flex-shrink: 0;
-}
-.rq-hint {
-    font-size: 0.68rem;
-    color: #334155;
-    width: 108px;
-    flex-shrink: 0;
-}
-.rq-track {
-    flex: 1;
-    height: 5px;
-    background: #1e2433;
-    border-radius: 3px;
-    overflow: hidden;
-    min-width: 60px;
-}
-.rq-fill-g { height: 100%; border-radius: 3px; background: #22c55e; }
-.rq-fill-a { height: 100%; border-radius: 3px; background: #f59e0b; }
-.rq-fill-r { height: 100%; border-radius: 3px; background: #ef4444; }
-.rq-score-g { font-size: 0.78rem; font-weight: 600; color: #4ade80; width: 34px; text-align: right; flex-shrink: 0; }
-.rq-score-a { font-size: 0.78rem; font-weight: 600; color: #fbbf24; width: 34px; text-align: right; flex-shrink: 0; }
-.rq-score-r { font-size: 0.78rem; font-weight: 600; color: #f87171; width: 34px; text-align: right; flex-shrink: 0; }
-.rq-warn {
-    margin-top: 10px;
-    padding: 7px 11px;
-    background: rgba(245,158,11,0.08);
-    border-left: 2px solid #f59e0b;
-    border-radius: 0 5px 5px 0;
-    font-size: 0.72rem;
-    color: #94a3b8;
-    line-height: 1.5;
-}
-.rq-warn b { color: #fbbf24; }
-.rq-ok {
-    margin-top: 10px;
-    padding: 7px 11px;
-    background: rgba(34,197,94,0.06);
-    border-left: 2px solid #22c55e;
-    border-radius: 0 5px 5px 0;
-    font-size: 0.72rem;
-    color: #475569;
-}
-.source-card-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 8px;
-    margin-bottom: 0;
-}
-.source-card {
-    background: #0f111a;
-    border: 1px solid #1e2843;
-    border-radius: 9px;
-    padding: 10px 11px;
-}
-.source-card-title {
-    font-size: 0.75rem;
-    font-weight: 500;
-    color: #60a8f8;
-    line-height: 1.35;
-    margin-bottom: 5px;
-}
-.source-card-section {
-    font-size: 0.65rem;
-    color: #334155;
-    margin-bottom: 5px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.source-card-rank {
-    font-size: 0.68rem;
-    color: #475569;
-}
-.source-card-rank b { color: #94a3b8; }
-</style>
-""", unsafe_allow_html=True)
 
 
 # ── API helpers ────────────────────────────────────────────────────────────────
@@ -593,111 +343,161 @@ if st.session_state.active_tab == "ask":
                 badge_label = "CiteRAG"
                 st.markdown(f'<span class="cite-badge {badge_cls}">{badge_label}</span>', unsafe_allow_html=True)
 
-            # Render comparison UI if specifically flagged or if comparison tags are present in text
-            import re
-            doc_heads   = re.findall(r"(DOCUMENT\s*[\:\-\—\–].+)", text)
-            is_comp_fmt = len(doc_heads) >= 2 or "COMPARISON TABLE" in text
-            
-            if (msg.get("tool_used") == "compare" and msg.get("side_a")) or is_comp_fmt:
-                raw = msg.get("content", "")
-
-                def _sect(text, start_tag, end_tags):
-                    if start_tag not in text:
-                        return ""
-                    part = text.split(start_tag, 1)[1]
-                    for tag in end_tags:
-                        if tag in part:
-                            part = part.split(tag, 1)[0]
-                    return part.strip()
-
-                # ── Dynamic Section Extraction ──
-                footer_tags   = ["COMPARISON TABLE", "GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"]
-                final_answer  = _sect(raw, "FINAL ANSWER", doc_heads[:1] + ["DOCUMENT:", "DOCUMENT_A:"] + footer_tags)
+            def _render_answer_body(block_text, source_msg, is_sub=False):
+                if "FINAL ANSWER:" in block_text and block_text.startswith("###"):
+                    pass
                 
-                # Extract all documents found by regex
-                doc_sections = []
-                for i, head in enumerate(doc_heads):
-                    # End at next header or any footer tag
-                    ends = doc_heads[i+1:] + footer_tags
-                    content = _sect(raw, head, ends)
-                    # Clean title (remove "DOCUMENT" and punctuation)
-                    title = re.sub(r"DOCUMENT\s*[\:\-\—\–]\s*", "", head, flags=re.I).strip()
-                    doc_sections.append((title, content))
+                block_text = block_text.replace("📋 FINAL ANSWER: ", "").strip()
+                if block_text.startswith("📋 **FINAL ANSWER:**"):
+                    block_text = block_text.replace("📋 **FINAL ANSWER:**", "").strip()
 
-                # Fallback for old explicit keys if no documents found in text
-                if not doc_sections and msg.get("side_a"):
-                    doc_sections.append((msg.get("doc_a", "Document A"), msg.get("side_a", "")))
-                    doc_sections.append((msg.get("doc_b", "Document B"), msg.get("side_b", "")))
+                import re
+                # Upgraded Regex to catch "DOCUMENT A --" along with "DOCUMENT :"
+                doc_heads   = re.findall(r"(DOCUMENT\s*[A-Z]?\s*[\:\-\—\–].+)", block_text)
+                is_comp_fmt = len(doc_heads) >= 2 or "COMPARISON TABLE" in block_text
+                
+                if (source_msg.get("tool_used") == "compare" and source_msg.get("side_a")) or is_comp_fmt:
+                    raw = block_text
 
-                comp_table = _sect(raw, "COMPARISON TABLE", ["GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:"])
-                if not comp_table: comp_table = msg.get("comp_table", "")
+                    def _sect(t, start_tag, end_tags):
+                        if start_tag not in t:
+                            return ""
+                        part = t.split(start_tag, 1)[1]
+                        for tag in end_tags:
+                            if tag in part:
+                                part = part.split(tag, 1)[0]
+                        return part.strip()
 
-                gap_block  = _sect(raw, "GAP IDENTIFIED:", ["KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"])
-                key_diff   = _sect(raw, "KEY DIFFERENCE:", ["SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"])
-                systemic   = _sect(raw, "SYSTEMIC ISSUE", ["COMPARISON INSIGHT:", "SUMMARY:"])
-                insight    = _sect(raw, "COMPARISON INSIGHT:", ["SUMMARY:"])
-                summary    = _sect(raw, "SUMMARY:", ["END_NEVER_MATCHES"])
+                    footer_tags   = ["COMPARISON TABLE", "GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"]
+                    final_answer  = _sect(raw, "FINAL ANSWER", doc_heads[:1] + ["DOCUMENT:", "DOCUMENT_A:"] + footer_tags)
+                    
+                    if not final_answer:
+                        first_ender = doc_heads[0] if doc_heads else (footer_tags[0] if is_comp_fmt else None)
+                        if first_ender and first_ender in raw:
+                            final_answer = raw.split(first_ender, 1)[0].replace("###", "").strip()
 
-                if final_answer:
-                    st.markdown("📋 **FINAL ANSWER:** " + final_answer)
-                    st.divider()
+                    doc_sections = []
+                    for i, head in enumerate(doc_heads):
+                        ends = doc_heads[i+1:] + footer_tags
+                        content = _sect(raw, head, ends)
+                        title = re.sub(r"DOCUMENT\s*[A-Z]?\s*[\:\-\—\–]\s*", "", head, flags=re.I).strip()
+                        doc_sections.append((title, content))
 
-                # ── Render documents in Grid (2 columns per row) ──
-                for i in range(0, len(doc_sections), 2):
-                    row_cols = st.columns(2)
-                    for j in range(2):
-                        if i + j < len(doc_sections):
-                            title, content = doc_sections[i + j]
-                            color = "🔵" if (i + j) % 2 == 0 else "🟢"
-                            with row_cols[j]:
-                                st.markdown(f"**{color} {title}**")
-                                st.markdown(content)
+                    if not doc_sections and source_msg.get("side_a"):
+                        doc_sections.append((source_msg.get("doc_a", "Document A"), source_msg.get("side_a", "")))
+                        doc_sections.append((source_msg.get("doc_b", "Document B"), source_msg.get("side_b", "")))
 
-                if comp_table:
-                    st.divider()
-                    st.markdown("**📊 COMPARISON TABLE**")
-                    st.markdown(comp_table)
+                    comp_table = _sect(raw, "COMPARISON TABLE", ["GAP IDENTIFIED:", "KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:"])
+                    if not comp_table: comp_table = source_msg.get("comp_table", "")
 
-                if gap_block:
-                    st.divider()
-                    st.markdown("**🔴 GAP IDENTIFIED:**")
-                    st.markdown(gap_block)
-                if key_diff:
-                    st.markdown("**🔑 KEY DIFFERENCE:** " + key_diff)
-                if systemic:
-                    st.warning("⚠️ **SYSTEMIC ISSUE:** " + systemic)
-                if insight:
-                    st.divider()
-                    st.markdown("**💡 COMPARISON INSIGHT:**")
-                    st.markdown(insight)
-                if summary:
-                    st.divider()
-                    st.markdown("**📝 SUMMARY:** " + summary)
+                    gap_block  = _sect(raw, "GAP IDENTIFIED:", ["KEY DIFFERENCE:", "SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"])
+                    key_diff   = _sect(raw, "KEY DIFFERENCE:", ["SYSTEMIC ISSUE", "COMPARISON INSIGHT:", "SUMMARY:"])
+                    systemic   = _sect(raw, "SYSTEMIC ISSUE", ["COMPARISON INSIGHT:", "SUMMARY:"])
+                    insight    = _sect(raw, "COMPARISON INSIGHT:", ["SUMMARY:"])
+                    summary    = _sect(raw, "SUMMARY:", ["END_NEVER_MATCHES"])
 
-            else:
+                    if "\n" in raw and raw.startswith("### "):
+                        head_title = raw.split("\n", 1)[0]
+                        st.markdown(head_title)
+                    
+                    if final_answer:
+                        if final_answer.startswith(": "): final_answer = final_answer[2:]
+                        st.markdown("📋 **FINAL ANSWER:** " + final_answer)
+                        st.divider()
+
+                    for i in range(0, len(doc_sections), 2):
+                        row_cols = st.columns(2)
+                        for j in range(2):
+                            if i + j < len(doc_sections):
+                                title, content = doc_sections[i + j]
+                                color = "🔵" if (i + j) % 2 == 0 else "🟢"
+                                with row_cols[j]:
+                                    st.markdown(f"**{color} {title}**")
+                                    st.markdown(content)
+
+                    if comp_table:
+                        st.divider()
+                        st.markdown("**📊 COMPARISON TABLE**")
+                        st.markdown(comp_table)
+
+                    if gap_block:
+                        st.divider()
+                        st.markdown("**🔴 GAP IDENTIFIED:**")
+                        st.markdown(gap_block)
+                    if key_diff:
+                        st.markdown("**🔑 KEY DIFFERENCE:** " + key_diff)
+                    if systemic:
+                        st.warning("⚠️ **SYSTEMIC ISSUE:** " + systemic)
+                    if insight:
+                        st.divider()
+                        st.markdown("**💡 COMPARISON INSIGHT:**")
+                        st.markdown(insight)
+                    if summary:
+                        st.divider()
+                        st.markdown("**📝 SUMMARY:** " + summary)
+                else:
+                    block_text = block_text.replace("📋 FINAL ANSWER: ", "").strip()
+                    if block_text.startswith(": "): block_text = block_text[2:]
+                    st.markdown(block_text)
+                    
+            if role == "user":
                 st.markdown(text)
+            else:
+                sub_results = msg.get("sub_results", [])
+                
+                if sub_results and isinstance(sub_results, list):
+                    chunks_text = text.replace("📋 FINAL ANSWER: ", "").split("\n\n---\n\n")
+                    for s_idx, (s_text, s_res) in enumerate(itertools.zip_longest(chunks_text, sub_results)):
+                        if s_text:
+                            sub_q = (s_res or {}).get("question", f"Part {s_idx + 1}")
+                            st.markdown(f"#### 🔍 Question {s_idx+1}\n**{sub_q}**\n")
+                            _render_answer_body(s_text, s_res or msg, is_sub=True)
+                            
+                            s_cits = (s_res or {}).get("citations", [])
+                            if s_cits:
+                                with st.expander(f"🔍 Sources for Part {s_idx+1}"):
+                                    for c in s_cits[:5]:
+                                        c_title = c.get("title", c.get("doc_title", c.get("page_name", c.get("name", "Untitled Document"))))
+                                        c_sec = c.get("section", c.get("heading", ""))
+                                        c_id = c.get("notion_page_id", "")
+                                        c_url = f"https://www.notion.so/{c_id.replace('-', '')}" if c_id else ""
+                                        if c_url: st.markdown(f"📍 **[{c_title}]({c_url})**  \n`{c_sec}`", unsafe_allow_html=True)
+                                        else: st.markdown(f"📍 **{c_title}**  \n`{c_sec}`", unsafe_allow_html=True)
+                            
+                            _encoded = _b64.b64encode(s_text.encode("utf-8")).decode("ascii")
+                            _components.html(
+                                f"""<button id="cpbtn_s{s_idx}_{idx}" onclick="
+                                    try {{
+                                        var t = atob('{_encoded}');
+                                        navigator.clipboard.writeText(t).then(function(){{
+                                            document.getElementById('cpbtn_s{s_idx}_{idx}').textContent = '✅ Copied!';
+                                            setTimeout(function(){{ document.getElementById('cpbtn_s{s_idx}_{idx}').textContent = '📋 Copy answer'; }}, 2000);
+                                        }}).catch(function(){{
+                                            var el = document.createElement('textarea'); el.value = t; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el); document.getElementById('cpbtn_s{s_idx}_{idx}').textContent = '✅ Copied!'; setTimeout(function(){{ document.getElementById('cpbtn_s{s_idx}_{idx}').textContent = '📋 Copy answer'; }}, 2000);
+                                        }});
+                                    }} catch(e) {{ console.error(e); }}
+                                " style="background:#131722;border:1px solid #1e2843;border-radius:6px;color:#94a3b8;font-size:12px;padding:4px 12px;cursor:pointer;font-family:inherit;">📋 Copy answer</button>""",
+                                height=36,
+                            )
+                        if s_idx < len(chunks_text) - 1:
+                            st.divider()
+                else:
+                    _render_answer_body(text, msg, is_sub=False)
 
             # ── Copy button on assistant answers ──────────────────────────────
-            if role == "assistant":
-                import streamlit.components.v1 as _components
-                import base64 as _b64
+            if role == "assistant" and not (msg.get("sub_results") and isinstance(msg.get("sub_results"), list)):
                 _encoded = _b64.b64encode(text.encode("utf-8")).decode("ascii")
                 _components.html(
-                    f"""<button id="cpbtn" onclick="
+                    f"""<button id="cpbtn_{idx}" onclick="
                         try {{
                             var t = atob('{_encoded}');
                             navigator.clipboard.writeText(t).then(function(){{
-                                document.getElementById('cpbtn').textContent = '✅ Copied!';
-                                setTimeout(function(){{ document.getElementById('cpbtn').textContent = '📋 Copy answer'; }}, 2000);
+                                document.getElementById('cpbtn_{idx}').textContent = '✅ Copied!';
+                                setTimeout(function(){{ document.getElementById('cpbtn_{idx}').textContent = '📋 Copy answer'; }}, 2000);
                             }}).catch(function(){{
-                                var el = document.createElement('textarea');
-                                el.value = t;
-                                document.body.appendChild(el);
-                                el.select();
-                                document.execCommand('copy');
-                                document.body.removeChild(el);
-                                document.getElementById('cpbtn').textContent = '✅ Copied!';
-                                setTimeout(function(){{ document.getElementById('cpbtn').textContent = '📋 Copy answer'; }}, 2000);
+                                var el = document.createElement('textarea'); el.value = t; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el);
+                                document.getElementById('cpbtn_{idx}').textContent = '✅ Copied!';
+                                setTimeout(function(){{ document.getElementById('cpbtn_{idx}').textContent = '📋 Copy answer'; }}, 2000);
                             }});
                         }} catch(e) {{ console.error(e); }}
                     " style="background:#131722;border:1px solid #1e2843;border-radius:6px;color:#94a3b8;font-size:12px;padding:4px 12px;cursor:pointer;font-family:inherit;">📋 Copy answer</button>""",
@@ -739,7 +539,7 @@ if st.session_state.active_tab == "ask":
 
                 # Render Follow-ups if present
                 f_ups = msg.get("followups", [])
-                if f_ups:
+                if f_ups and not (msg.get("sub_results") and isinstance(msg.get("sub_results"), list)):
                     st.markdown("<br/><span style='font-size:0.85rem;color:#94a3b8;'>**Suggested Follow-ups:**</span>", unsafe_allow_html=True)
                     # Use pills or buttons
                     cols = st.columns(len(f_ups))
