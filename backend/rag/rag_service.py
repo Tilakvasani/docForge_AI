@@ -332,18 +332,31 @@ _embedder_instance   = None
 _collection_instance = None
 
 
-def _get_llm():
+def _get_llm(temperature: float = 0.2, max_tokens: int = 3000):
     global _llm_instance
-    if _llm_instance is None:
-        _llm_instance = AzureChatOpenAI(
-            azure_endpoint=settings.AZURE_LLM_ENDPOINT,
-            api_key=settings.AZURE_OPENAI_LLM_KEY,
-            azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
-            api_version="2024-12-01-preview",
-            temperature=0.2,
-            max_tokens=3000,
-        )
-    return _llm_instance
+    
+    # If using defaults, try to return singleton
+    if temperature == 0.2 and max_tokens == 3000:
+        if _llm_instance is None:
+            _llm_instance = AzureChatOpenAI(
+                azure_endpoint=settings.AZURE_LLM_ENDPOINT,
+                api_key=settings.AZURE_OPENAI_LLM_KEY,
+                azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
+                api_version="2024-12-01-preview",
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        return _llm_instance
+    
+    # Otherwise return a fresh instance for specialized tasks (e.g. history compression)
+    return AzureChatOpenAI(
+        azure_endpoint=settings.AZURE_LLM_ENDPOINT,
+        api_key=settings.AZURE_OPENAI_LLM_KEY,
+        azure_deployment=settings.AZURE_LLM_DEPLOYMENT_41_MINI,
+        api_version="2024-12-01-preview",
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )   
 
 
 def _get_embedder():
