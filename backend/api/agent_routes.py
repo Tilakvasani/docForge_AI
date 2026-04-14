@@ -1,5 +1,5 @@
 """
-agent_routes.py — FastAPI routes for the CiteRAG Agent layer  (v3)
+agent_routes.py — FastAPI routes for the CiteRAG Agent layer
 
 Bug fixes vs v2:
   1. TICKETS_CACHE_KEY is a module-level constant — no more duplicate string
@@ -14,7 +14,7 @@ Bug fixes vs v2:
 from datetime import datetime, timezone
 from typing import Optional, List
 import string
-
+import random
 import httpx as _httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -34,11 +34,13 @@ TICKETS_CACHE_KEY = "docforge:agent:tickets"   # single source of truth
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class TicketUpdateRequest(BaseModel):
+    """Schema for updating the status of an existing Notion support ticket."""
     ticket_id: str
     status:    str   # "Open" | "In Progress" | "Resolved"
 
 
 class TicketCreateRequest(BaseModel):
+    """Schema for creating a new Notion support ticket from the CiteRAG agent context."""
     question:          str
     session_id:        str       = "default"
     attempted_sources: List[str] = []
@@ -51,6 +53,7 @@ class TicketCreateRequest(BaseModel):
 
 
 class MemorySaveRequest(BaseModel):
+    """Schema for saving dynamic session memory (like user names or roles) to Redis."""
     session_id: str
     memory:     dict
 
@@ -169,7 +172,6 @@ async def _create_notion_ticket(req: TicketCreateRequest) -> dict:
     live_date = datetime.now(timezone.utc).isoformat()
 
     # Generate a simple numeric ticket ID
-    import random
     ticket_id = req.ticket_id or "".join(random.choices(string.digits, k=8))
 
     properties: dict = {

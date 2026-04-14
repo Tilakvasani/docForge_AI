@@ -32,6 +32,7 @@ import hashlib
 import re
 import time
 from typing import Optional
+import re as _re
 
 import chromadb
 from langchain_openai import AzureOpenAIEmbeddings
@@ -393,7 +394,7 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
         return [text] if text.strip() else []
 
     # ── Extract tables first so they're never split across chunks ────────────
-    import re as _re
+    
     table_pattern = _re.compile(r"\x00TABLE_START\x00\n(.*?)\n\x00TABLE_END\x00", _re.DOTALL)
     tables = table_pattern.findall(text)
     # Replace tables with a placeholder

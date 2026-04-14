@@ -1,3 +1,7 @@
+"""
+REST API Routes for core Document Generation functionality.
+Handles fetching sections, generating content via LLM, and publishing to Notion.
+"""
 # ── Third-party ───────────────────────────────────────────────────────────────
 from fastapi import APIRouter, HTTPException   # FastAPI routing + error responses
 from pydantic import BaseModel                 # Request/response schema validation
@@ -38,6 +42,10 @@ class SaveDocRequest(BaseModel):
 
 @router.get("/departments")
 async def get_departments():
+    """
+    Fetch the list of all available departments for document generation.
+    Returns cached list if available to minimize database hits.
+    """
     try:
         # Try cache first
         cached = await cache.get_departments()
@@ -58,6 +66,10 @@ async def get_departments():
 
 @router.get("/sections/{doc_type}")
 async def get_sections(doc_type: str):
+    """
+    Retrieve the standard sections required for a specific document type.
+    Decodes URL-encoded doc types and checks Redis cache first.
+    """
     decoded = doc_type.replace("%2F", "/").replace("%28", "(").replace("%29", ")")
     try:
         # Try cache first
@@ -85,6 +97,10 @@ async def get_sections(doc_type: str):
 
 @router.post("/questions/generate")
 async def api_generate_questions(req: GenerateQuestionsRequest):
+    """
+    Generate contextual questions for a specific document section using the LLM.
+    These questions are presented to the user to gather dynamic facts.
+    """
     try:
         result = await generate_questions(req)
 
@@ -101,6 +117,10 @@ async def api_generate_questions(req: GenerateQuestionsRequest):
 
 @router.post("/answers/save")
 async def api_save_answers(req: SaveAnswersRequest):
+    """
+    Save the user's answers against a specific section.
+    Invalidates the cached section content to force a fresh regeneration.
+    """
     try:
         result = await save_user_answers(req)
 
@@ -167,6 +187,10 @@ async def api_edit_section(req: EditSectionRequest):
 
 @router.post("/document/save")
 async def api_save_document(req: SaveDocRequest):
+    """
+    Commit the entire generated document to the local database.
+    This acts as persistent local storage before Notion publishing.
+    """
     try:
         gen_id = await save_generated_document(
             doc_id=req.doc_id, doc_sec_id=req.doc_sec_id, sec_id=req.sec_id,
@@ -181,6 +205,10 @@ async def api_save_document(req: SaveDocRequest):
 
 @router.post("/document/publish")
 async def api_publish_document(req: NotionPublishRequest):
+    """
+    Publish the final compiled document to Notion.
+    Resolves the next version number automatically and uploads images.
+    """
     try:
         result = await publish_to_notion(req)
 
@@ -195,6 +223,10 @@ async def api_publish_document(req: NotionPublishRequest):
 
 @router.get("/library/notion")
 async def api_notion_library():
+    """
+    Fetch the list of all published documents directly from the Notion database.
+    Used to populate the Document Library view in the frontend.
+    """
     try:
         # Try cache first (5-min TTL)
         cached = await cache.get_notion_library()

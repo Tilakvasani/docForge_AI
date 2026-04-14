@@ -1,0 +1,16 @@
+[
+  {
+    "question": "What are the confidentiality obligations in the NDA?",
+    "ground_truth": "The NDA requires both parties to keep all shared business information strictly confidential and not disclose it to any third party without prior written consent.",
+    "timestamp": "14:15:54",
+    "tool_used": "search",
+    "answer": "The confidentiality obligations in the NDA require the receiving party to protect all confidential information disclosed under the agreement. Disclosures are only allowed if legally permitted or to affiliates or advisors under equivalent confidentiality terms. Breaches of these obligations may result in injunctive relief, damages, termination of agreements, and the return or destruction of confidential materials. The document covers the scope of protection and consequences of breaches but does not specify the exact types of confidential information covered.",
+    "scores": {
+      "faithfulness": 0.909,
+      "answer_relevancy": 0.857,
+      "context_precision": 1.0,
+      "context_recall": 1.0
+    },
+    "error": null
+  }
+]

@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DocForge AI + CiteRAG",
-    description="AI document generation (DocForge) and RAG Q&A (CiteRAG) for Turabit",
+    description="AI document generation (DocForge) and RAG Q&A (CiteRAG).",
     version="5.0.0",
     lifespan=lifespan,
 )

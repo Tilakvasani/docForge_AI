@@ -5,6 +5,8 @@ Enhanced prompt system for 100+ industry-standard documents.
 Covers: question generation, full document generation, section
 editing/enhancement, and structural metadata per document type.
 """
+from langchain_core.prompts import PromptTemplate
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  DOCUMENT STRUCTURAL METADATA
@@ -477,7 +479,6 @@ DOC_STRUCTURE_METADATA = {
 #  QUESTION GENERATION PROMPTS 
 # ─────────────────────────────────────────────────────────────────────────────
 
-from langchain_core.prompts import PromptTemplate
 
 # ── Text ──────────────────────────────────────────────────────────────────────
 

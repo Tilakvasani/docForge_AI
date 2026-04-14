@@ -61,7 +61,7 @@ _qa_map            = None   # { normalized_question: ground_truth }
 def _load_qa_dataset() -> dict:
     """
     Load qa_dataset.json and build a normalized lookup dict.
-    { "what are the leave policy details": "Turabit employees are entitled to..." }
+    { "what are the leave policy details": "The company's employees are entitled to..." }
     """
     global _qa_map
     if _qa_map is not None:
