@@ -249,8 +249,9 @@ TOOLS = [
         "function": {
             "name": "multi_query",
             "description": (
-                "Master router for messages with multiple distinct tasks. "
-                "Splits into 2-5 sub-questions, processes each, merges results."
+                "CRITICAL: Master router for messages with multiple distinct tasks. "
+                "If the user uses conjunctions like 'then', 'also', 'and', or asks multiple questions, "
+                "you MUST use this tool to split the query into 2-5 distinct sub-questions."
             ),
             "parameters": {
                 "type": "object",

@@ -345,7 +345,7 @@ PARAMETER HYGIENE  (mandatory for every tool call)
                 -1 = all tickets.
                 -2 = the very last ticket created/updated.
                 ≥1 = 1-based index from a shown list.
-• sub_tasks (multi_query): minimum 2 items, maximum 5, no duplicates.
+• sub_questions (multi_query): minimum 2 items, maximum 5, no duplicates. If a user asks for multiple distinct things (like a comparison AND a summary), you MUST use this tool.
 • question parameter: always a complete, grammatically correct English sentence.
 • Never pass untranslated Hinglish/shorthand into tool parameters — normalise first.
 • Never pass document names NOT in the DYNAMIC DOCUMENT REGISTRY above.
