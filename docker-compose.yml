@@ -1,71 +1,47 @@
 version: "3.9"
-
 services:
-  # ── PostgreSQL ────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER:     ${POSTGRES_USER:-docforge}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docforge}
-      POSTGRES_DB:       ${POSTGRES_DB:-docforge}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+      POSTGRES_USER: docforge
+      POSTGRES_PASSWORD: docforge
+      POSTGRES_DB: docforge
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-docforge} -d ${POSTGRES_DB:-docforge}"]
+      test: ["CMD-SHELL", "pg_isready -U docforge"]
       interval: 10s
-      timeout: 5s
       retries: 5
 
-  # ── Redis ─────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     restart: always
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
-  # ── Backend ───────────────────────────────────────────────────────────────────
   backend:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
+    image: tilakvasani/docforge-backend:latest
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      # M9 FIX: inject Postgres URL so backend finds DB out-of-the-box.
-      # Override in .env if using an external Postgres instance.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-docforge}:${POSTGRES_PASSWORD:-docforge}@postgres:5432/${POSTGRES_DB:-docforge}
+      DATABASE_URL: postgresql://docforge:docforge@postgres:5432/docforge
+      REDIS_URL: redis://redis:6379
+      BACKEND_URL: http://backend:8000
     depends_on:
-      redis:
-        condition: service_healthy
       postgres:
         condition: service_healthy
-    volumes:
-      - .:/app
+      redis:
+        condition: service_started
     restart: always
 
-  # ── Frontend ──────────────────────────────────────────────────────────────────
   frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile.frontend
+    image: tilakvasani/docforge-frontend:latest
     ports:
       - "8501:8501"
-    env_file:
-      - .env
+    env_file: .env
+    environment:
+      # M10 FIX: Use Docker service name for inter-container communication
+      BACKEND_URL: http://backend:8000
     depends_on:
       - backend
-    volumes:
-      - .:/app
     restart: always
 
 volumes:

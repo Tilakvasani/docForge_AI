@@ -35,7 +35,7 @@ except ImportError:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/") + "/api"
+API_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/") + "/api"
 
 _TAB_MAP = {
     "💬 CiteRAG": "ask",
