@@ -66,12 +66,12 @@ class AskRequest(BaseModel):
     """
     # H5 FIX: Constrained fields to prevent oversized prompts and Redis key injection
     question:       str = Field(..., max_length=2000)
-    filters:        Dict[str, str] = {}
+    filters:        Dict[str, str] = Field(default_factory=dict)
     session_id:     str = Field("default", max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
     top_k:          int = 5
     doc_a:          str = ""
     doc_b:          str = ""
-    doc_list:       list[str] = []
+    doc_list:       list[str] = Field(default_factory=list)
     stream:         bool = False
     skip_cache:     bool = False
 
