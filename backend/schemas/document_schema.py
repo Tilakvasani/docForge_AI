@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 
 
@@ -8,7 +8,7 @@ class GenerateQuestionsRequest(BaseModel):
     section_name: str
     doc_type: str
     department: str
-    company_context: Optional[Dict[str, str]] = {}
+    company_context: Optional[Dict[str, str]] = Field(default_factory=dict)
 
 
 class SaveAnswersRequest(BaseModel):
@@ -27,7 +27,7 @@ class GenerateSectionRequest(BaseModel):
     section_name: str
     doc_type: str
     department: str
-    company_context: Optional[Dict[str, str]] = {}
+    company_context: Optional[Dict[str, str]] = Field(default_factory=dict)
     num_sections: Optional[int] = 10
 
 
@@ -45,4 +45,4 @@ class NotionPublishRequest(BaseModel):
     doc_type: str
     department: str
     gen_doc_full: str
-    company_context: Optional[Dict[str, str]] = {}
+    company_context: Optional[Dict[str, str]] = Field(default_factory=dict)
