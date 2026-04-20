@@ -37,6 +37,10 @@ DEPT_MAP = {
 
 
 def _get_notion_token() -> str:
+    """
+    Retrieve the Notion API token from environment settings.
+    Raises ValueError if neither NOTION_TOKEN nor NOTION_API_KEY is configured.
+    """
     token = settings.NOTION_TOKEN or settings.NOTION_API_KEY
     if not token:
         raise ValueError("Notion token not set. Add NOTION_TOKEN=secret_xxx to your .env")
@@ -44,6 +48,11 @@ def _get_notion_token() -> str:
 
 
 def _get_notion_db_id() -> str:
+    """
+    Retrieve and sanitize the Notion Database ID.
+    Strips trailing view suffixes ('?v=...') and full URL prefixes.
+    Raises ValueError if not configured.
+    """
     raw = settings.NOTION_DATABASE_ID or ""
     if "notion.so/" in raw:
         raw = raw.split("notion.so/")[-1]
@@ -54,6 +63,7 @@ def _get_notion_db_id() -> str:
 
 
 def _headers() -> dict:
+    """Generate standard HTTP headers for Notion API requests."""
     return {
         "Authorization": f"Bearer {_get_notion_token()}",
         "Content-Type": "application/json",
@@ -62,6 +72,7 @@ def _headers() -> dict:
 
 
 def _txt(content: str, bold=False, italic=False, code=False, color="default") -> dict:
+    """Helper to build a Notion rich_text object with annotations."""
     return {
         "type": "text",
         "text": {"content": content},
@@ -101,6 +112,10 @@ def _callout(lines: list, emoji: str = "📋", color: str = "gray_background") -
 
 
 def _table_to_notion(table_lines: list) -> Optional[dict]:
+    """
+    Convert a list of Markdown pipe table rows into a Notion table block.
+    Returns None if no valid rows are found.
+    """
     rows = []
     for line in table_lines:
         if all(c in '-|: ' for c in line):
@@ -157,6 +172,11 @@ def _parse_mermaid_steps(mermaid_text: str) -> list:
 
 
 def _mermaid_to_notion_blocks(mermaid_text: str, section_name: str = "") -> list:
+    """
+    Convert Mermaid flowchart syntax into a sequence of Notion blocks.
+    Outputs a colored Callout acting as a header, followed by a bulleted/numbered
+    list representing the parsed diagram steps.
+    """
     blocks = [{
         "object": "block", "type": "callout",
         "callout": {
@@ -194,6 +214,11 @@ def _mermaid_to_notion_blocks(mermaid_text: str, section_name: str = "") -> list
 
 
 async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
+    """
+    Parse a large plain-text document (with Markdown elements) into a list of 
+    Notion block objects (paragraphs, headings, tables, bullet lists, etc.).
+    Handles interleaved Mermaid diagrams by calling `_mermaid_to_notion_blocks`.
+    """
     blocks          = [meta_callout, _divider()]
     mermaid_pattern = re.compile(r'```mermaid(.*?)```', re.DOTALL)
     segments        = mermaid_pattern.split(plain_text)
@@ -280,6 +305,11 @@ async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
 
 
 async def _post_blocks_in_batches(page_id: str, blocks: list):
+    """
+    Append blocks to a Notion page in chunks of 100 to adhere to API limits.
+    Implements exponential backoff (up to 4 attempts) for HTTP 429 Rate Limits.
+    Raises RuntimeError if a chunk fails to post successfully.
+    """
     async with httpx.AsyncClient(timeout=30) as client:
         for start in range(0, len(blocks), 100):
             batch = blocks[start:start + 100]
@@ -302,6 +332,12 @@ async def _post_blocks_in_batches(page_id: str, blocks: list):
 
 
 async def _get_next_version(dept: str, doc_type: str) -> int:
+    """
+    Query the Notion database to find the highest existing 'Version' number for 
+    documents matching the given Department and Doc Type.
+    Returns the next version number (existing_max + 1) or 1 if no matches exist.
+    Falls back to version 1 on network or API failures.
+    """
     query = {
         "filter": {
             "and": [
@@ -340,6 +376,18 @@ async def _get_next_version(dept: str, doc_type: str) -> int:
 
 
 async def publish_to_notion(request: NotionPublishRequest) -> dict:
+    """
+    Generate and publish a complete document to the Notion database.
+    
+    1. Determines the next available version number.
+    2. Constructs a 'meta' callout block with generated document attributes.
+    3. Parses the Markdown document text into native Notion Block Objects.
+    4. Creates the root Notion Page with properties (Status, Dept, Industry).
+    5. Appends the parsed child blocks to the new page in batches.
+    
+    Returns a dict containing the notion_url, page_id, and version number.
+    Raises Exception if the page creation API call fails.
+    """
     ctx        = request.company_context or {}
     company    = ctx.get("company_name", "Company")
     industry   = ctx.get("industry", "")
@@ -410,6 +458,11 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
 
 
 async def fetch_library_from_notion() -> list:
+    """
+    Query the Notion database for all published documents, sorted descending by Created At.
+    Handles Notion API pagination (using cursors) to retrieve the complete library.
+    Normalizes the database properties into a clean list of dictionaries for the frontend.
+    """
     library, cursor = [], None
     async with httpx.AsyncClient(timeout=30) as client:
         while True:
