@@ -1,7 +1,9 @@
 """
-DocForge AI — flowchart_renderer.py  v1.0
-Converts a Mermaid flowchart TD block into a high-quality PNG image
-using only matplotlib + Python stdlib. No Node.js, no external APIs.
+flowchart_renderer.py — Flowchart Rasteriser
+============================================
+
+Converts Mermaid TD flowchart syntax into high-quality PNG images
+using Matplotlib, enabling seamless embedding into Word documents.
 """
 
 import re

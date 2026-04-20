@@ -1,16 +1,22 @@
 """
-DocForge AI — generator.py
-Section-type-aware generation pipeline.
-All prompts imported from prompts/prompts.py (single source of truth).
+Section-type-aware document generation pipeline for DocForge AI.
+
+Orchestrates the full generation flow for individual document sections:
+    1. Detect the section type (text, table, flowchart, raci, signature).
+    2. Generate LLM questions appropriate for that type.
+    3. Accept and persist user answers.
+    4. Generate section content using the matching prompt template.
+    5. Apply post-processing (markdown stripping, word-count enforcement).
+
+All LLM prompts are imported from `backend/prompts/prompts.py` as the
+single source of truth for prompt templates.
 """
 
 import re
-from langchain_openai import AzureChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 
-from backend.core.config import settings
 from backend.core.logger import logger
-from backend.core.llm import get_llm          # H6+M1 FIX: shared factory, uses settings.AZURE_LLM_API_VERSION
+from backend.core.llm import get_llm
 from backend.services.db_service import (
     save_questions, save_answers, get_qa_by_sec_id,
     update_section_content, get_generated_document,
@@ -23,7 +29,6 @@ from backend.schemas.document_schema import (
     GenerateSectionRequest, EditSectionRequest,
 )
 
-# Import DOC_STRUCTURE_METADATA + ALL prompts from templates.py (single source of truth)
 from backend.prompts.prompts import (
     DOC_STRUCTURE_METADATA,
     TEXT_QUESTIONS_PROMPT,
@@ -39,22 +44,12 @@ from backend.prompts.prompts import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SECTION TYPE CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
-
 SECTION_TYPE_TEXT       = "text"
 SECTION_TYPE_TABLE      = "table"
 SECTION_TYPE_FLOWCHART  = "flowchart"
 SECTION_TYPE_RACI       = "raci"
 SECTION_TYPE_SIGNATURE  = "signature"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  KEYWORD FALLBACK PATTERNS
-#  Used when doc_type is not in DOC_STRUCTURE_METADATA or as a secondary check
-#  for which SECTION within a doc needs which type.
-# ─────────────────────────────────────────────────────────────────────────────
 
 SECTION_TYPE_PATTERNS = {
     SECTION_TYPE_SIGNATURE: [
@@ -83,36 +78,30 @@ SECTION_TYPE_PATTERNS = {
 }
 
 
-# Local get_llm removed — using backend.core.llm.get_llm directly (imported above).
-# This eliminates the hardcoded api_version and the duplicate factory.
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SECTION TYPE DETECTOR
-# ─────────────────────────────────────────────────────────────────────────────
-
 def detect_section_type(doc_type: str, section_name: str) -> str:
     """
-    Determine the rendering type for a section.
+    Determine the appropriate rendering type for a document section.
 
-    Priority:
-      1. DOC_STRUCTURE_METADATA flags keyed by doc_type
-         — but only if the section_name matches the expected section for that flag
-         (uses keyword fallback to confirm, except for signature which always wins)
-      2. Section name keyword patterns
-      3. Default: text
+    Resolution order:
+        1. Signature keywords in the section name always win.
+        2. If the document metadata flags a type (e.g. `has_raci`) AND the
+           section name confirms it via keyword matching, that type is used.
+        3. Section name keyword matching alone (for docs without metadata flags).
+        4. Default: `"text"`.
+
+    Args:
+        doc_type:     The document type (e.g. "Standard Operating Procedure").
+        section_name: The section name to classify.
+
+    Returns:
+        One of: `"text"`, `"table"`, `"flowchart"`, `"raci"`, `"signature"`.
     """
     sec_lower = section_name.lower()
-
-    # ── Priority 1: metadata flags ───────────────────────────────────────────
     meta = DOC_STRUCTURE_METADATA.get(doc_type, {})
 
-    # Signature check first — section name is the deciding signal
     if _matches_keywords(sec_lower, SECTION_TYPE_PATTERNS[SECTION_TYPE_SIGNATURE]):
         return SECTION_TYPE_SIGNATURE
 
-    # For table/flowchart/raci, the metadata flag tells us the doc CAN have it,
-    # but the section name confirms WHICH section it applies to.
     if meta.get("has_raci") and _matches_keywords(sec_lower, SECTION_TYPE_PATTERNS[SECTION_TYPE_RACI]):
         return SECTION_TYPE_RACI
 
@@ -122,7 +111,6 @@ def detect_section_type(doc_type: str, section_name: str) -> str:
     if meta.get("has_table") and _matches_keywords(sec_lower, SECTION_TYPE_PATTERNS[SECTION_TYPE_TABLE]):
         return SECTION_TYPE_TABLE
 
-    # ── Priority 2: section name keywords alone ───────────────────────────────
     for stype in [SECTION_TYPE_RACI, SECTION_TYPE_FLOWCHART, SECTION_TYPE_TABLE]:
         if _matches_keywords(sec_lower, SECTION_TYPE_PATTERNS[stype]):
             return stype
@@ -131,14 +119,25 @@ def detect_section_type(doc_type: str, section_name: str) -> str:
 
 
 def _matches_keywords(text: str, keywords: list) -> bool:
+    """Return True if any keyword from `keywords` appears as a substring of `text`."""
     return any(kw in text for kw in keywords)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  QUESTION GENERATION HANDLER
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def generate_questions(req: GenerateQuestionsRequest) -> dict:
+    """
+    Generate contextual questions for a document section via the LLM.
+
+    The section type is detected first to select the appropriate prompt
+    template. Signature sections always produce zero questions. The
+    generated questions are persisted to the database before returning.
+
+    Args:
+        req: A `GenerateQuestionsRequest` with section and company metadata.
+
+    Returns:
+        A dict with keys: `sec_id`, `doc_sec_id`, `doc_id`, `section_name`,
+        `section_type`, and `questions`.
+    """
     ctx       = req.company_context or {}
     doc_type  = req.doc_type
     sec_name  = req.section_name
@@ -147,13 +146,12 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
 
     logger.info(f"Section type detected: '{sec_type}' for '{sec_name}' in '{doc_type}'")
 
-    # Signature: always 0 questions
     if sec_type == SECTION_TYPE_SIGNATURE:
         questions = []
 
     elif sec_type == SECTION_TYPE_TABLE:
         chain     = TABLE_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
-        raw       = (await chain.ainvoke({       # H6 FIX: was chain.invoke (blocking)
+        raw       = (await chain.ainvoke({
             "section_name": sec_name,
             "doc_type":     doc_type,
             "department":   req.department,
@@ -165,7 +163,7 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
 
     elif sec_type == SECTION_TYPE_FLOWCHART:
         chain     = FLOWCHART_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
-        raw       = (await chain.ainvoke({       # H6 FIX: was chain.invoke (blocking)
+        raw       = (await chain.ainvoke({
             "section_name":   sec_name,
             "doc_type":       doc_type,
             "department":     req.department,
@@ -177,7 +175,7 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
 
     elif sec_type == SECTION_TYPE_RACI:
         chain     = RACI_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
-        raw       = (await chain.ainvoke({       # H6 FIX: was chain.invoke (blocking)
+        raw       = (await chain.ainvoke({
             "section_name": sec_name,
             "doc_type":     doc_type,
             "department":   req.department,
@@ -187,9 +185,9 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
         })).strip()
         questions = _parse_questions(raw, max_q=2)
 
-    else:  # SECTION_TYPE_TEXT (default)
+    else:
         chain     = TEXT_QUESTIONS_PROMPT | get_llm(0.3) | StrOutputParser()
-        raw       = (await chain.ainvoke({       # H6 FIX: was chain.invoke (blocking)
+        raw       = (await chain.ainvoke({
             "section_name": sec_name,
             "doc_type":     doc_type,
             "department":   req.department,
@@ -218,7 +216,19 @@ async def generate_questions(req: GenerateQuestionsRequest) -> dict:
 
 
 def _parse_questions(raw: str, max_q: int) -> list:
-    """Parse LLM question output, strip non-questions, cap at max_q."""
+    """
+    Parse raw LLM output into a clean list of question strings.
+
+    Strips leading numbering, bullets, and whitespace. Skips lines shorter
+    than 10 characters. Caps output at `max_q` questions.
+
+    Args:
+        raw:   Raw text from the LLM output parser.
+        max_q: Maximum number of questions to return.
+
+    Returns:
+        A list of clean question strings, capped at `max_q`.
+    """
     if not raw or raw.strip().upper() == "NONE":
         return []
     lines = [
@@ -229,11 +239,16 @@ def _parse_questions(raw: str, max_q: int) -> list:
     return lines[:max_q]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SAVE ANSWERS
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def save_user_answers(req: SaveAnswersRequest) -> dict:
+    """
+    Persist user-provided answers for a document section.
+
+    Args:
+        req: A `SaveAnswersRequest` with section ID, questions, and answers.
+
+    Returns:
+        A dict with `sec_id`, `section_name`, and `saved: True`.
+    """
     await save_answers(
         sec_id=req.sec_id, questions=req.questions,
         answers=req.answers, section_name=req.section_name
@@ -241,22 +256,33 @@ async def save_user_answers(req: SaveAnswersRequest) -> dict:
     return {"sec_id": req.sec_id, "section_name": req.section_name, "saved": True}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  SECTION CONTENT GENERATION HANDLER
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def generate_section_content(req: GenerateSectionRequest) -> dict:
+    """
+    Generate content for a document section using the appropriate LLM prompt.
+
+    Retrieves the stored Q&A data, selects the matching generation prompt
+    based on the section type, invokes the LLM, and applies post-processing
+    (markdown stripping, flowchart fencing, word-count enforcement for text).
+
+    Args:
+        req: A `GenerateSectionRequest` with section metadata and company context.
+
+    Returns:
+        A dict with `sec_id`, `section_name`, `section_type`, and `content`.
+
+    Raises:
+        ValueError: If no Q&A record exists for `req.sec_id`.
+    """
     qa_row = await get_qa_by_sec_id(req.sec_id)
     if not qa_row:
         raise ValueError(f"No Q&A found for sec_id={req.sec_id}")
 
-    qa_data     = qa_row["doc_sec_que_ans"]
-    questions   = qa_data.get("questions", [])
-    answers     = qa_data.get("answers", [])
-    # Prefer the type saved at question-gen time; re-detect as fallback
-    sec_type    = qa_data.get("section_type") or detect_section_type(req.doc_type, req.section_name)
-    ctx         = req.company_context or {}
-    meta        = DOC_STRUCTURE_METADATA.get(req.doc_type, {})
+    qa_data      = qa_row["doc_sec_que_ans"]
+    questions    = qa_data.get("questions", [])
+    answers      = qa_data.get("answers", [])
+    sec_type     = qa_data.get("section_type") or detect_section_type(req.doc_type, req.section_name)
+    ctx          = req.company_context or {}
+    meta         = DOC_STRUCTURE_METADATA.get(req.doc_type, {})
 
     company_name = ctx.get("company_name", "the company")
     industry     = ctx.get("industry", "general")
@@ -267,11 +293,9 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
 
     logger.info(f"Generating [{sec_type.upper()}] section: '{req.section_name}'")
 
-    # ── Dispatch to correct generator ────────────────────────────────────────
-
     if sec_type == SECTION_TYPE_SIGNATURE:
         chain = SECTION_SIGNATURE_PROMPT | get_llm(0.4) | StrOutputParser()
-        raw   = (await chain.ainvoke({          # H6 FIX: was chain.invoke (blocking)
+        raw   = (await chain.ainvoke({
             "doc_type":     req.doc_type,
             "department":   department,
             "company_name": company_name,
@@ -281,7 +305,7 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
 
     elif sec_type == SECTION_TYPE_TABLE:
         chain = SECTION_TABLE_PROMPT | get_llm(0.5) | StrOutputParser()
-        raw   = (await chain.ainvoke({          # H6 FIX: was chain.invoke (blocking)
+        raw   = (await chain.ainvoke({
             "doc_type":     req.doc_type,
             "department":   department,
             "section_name": req.section_name,
@@ -296,7 +320,7 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
 
     elif sec_type == SECTION_TYPE_FLOWCHART:
         chain = SECTION_FLOWCHART_PROMPT | get_llm(0.5) | StrOutputParser()
-        raw   = (await chain.ainvoke({          # H6 FIX: was chain.invoke (blocking)
+        raw   = (await chain.ainvoke({
             "doc_type":       req.doc_type,
             "department":     department,
             "section_name":   req.section_name,
@@ -311,7 +335,7 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
 
     elif sec_type == SECTION_TYPE_RACI:
         chain = SECTION_RACI_PROMPT | get_llm(0.4) | StrOutputParser()
-        raw   = (await chain.ainvoke({          # H6 FIX: was chain.invoke (blocking)
+        raw   = (await chain.ainvoke({
             "doc_type":     req.doc_type,
             "department":   department,
             "section_name": req.section_name,
@@ -324,10 +348,10 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
         clean = _clean_preserve_tables(raw)
         logger.info(f"RACI section '{req.section_name}' generated")
 
-    else:  # SECTION_TYPE_TEXT
+    else:
         target_words = get_words_per_section(req.doc_type, req.num_sections or 10)
         chain        = SECTION_TEXT_PROMPT | get_llm(0.7) | StrOutputParser()
-        raw          = (await chain.ainvoke({   # H6 FIX: was chain.invoke (blocking)
+        raw          = (await chain.ainvoke({
             "doc_type":     req.doc_type,
             "department":   department,
             "section_name": req.section_name,
@@ -350,24 +374,35 @@ async def generate_section_content(req: GenerateSectionRequest) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  EDIT SECTION
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def edit_section(req: EditSectionRequest) -> dict:
-    # M7/M8 FIX: prefer section_type saved at question-gen time over re-detection.
-    # Re-detection reads only the section name, which can mis-classify edited content.
-    sec_type = "text"  # safe default
+    """
+    Apply a user-provided edit instruction to existing section content.
+
+    The section type is read from the stored Q&A record (if available) to
+    ensure the correct post-processing pipeline is applied. Falls back to
+    detection from `doc_type` + `section_name` if the stored type is absent.
+
+    After editing, updates the full document text in the database by
+    replacing the first occurrence of the old content.
+
+    Args:
+        req: An `EditSectionRequest` with gen_id, section metadata,
+             current content, and the edit instruction.
+
+    Returns:
+        A dict with `sec_id`, `section_name`, `section_type`, and
+        `updated_content`.
+    """
+    sec_type = "text"
     if req.sec_id:
         qa_row = await get_qa_by_sec_id(req.sec_id)
         if qa_row:
             sec_type = qa_row.get("doc_sec_que_ans", {}).get("section_type", "text") or "text"
-    # Fallback: re-detect from doc_type + section_name (original behaviour)
     if sec_type == "text" and hasattr(req, "doc_type") and req.doc_type:
         sec_type = detect_section_type(req.doc_type, req.section_name)
 
     chain   = EDIT_PROMPT | get_llm(0.6) | StrOutputParser()
-    raw     = (await chain.ainvoke({             # H6 FIX: was chain.invoke (blocking)
+    raw     = (await chain.ainvoke({
         "section_name":     req.section_name,
         "section_type":     sec_type,
         "current_content":  req.current_content,
@@ -383,8 +418,6 @@ async def edit_section(req: EditSectionRequest) -> dict:
     if gen_doc:
         full_doc = gen_doc.get("gen_doc_full", "")
         if req.current_content in full_doc:
-            # M7 FIX: replace only the FIRST occurrence to avoid double-replacing
-            # repeated boilerplate paragraphs that look identical in two sections.
             full_doc = full_doc.replace(req.current_content, updated, 1)
         else:
             logger.warning(
@@ -402,12 +435,19 @@ async def edit_section(req: EditSectionRequest) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PRIVATE UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _build_qa_block(questions: list, answers: list) -> str:
-    """Format Q&A pairs for injection into any generation prompt."""
+    """
+    Format question-answer pairs as a plain text block for prompt injection.
+
+    Returns a fallback message when no questions are present.
+
+    Args:
+        questions: List of question strings.
+        answers:   List of answer strings aligned by index.
+
+    Returns:
+        A formatted string with Q/A pairs, or a placeholder if empty.
+    """
     if not questions:
         return "No specific input provided — use professional industry-standard placeholder content."
     pairs = []
@@ -419,14 +459,22 @@ def _build_qa_block(questions: list, answers: list) -> str:
 
 def _clean_preserve_tables(text: str) -> str:
     """
-    Strip markdown formatting from non-table lines.
-    Pipe-format tables are preserved exactly.
+    Strip markdown formatting from non-table content while preserving pipe tables.
+
+    Lines containing `|` are kept verbatim. All other lines are passed through
+    `markdown_to_plain_text`. Consecutive blank lines are collapsed to two.
+
+    Args:
+        text: Raw LLM output that may contain markdown and pipe-format tables.
+
+    Returns:
+        Cleaned plain text with tables intact.
     """
     lines  = text.split("\n")
     result = []
     for line in lines:
         if "|" in line:
-            result.append(line.rstrip())          # table row — preserve as-is
+            result.append(line.rstrip())
         else:
             result.append(markdown_to_plain_text(line))
     return re.sub(r"\n{3,}", "\n\n", "\n".join(result)).strip()
@@ -434,13 +482,18 @@ def _clean_preserve_tables(text: str) -> str:
 
 def _clean_preserve_flowcharts(text: str) -> str:
     """
-    Preserve ```mermaid ... ``` blocks exactly.
-    Strip markdown from everything outside those blocks.
+    Preserve Mermaid fenced blocks while stripping markdown from surrounding text.
 
-    Safety net: if LLM output contains 'flowchart TD' without backtick fences,
-    automatically wraps it so docx_builder can detect and render it as an image.
+    If the LLM produced a bare `flowchart TD` block without backtick fences,
+    the function automatically wraps it so downstream renderers can detect it.
+
+    Args:
+        text: Raw LLM output that may contain Mermaid flowchart syntax.
+
+    Returns:
+        Cleaned text with all Mermaid blocks fenced and markdown stripped
+        from non-Mermaid content.
     """
-    # Auto-wrap bare flowchart blocks (LLM forgot the fences)
     if re.search(r'flowchart\s+(?:TD|LR|BT|RL)', text) and "```mermaid" not in text:
         text = re.sub(
             r'(flowchart\s+(?:TD|LR|BT|RL).*?)(\n\n|\Z)',
@@ -454,17 +507,29 @@ def _clean_preserve_flowcharts(text: str) -> str:
     cleaned = []
     for i, part in enumerate(parts):
         if i % 2 == 1:
-            # Odd index = inside a mermaid block — preserve verbatim
             cleaned.append(part)
         else:
-            # Even index = outside mermaid block — strip markdown
             cleaned.append(_clean_preserve_tables(part))
     result = "\n".join(cleaned)
     return re.sub(r"\n{3,}", "\n\n", result).strip()
 
 
 def _enforce_word_limit(text: str, target_words: int) -> str:
-    """Hard-truncate text to target_words at the nearest sentence boundary."""
+    """
+    Hard-truncate `text` to approximately `target_words` at the nearest sentence boundary.
+
+    Truncation is only applied when the word count exceeds `target_words * 1.2`.
+    The cut is made at the last sentence-ending punctuation (`.`, `!`, `?`)
+    found in the first `target_words` words, provided it falls past 60% of
+    the truncation point.
+
+    Args:
+        text:         The text to truncate.
+        target_words: Maximum desired word count.
+
+    Returns:
+        The text unchanged if within limit, otherwise the truncated version.
+    """
     words = text.split()
     if len(words) <= int(target_words * 1.2):
         return text

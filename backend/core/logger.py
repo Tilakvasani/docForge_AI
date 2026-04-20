@@ -1,11 +1,15 @@
 """
-logger.py — Pretty PowerShell-friendly logging for CiteRAG / DocForge
+Structured console logging for DocForge AI.
 
-Output format:
-  14:32:05  ℹ  Redis connected
-  14:32:05  ✅ Agent compiled — nodes: [...]
-  14:32:08  ⚠️  Classifier LLM failed — defaulting to DOCUMENT
-  14:32:09  ❌ create_ticket error: ...
+Produces compact, emoji-prefixed log lines readable in any terminal:
+
+    14:32:05  ℹ️   [app]    DocForge AI backend started
+    14:32:08  ⚠️   [agent]  Classifier LLM failed — defaulting to DOCUMENT
+    14:32:09  ❌  [routes]  Notion API 429: rate limit exceeded
+
+The logger is initialized lazily via `_setup_logging()`, which is called
+once during the FastAPI lifespan startup to avoid conflicts with uvicorn's
+own logging configuration on hot-reload.
 """
 
 import logging
@@ -13,7 +17,6 @@ import sys
 from backend.core.config import settings
 
 
-# ── Emoji map per level ───────────────────────────────────────────────────────
 _LEVEL_EMOJI = {
     logging.DEBUG:    "🔎",
     logging.INFO:     "ℹ️ ",
@@ -22,7 +25,6 @@ _LEVEL_EMOJI = {
     logging.CRITICAL: "🔥",
 }
 
-# Shorten noisy module names for cleaner output
 _MODULE_ALIASES = {
     "backend.agents.agent_graph":         "agent",
     "backend.api.agent_routes":           "routes",
@@ -43,41 +45,33 @@ _MODULE_ALIASES = {
 
 class _PrettyFormatter(logging.Formatter):
     """
-    Compact, emoji-prefixed formatter for console output.
-    
-    Generates a log line in the format:
-      [HH:MM:SS] [EMOJI] [MODULE] [MESSAGE]
-    
-    Attributes:
-        datefmt (str): Format string for the timestamp.
+    Compact, emoji-prefixed log formatter for console output.
+
+    Produces lines in the format:
+        [HH:MM:SS]  [EMOJI]  [module]  message
+
+    Long module names are replaced with short aliases defined in
+    `_MODULE_ALIASES`. Exception tracebacks are indented for readability.
     """
 
     def format(self, record: logging.LogRecord) -> str:
         """
-        Formats a LogRecord into a pretty console string.
-        
+        Format a `LogRecord` into a single, human-readable console line.
+
         Args:
-            record: The logging.LogRecord to format.
-            
+            record: The log record to format.
+
         Returns:
-            The formatted string with emoji and shortened module names.
+            A formatted string including timestamp, emoji, module alias,
+            message, and any attached exception traceback.
         """
-        # Time — only HH:MM:SS, no date
         time_str = self.formatTime(record, "%H:%M:%S")
+        emoji    = _LEVEL_EMOJI.get(record.levelno, "  ")
+        module   = _MODULE_ALIASES.get(record.name, record.name.split(".")[-1])
+        msg      = record.getMessage()
 
-        # Emoji for level
-        emoji = _LEVEL_EMOJI.get(record.levelno, "  ")
-
-        # Short module name
-        module = _MODULE_ALIASES.get(record.name, record.name.split(".")[-1])
-
-        # Message
-        msg = record.getMessage()
-
-        # Attach exception if present
         if record.exc_info:
-            exc_text = self.formatException(record.exc_info)
-            # indent exception lines for readability
+            exc_text  = self.formatException(record.exc_info)
             exc_lines = "\n".join("      " + l for l in exc_text.splitlines())
             msg = f"{msg}\n{exc_lines}"
 
@@ -86,30 +80,20 @@ class _PrettyFormatter(logging.Formatter):
 
 def _setup_logging():
     """
-    Initializes the global logging configuration.
+    Initialize the global logging configuration for DocForge AI.
 
-    - Sets the log level from settings.
-    - Attaches the _PrettyFormatter to the stream handler.
-    - Silences noisy third-party libraries (httpx, urllib3, etc.).
-    - Configures uvicorn access logs to be less verbose in production.
-
-    CRASH FIX (Windows / Python 3.11 SpawnProcess):
-      We must NOT call logging.basicConfig(force=True) inside a uvicorn
-      spawned sub-process.  force=True replaces ALL existing handlers on the
-      root logger — including the ones uvicorn sets up via dictConfig — which
-      triggers the 'configure_custom' traceback on every hot-reload.
-      Instead we attach our handler only when the root logger has no
-      StreamHandler pointing at stdout yet (first-time setup), and in all
-      other cases we simply set the level and let uvicorn's own handlers
-      remain in place.
+    Attaches `_PrettyFormatter` to the root logger's stdout `StreamHandler`
+    and silences noisy third-party libraries. Safe to call multiple times —
+    if a stdout `StreamHandler` already exists (e.g. installed by uvicorn),
+    the formatter is updated in place rather than adding a duplicate handler.
+    This prevents double-printing on hot-reload and avoids conflicts with
+    uvicorn's internal `dictConfig` setup on Windows.
     """
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
 
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Only add our pretty handler if no stdout StreamHandler exists yet.
-    # This prevents double-printing on reload and avoids the dictConfig crash.
     already_has_stdout = any(
         isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout
         for h in root.handlers
@@ -120,8 +104,6 @@ def _setup_logging():
         handler.setLevel(level)
         root.addHandler(handler)
     else:
-        # Re-apply our formatter to the existing stdout handler so log style
-        # is consistent even after uvicorn re-installs its own handlers.
         for h in root.handlers:
             if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout:
                 h.setFormatter(_PrettyFormatter())
@@ -133,7 +115,5 @@ def _setup_logging():
     if level > logging.DEBUG:
         logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
-
-# _setup_logging() is now called by main.py lifespan
 
 logger = logging.getLogger("app")

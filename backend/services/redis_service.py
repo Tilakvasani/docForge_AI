@@ -1,40 +1,43 @@
 """
-DocForge AI — redis_service.py
-Redis caching layer with graceful fallback.
-If Redis is unavailable, all cache ops are no-ops and the app works normally.
+redis_service.py — Async Redis caching layer with graceful fallback
+====================================================================
 
-Cache keys & TTLs:
-  departments              → 1 hour  (static DB data)
-  sections:{doc_type}      → 1 hour  (static DB data)
-  questions:{sec_id}       → 24 hours (expensive LLM call)
-  section:{sec_id}         → 24 hours (most expensive LLM call)
-  notion_library           → 5 minutes (Notion API call)
+All cache operations are no-ops when Redis is unavailable, so the
+application continues to function without it.
 
-Usage:
-  from backend.services.redis_service import cache
-  value = await cache.get("mykey")
-  await cache.set("mykey", data, ttl=3600)
-  await cache.delete("mykey")
-  await cache.flush_pattern("sections:*")
+Cache keys and TTLs:
+    departments              — 1 hour   (static database data)
+    sections:{doc_type}      — 1 hour   (static database data)
+    questions:{sec_id}       — 24 hours (LLM-generated questions)
+    section:{sec_id}         — 24 hours (LLM-generated section content)
+    notion_library           — 5 minutes (live Notion API results)
+
+Public singleton:
+    cache  — a pre-constructed `RedisCache` instance ready for import.
+
+Usage::
+
+    from backend.services.redis_service import cache
+    value = await cache.get("mykey")
+    await cache.set("mykey", data, ttl=3600)
+    await cache.delete("mykey")
+    await cache.flush_pattern("sections:*")
 """
 import json
-import logging
 import os
 import time
 from typing import Any, Optional
 
-import redis.asyncio as aioredis  # async Redis client
+import redis.asyncio as aioredis
 
 from backend.core.logger import logger
 
-# ─── TTL constants (seconds) ──────────────────────────────────────────────────
-TTL_DEPARTMENTS   = 3600          # 1 hour  — department list rarely changes
-TTL_SECTIONS      = 3600          # 1 hour  — section list rarely changes
-TTL_QUESTIONS     = 86400         # 24 hours — LLM-generated questions
-TTL_SECTION_CONTENT = 86400       # 24 hours — LLM-generated section content
-TTL_NOTION_LIBRARY  = 300         # 5 minutes — Notion API results
+TTL_DEPARTMENTS   = 3600
+TTL_SECTIONS      = 3600
+TTL_QUESTIONS     = 86400
+TTL_SECTION_CONTENT = 86400
+TTL_NOTION_LIBRARY  = 300
 
-# ─── Cache key builders ───────────────────────────────────────────────────────
 KEY_DEPARTMENTS       = "docforge:departments"
 KEY_SECTIONS          = lambda doc_type: f"docforge:sections:{doc_type}"
 KEY_QUESTIONS         = lambda sec_id:   f"docforge:questions:{sec_id}"
@@ -65,7 +68,7 @@ class RedisCache:
         if url:
             self._url = url  # persist the URL for reconnects
         try:
-            client = aioredis.from_url(self._url,  # C2 FIX: always use self._url
+            client = aioredis.from_url(self._url,
                                        encoding="utf-8",
                                        decode_responses=True,
                                        socket_connect_timeout=5,

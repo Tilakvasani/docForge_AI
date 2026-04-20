@@ -1,24 +1,17 @@
 """
-DocForge AI — docx_builder.py  v5.0  (pure Python, no Node.js)
+docx_builder.py — Document Export Builder
+=========================================
 
-Features:
-  ✅ Professional header:  Company  |  Doc Type  (right-aligned, grey)
-  ✅ Footer:               Page N of M  (centred, grey)
-  ✅ Title block:          Doc type (large, accent blue) + subtitle line
-  ✅ Section headings:     accent blue, bold, underline divider
-  ✅ Pipe-format tables  → real Word tables (header shaded, zebra rows)
-  ✅ Mermaid flowcharts  → real PNG image embedded in Word (via flowchart_renderer.py)
-  ✅ Bullet lines        → indented bullet paragraphs
-  ✅ Numbered lines      → indented numbered paragraphs
-  ✅ Plain paragraphs
-  ✅ Returns raw bytes   — no temp files, no subprocess
+Constructs a formatted Microsoft Word (.docx) document from generated sections.
+Handles conversion of markdown content (tables, lists) and embedded mermaid
+flowcharts into native Word elements.
 
 Dependencies:
-    pip install python-docx matplotlib pillow
+    python-docx
+    matplotlib
+    pillow
 
-Both files must be in the same directory:
-    docx_builder.py
-    flowchart_renderer.py
+Requires `flowchart_renderer.py` for diagram rasterisation.
 """
 
 import re

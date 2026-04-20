@@ -1,14 +1,18 @@
 """
-ragas_scorer.py — Inline RAGAS scoring for CiteRAG Lab
-────────────────────────────────────────────────────────
-ALL 4 metrics are REAL. No proxies. No circular logic.
+ragas_scorer.py — RAGAS evaluation for the CiteRAG pipeline
+============================================================
 
-Ground truth comes from qa_dataset.json — 15 human-written QA pairs
-covering every document type in your system. When a user question
-matches a dataset entry, all 4 metrics run including real context_recall.
-When no match, 3 metrics run (faithfulness, answer_relevancy, context_precision).
+Runs all four RAGAS metrics against a retrieved answer and its supporting
+chunks. Ground truth is resolved from `qa_dataset.json` when available.
+All matched metrics run in parallel via `asyncio.gather`.
 
-All matched metrics run in parallel via asyncio.gather.
+Metrics:
+    faithfulness       — measures hallucination; no ground truth required.
+    answer_relevancy   — measures topic drift; no ground truth required.
+    context_precision  — requires ground truth (skipped if none found).
+    context_recall     — requires ground truth (skipped if none found).
+
+Compatible with RAGAS v0.1 and v0.2+; version is detected at runtime.
 """
 
 import json
@@ -53,7 +57,7 @@ _context_precision = None
 _context_recall    = None
 _ragas_llm         = None
 _ragas_emb         = None
-_qa_map            = None   # { normalized_question: ground_truth }
+_qa_map            = None
 
 
 # ── Load dataset ──────────────────────────────────────────────────────────────
@@ -148,6 +152,16 @@ def _get_ragas_version() -> tuple[int, int]:
 # ── RAGAS init ────────────────────────────────────────────────────────────────
 
 def _init_ragas() -> bool:
+    """
+    Initialize RAGAS metric singletons with Azure OpenAI LLM and embedding models.
+
+    Detects the installed RAGAS version and initialises the appropriate metric
+    objects (v0.2+ class-based API vs v0.1 module-level singleton API).
+    Idempotent: returns True immediately if already initialised.
+
+    Returns:
+        True if initialisation succeeded, False on import or configuration error.
+    """
     global _ragas_ready, _faithfulness, _answer_relevancy
     global _context_precision, _context_recall, _ragas_llm, _ragas_emb
 
@@ -155,8 +169,6 @@ def _init_ragas() -> bool:
         return True
 
     try:
-
-
         major, minor = _get_ragas_version()
         logger.info("Detected RAGAS version %d.%d", major, minor)
 
@@ -175,9 +187,6 @@ def _init_ragas() -> bool:
         )
 
         if major == 0 and minor >= 2:
-            # ── RAGAS v0.2+ API ──────────────────────────────────────────────
-
-
             _ragas_llm = LangchainLLMWrapper(judge_llm)
             _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
 
@@ -187,9 +196,6 @@ def _init_ragas() -> bool:
             _context_recall    = ContextRecall(llm=_ragas_llm)
 
         else:
-            # ── RAGAS v0.1 API ───────────────────────────────────────────────
-
-
             _ragas_llm = LangchainLLMWrapper(judge_llm)
             _ragas_emb = LangchainEmbeddingsWrapper(judge_emb)
 
@@ -219,11 +225,19 @@ def _init_ragas() -> bool:
 # ── Single metric runner ──────────────────────────────────────────────────────
 
 def _run_single_metric(metric, data) -> Optional[float]:
-    """Run one RAGAS metric synchronously inside a thread executor.
-    Supports both v0.1 (evaluate()) and v0.2+ APIs.
+    """
+    Run one RAGAS metric synchronously inside a thread executor.
 
-    For v0.2, `data` is already an EvaluationDataset built in score().
-    For v0.1, `data` is a HuggingFace Dataset.
+    Automatically selects the RAGAS v0.1 or v0.2+ evaluation path based on
+    the installed package version. tqdm output is suppressed globally to keep
+    logs clean.
+
+    Args:
+        metric: An initialised RAGAS metric object.
+        data:   For v0.2+, an `EvaluationDataset`; for v0.1, a HuggingFace `Dataset`.
+
+    Returns:
+        A float score in [0, 1], or None if evaluation fails.
     """
     os.environ["TQDM_DISABLE"] = "1"
 
@@ -232,22 +246,17 @@ def _run_single_metric(metric, data) -> Optional[float]:
 
     try:
         if major == 0 and minor >= 2:
-            # v0.2+: data is already an EvaluationDataset — pass directly
-
             with contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
                 result = ragas_evaluate(data, metrics=[metric])
 
             df = result.to_pandas()
-            # Resolve column: try exact metric name, then case-insensitive, then last numeric col
             if metric_name in df.columns:
                 col = metric_name
             else:
-                # Try case-insensitive match
                 lower_map = {c.lower(): c for c in df.columns}
                 col = lower_map.get(metric_name.lower())
                 if col is None:
-                    # Fall back to last non-metadata column (drop user_input/response/etc.)
                     skip = {"user_input", "response", "retrieved_contexts", "reference"}
                     numeric_cols = [c for c in df.columns if c not in skip]
                     col = numeric_cols[-1] if numeric_cols else df.columns[-1]
@@ -255,8 +264,6 @@ def _run_single_metric(metric, data) -> Optional[float]:
             return round(float(val), 3)
 
         else:
-            # v0.1: data is a HuggingFace Dataset
-
             with contextlib.redirect_stdout(io.StringIO()), \
                  contextlib.redirect_stderr(io.StringIO()):
                 result = ragas_evaluate(data, metrics=[metric])
@@ -279,20 +286,22 @@ async def score(
     ground_truth: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Run real RAGAS evaluation.
+    Run RAGAS evaluation against a retrieved answer and its source chunks.
 
-    faithfulness      — always real (no GT needed)
-    answer_relevancy  — always real (no GT needed)
-    context_precision — real when GT found (v0.2 requires GT); None if no GT match
-    context_recall    — real when GT found in qa_dataset.json; None if no GT match
-
-    All metrics run in parallel via asyncio.gather.
+    `context_precision` and `context_recall` require ground truth; they are
+    skipped and set to None when no matching entry is found in `qa_dataset.json`.
+    All metrics that can run do so in parallel via `asyncio.gather`.
 
     Args:
-        question      — user's original question
-        answer        — LLM-generated answer
-        chunks        — retrieved chunks (list of dicts with 'content' key)
-        ground_truth  — optional override from a labeled eval set
+        question:     The user's original question.
+        answer:       The LLM-generated answer to evaluate.
+        chunks:       Retrieved chunks (list of dicts with a `content` or `text` key).
+        ground_truth: Optional override from a labeled evaluation set; if not
+                      provided, a match is attempted from `qa_dataset.json`.
+
+    Returns:
+        A dict with keys `faithfulness`, `answer_relevancy`, `context_precision`,
+        and `context_recall` (float or None), or None if evaluation cannot run.
     """
     if not chunks or not answer or not question:
         return None
@@ -308,19 +317,12 @@ async def score(
     if not contexts:
         return None
 
-    # Resolve ground truth: caller override > dataset lookup > None
     real_gt = ground_truth or _lookup_ground_truth(question)
 
-    # Build datasets.
-    # v0.1: HuggingFace Dataset with fields question/answer/contexts/ground_truth
-    # v0.2: EvaluationDataset with fields user_input/response/retrieved_contexts/reference
     major, minor = _get_ragas_version()
     logger.info("Running RAGAS scoring with v%d.%d", major, minor)
 
     if major == 0 and minor >= 2:
-        # RAGAS v0.2+ — EvaluationDataset field names
-
-
         eval_no_gt = EvaluationDataset.from_list([{
             "user_input":         question,
             "response":           answer,
@@ -337,9 +339,6 @@ async def score(
         data_no_gt   = eval_no_gt
         data_with_gt = eval_with_gt
     else:
-        # RAGAS v0.1 — HuggingFace Dataset field names
-
-
         data_no_gt = Dataset.from_dict({
             "question": [question],
             "answer":   [answer],

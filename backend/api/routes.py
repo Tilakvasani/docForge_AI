@@ -1,14 +1,29 @@
 """
-REST API Routes for core Document Generation functionality.
-Handles fetching sections, generating content via LLM, and publishing to Notion.
+routes.py — Core document generation REST API
+=============================================
+
+Handles departments, sections, question generation, answer saving,
+section content generation, document save, Notion publishing, and
+the document library view.
+
+Route prefix: /api/
+
+Endpoints:
+    GET  /departments            — All departments (60s Redis cache)
+    GET  /sections/{doc_type}    — Sections for a given doc type (Redis cache)
+    POST /questions/generate     — Generate LLM questions for a section
+    POST /answers/save           — Persist user answers and invalidate cache
+    POST /section/generate       — Generate section content via LLM + quality gate
+    POST /section/edit           — Apply an edit instruction to a section
+    POST /document/save          — Commit a full document to the database
+    POST /document/publish       — Publish document to Notion
+    GET  /library/notion         — Fetch all published documents from Notion
 """
-# ── Third-party ───────────────────────────────────────────────────────────────
-from fastapi import APIRouter, HTTPException   # FastAPI routing + error responses
-from pydantic import BaseModel                 # Request/response schema validation
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from typing import List
 
-# ── Internal ──────────────────────────────────────────────────────────────────
-from backend.core.logger import logger         # Structured logger
+from backend.core.logger import logger
 from backend.services.db_service import (
     get_all_departments, get_sections_by_doc_type,
     save_generated_document,
@@ -23,22 +38,23 @@ from backend.schemas.document_schema import (
     GenerateSectionRequest, EditSectionRequest,
     NotionPublishRequest,
 )
-from backend.services.redis_service import cache   # Redis caching layer
-from backend.prompts.quality_gates import check_quality    # PS1 quality gate validator
+from backend.services.redis_service import cache
+from backend.prompts.quality_gates import check_quality
 
 router = APIRouter()
 
 
 class SaveDocRequest(BaseModel):
-    doc_id: int
-    doc_sec_id: int
-    sec_id: int
+    """
+    Request schema for persisting a fully generated document to the local database.
+    """
+
+    doc_id:          int
+    doc_sec_id:      int
+    sec_id:          int
     gen_doc_sec_dec: List[str]
-    gen_doc_full: str
+    gen_doc_full:    str
 
-
-
-# ── Departments & Sections ────────────────────────────────────────────────────
 
 @router.get("/departments")
 async def get_departments():
@@ -48,7 +64,6 @@ async def get_departments():
     """
     logger.info("📥 [GET /departments] Frontend requested department list")
     try:
-        # Try cache first
         cached = await cache.get_departments()
         if cached is not None:
             logger.info("✅ [CACHE HIT] departments — returning %d depts from Redis", len(cached))
@@ -57,7 +72,6 @@ async def get_departments():
         depts = await get_all_departments()
         logger.info("🗄️  [DB] Loaded %d departments from database", len(depts))
 
-        # Store in cache
         await cache.set_departments(depts)
         logger.info("💾 [CACHE SET] departments (%d items)", len(depts))
 
@@ -76,7 +90,6 @@ async def get_sections(doc_type: str):
     decoded = doc_type.replace("%2F", "/").replace("%28", "(").replace("%29", ")")
     logger.info("📥 [GET /sections] Frontend requested sections for doc_type=%r", decoded)
     try:
-        # Try cache first
         cached = await cache.get_sections(decoded)
         if cached is not None:
             logger.info("✅ [CACHE HIT] sections:%s", decoded)
@@ -90,7 +103,6 @@ async def get_sections(doc_type: str):
         sec_names = sections.get("doc_sec", [])
         logger.info("🗄️  [DB] Loaded %d sections for %r: %s", len(sec_names), decoded, sec_names)
 
-        # Store in cache
         await cache.set_sections(decoded, sections)
         logger.info("💾 [CACHE SET] sections:%s", decoded)
 
@@ -101,8 +113,6 @@ async def get_sections(doc_type: str):
         logger.error("❌ [GET /sections] Error for doc_type=%r: %s", decoded, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── Questions & Answers ───────────────────────────────────────────────────────
 
 @router.post("/questions/generate")
 async def api_generate_questions(req: GenerateQuestionsRequest):
@@ -151,7 +161,6 @@ async def api_save_answers(req: SaveAnswersRequest):
         result = await save_user_answers(req)
         logger.info("✅ [POST /answers/save] sec_id=%s saved to DB", req.sec_id)
 
-        # Invalidate cached section content — answers changed, regenerate fresh
         if req.sec_id:
             await cache.invalidate_section_content(req.sec_id)
             logger.info("🗑️  [CACHE DEL] section content:%s (answers updated)", req.sec_id)
@@ -162,8 +171,6 @@ async def api_save_answers(req: SaveAnswersRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Section Generation & Edit ─────────────────────────────────────────────────
-
 @router.post("/section/generate")
 async def api_generate_section(req: GenerateSectionRequest):
     """Generate section content via LLM + run quality gate check before returning."""
@@ -172,7 +179,6 @@ async def api_generate_section(req: GenerateSectionRequest):
         req.sec_id, req.section_name, req.doc_type, req.department,
     )
     try:
-        # Check cache — if same sec_id already generated, return instantly
         if req.sec_id:
             cached = await cache.get_section_content(req.sec_id)
             if cached is not None:
@@ -182,7 +188,6 @@ async def api_generate_section(req: GenerateSectionRequest):
         logger.info("🤖 [LLM] Calling generate_section_content for sec_id=%s", req.sec_id)
         result = await generate_section_content(req)
 
-        # ── Quality gate: check generated content meets minimum standards ───────
         content    = result.get("content", "") if result else ""
         doc_type   = getattr(req, "doc_type", "") if result else ""
         passed, qc_note = check_quality(content, doc_type)
@@ -192,7 +197,6 @@ async def api_generate_section(req: GenerateSectionRequest):
         else:
             logger.info("✅ [QC PASS] sec_id=%s | words=%d | type=%s", req.sec_id, word_count, result.get("section_type", "?"))
 
-        # Cache the expensive LLM result (even if QC failed — let user refine)
         if req.sec_id and result:
             await cache.set_section_content(req.sec_id, result)
             logger.info("💾 [CACHE SET] section content:%s", req.sec_id)
@@ -205,6 +209,12 @@ async def api_generate_section(req: GenerateSectionRequest):
 
 @router.post("/section/edit")
 async def api_edit_section(req: EditSectionRequest):
+    """
+    Apply a freeform edit instruction to a previously generated section.
+
+    Regenerates only the targeted section via the LLM and invalidates
+    the corresponding Redis cache entry so subsequent loads return fresh content.
+    """
     logger.info(
         "📥 [POST /section/edit] sec_id=%s | section=%r | instruction=%r",
         req.sec_id, req.section_name, req.edit_instruction[:120],
@@ -213,7 +223,6 @@ async def api_edit_section(req: EditSectionRequest):
         result = await edit_section(req)
         logger.info("✅ [POST /section/edit] sec_id=%s edit applied", req.sec_id)
 
-        # Invalidate old cached content after edit
         if req.sec_id:
             await cache.invalidate_section_content(req.sec_id)
             logger.info("🗑️  [CACHE DEL] section content:%s (edited)", req.sec_id)
@@ -223,8 +232,6 @@ async def api_edit_section(req: EditSectionRequest):
         logger.error("❌ [POST /section/edit] sec_id=%s error: %s", req.sec_id, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── Document Save ─────────────────────────────────────────────────────────────
 
 @router.post("/document/save")
 async def api_save_document(req: SaveDocRequest):
@@ -248,8 +255,6 @@ async def api_save_document(req: SaveDocRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Notion ────────────────────────────────────────────────────────────────────
-
 @router.post("/document/publish")
 async def api_publish_document(req: NotionPublishRequest):
     """
@@ -264,7 +269,6 @@ async def api_publish_document(req: NotionPublishRequest):
         result = await publish_to_notion(req)
         logger.info("✅ [POST /document/publish] Published to Notion — url=%s", result.get('notion_url', '?'))
 
-        # Invalidate library cache so new doc appears immediately
         await cache.invalidate_notion_library()
         logger.info("🗑️  [CACHE DEL] notion_library (new doc published)")
 
@@ -281,7 +285,6 @@ async def api_notion_library():
     Used to populate the Document Library view in the frontend.
     """
     try:
-        # Try cache first (5-min TTL)
         cached = await cache.get_notion_library()
         if cached is not None:
             logger.info("✅ [CACHE HIT] notion_library (%d docs)", len(cached))

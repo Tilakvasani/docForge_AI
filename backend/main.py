@@ -1,27 +1,26 @@
 """
-main.py — FastAPI entry point for DocForge AI + CiteRAG
-=========================================================
+FastAPI application entry point for DocForge AI.
 
-Run with:
+Registers all route groups, configures CORS, and manages the application
+lifespan (startup / shutdown) for Redis and PostgreSQL connections.
+
+Start the server with:
     uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
-Routes registered:
-  /api/rag/*    — RAG ingest, ask, status, eval, scores, cache
-  /api/agent/*  — Tool-calling agent: tickets + memory
-  /api/*        — DocForge document generation (routes.py)
+Registered route prefixes:
+    /api/rag/*    — RAG ingest, Q&A, evaluation, and cache management
+    /api/agent/*  — Tool-calling agent: ticket management and session memory
+    /api/*        — DocForge document generation pipeline
 """
 
-# ── Standard library ──────────────────────────────────────────────────────────
-from contextlib import asynccontextmanager  # lifespan context manager
+from contextlib import asynccontextmanager
 
-# ── Third-party ───────────────────────────────────────────────────────────────
-from fastapi import FastAPI                          # Web framework
-from fastapi.middleware.cors import CORSMiddleware   # Allow cross-origin requests (Streamlit → backend)
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-# ── Internal ──────────────────────────────────────────────────────────────────
-from backend.core.logger import logger, _setup_logging  # Structured logger
-from backend.services.redis_service import cache     # Redis client (dedup, caching, chat history)
-from backend.core.config import settings             # App settings loaded from .env
+from backend.core.logger import logger, _setup_logging
+from backend.services.redis_service import cache
+from backend.core.config import settings
 from backend.api.routes import router as docforge_router
 from backend.api.rag_routes import router as rag_router
 from backend.api.agent_routes import router as agent_router
@@ -35,18 +34,21 @@ except ImportError:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI lifespan context manager.
-    
-    Handles startup and shutdown logic for the application:
-    - Startup: Initializes logging, connects to Redis.
-    - Shutdown: Gracefully disconnects from Redis.
-    
+    FastAPI lifespan context manager for startup and shutdown sequencing.
+
+    Startup:
+        - Initializes structured logging.
+        - Establishes a Redis connection for caching and deduplication.
+
+    Shutdown:
+        - Closes the PostgreSQL connection pool (if available).
+        - Gracefully disconnects from Redis.
+
     Args:
-        app: The FastAPI application instance.
+        app: The FastAPI application instance passed by the framework.
     """
-    # ── Startup ───────────────────────────────────────────────────────────────
     _setup_logging()
-    
+
     try:
         connected = await cache.connect(settings.REDIS_URL)
         if connected:
@@ -59,12 +61,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Redis connection error: {e}")
         logger.warning("Agent operations will proceed without caching/deduplication.")
-        
+
     logger.info("DocForge AI backend started — routes: /api/rag/*, /api/agent/*, /api/*")
 
-    yield  # ← Application is running here
+    yield
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
     try:
         if _close_pg_pool:
             await _close_pg_pool()
@@ -82,34 +83,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Derive allowed origins from settings (comma-separated list in .env)
 _ALLOWED_ORIGINS = [o.strip() for o in settings.CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_ALLOWED_ORIGINS,   # C1 FIX: explicit origins required when credentials=True
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── DocForge generation routes ─────────────────────────────────────────────────
 app.include_router(docforge_router, prefix="/api")
-
-# ── RAG routes (ingest, ask, status, eval, scores) ────────────────────────────
 app.include_router(rag_router, prefix="/api")
-
-# ── Agent routes (tickets, memory) ────────────────────────────────────────────
 app.include_router(agent_router, prefix="/api")
 
 
 @app.get("/health", tags=["System"])
 async def health():
-    """Health check endpoint — confirms the service is running."""
+    """Health check — confirms the service is running and accepting requests."""
     return {"status": "ok", "service": "DocForge AI + CiteRAG"}
 
 
 @app.get("/", tags=["System"])
 async def root():
-    """Root endpoint — returns links to API docs and health check."""
+    """Root endpoint — returns links to the interactive API docs and health check."""
     return {"docs": "/docs", "health": "/health"}

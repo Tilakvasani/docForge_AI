@@ -1,24 +1,23 @@
 """
-config.py — Pydantic settings for DocForge AI + CiteRAG
-========================================================
+Centralized application settings for DocForge AI.
 
-All values read from environment / .env file.
-Add .env to .gitignore — never commit secrets.
+All configuration values are loaded from a `.env` file or environment variables
+using Pydantic Settings. Secrets should never be committed to source control.
 
-Required .env keys:
-  AZURE_LLM_ENDPOINT
-  AZURE_OPENAI_LLM_KEY
-  AZURE_LLM_DEPLOYMENT_41_MINI
-  AZURE_EMB_ENDPOINT
-  AZURE_OPENAI_EMB_KEY
-  AZURE_EMB_DEPLOYMENT
-  AZURE_EMB_API_VERSION
-  NOTION_TOKEN
-  NOTION_DATABASE_ID          ← source document DB for RAG ingest
-  NOTION_TICKET_DB_ID         ← ticket tracking DB for agent layer
-  CHROMA_PATH
-  REDIS_URL
-  DATABASE_URL                ← PostgreSQL
+Required environment variables:
+    AZURE_LLM_ENDPOINT           — Azure OpenAI chat endpoint URL
+    AZURE_OPENAI_LLM_KEY         — Azure OpenAI API key (LLM)
+    AZURE_LLM_DEPLOYMENT_41_MINI — Azure deployment name for the chat model
+    AZURE_EMB_ENDPOINT           — Azure OpenAI embeddings endpoint URL
+    AZURE_OPENAI_EMB_KEY         — Azure OpenAI API key (embeddings)
+    AZURE_EMB_DEPLOYMENT         — Azure deployment name for the embedding model
+    AZURE_EMB_API_VERSION        — Embeddings API version string
+    NOTION_TOKEN                 — Notion integration token
+    NOTION_DATABASE_ID           — Source document database for RAG ingest
+    NOTION_TICKET_DB_ID          — Ticket tracking database for the agent layer
+    CHROMA_PATH                  — Absolute path to ChromaDB persistent storage
+    REDIS_URL                    — Redis connection URL
+    DATABASE_URL                 — PostgreSQL connection string
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -29,65 +28,55 @@ import os
 
 class Settings(BaseSettings):
     """
-    Application settings and environment configuration.
-    
-    Loads values from a .env file or environment variables. This class
-    centrally manages credentials for Azure OpenAI, Notion, Redis, 
-    and general application behavior.
+    Application settings loaded from the environment or a `.env` file.
+
+    Centralizes all credentials and runtime configuration for Azure OpenAI,
+    Notion, Redis, ChromaDB, PostgreSQL, and general app behavior.
+    Fields with empty defaults are required and must be set in `.env`.
     """
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    # ── Azure OpenAI — LLM ────────────────────────────────────────────────────
-    AZURE_LLM_ENDPOINT:            str = ""                  # Azure endpoint URL
-    AZURE_OPENAI_LLM_KEY:          str = ""                  # Azure API key
-    AZURE_LLM_DEPLOYMENT_41_MINI:  str = "gpt-4.1-mini"      # Deployment name
-    AZURE_LLM_API_VERSION:         str = "2024-12-01-preview" # API version
+    AZURE_LLM_ENDPOINT:            str = ""
+    AZURE_OPENAI_LLM_KEY:          str = ""
+    AZURE_LLM_DEPLOYMENT_41_MINI:  str = "gpt-4.1-mini"
+    AZURE_LLM_API_VERSION:         str = "2024-12-01-preview"
 
-    # ── Azure OpenAI — Embeddings ─────────────────────────────────────────────
-    AZURE_EMB_ENDPOINT:            str = ""                  # Embeddings endpoint URL
-    AZURE_OPENAI_EMB_KEY:          str = ""                  # Embeddings API key
-    AZURE_EMB_DEPLOYMENT:          str = "text-embedding-3-large" 
+    AZURE_EMB_ENDPOINT:            str = ""
+    AZURE_OPENAI_EMB_KEY:          str = ""
+    AZURE_EMB_DEPLOYMENT:          str = "text-embedding-3-large"
     AZURE_EMB_API_VERSION:         str = "2024-02-01"
 
-    # ── Notion ────────────────────────────────────────────────────────────────
-    NOTION_TOKEN:                  str = ""       # Main integration token
-    NOTION_API_KEY:                str = ""       # Legacy fallback alias
-    NOTION_DATABASE_ID:            str = ""       # ID of the RAG source database
-    NOTION_TICKET_DB_ID:           Optional[str] = None  # ID of the ticket tracking database
+    NOTION_TOKEN:                  str = ""
+    NOTION_API_KEY:                str = ""
+    NOTION_DATABASE_ID:            str = ""
+    NOTION_TICKET_DB_ID:           Optional[str] = None
 
-    # ── Vector store ──────────────────────────────────────────────────────────
-    CHROMA_PATH:                   str = ""       # Absolute path to ChromaDB storage
+    CHROMA_PATH:                   str = ""
 
-    # ── Cache ─────────────────────────────────────────────────────────────────
     REDIS_URL:                     str = "redis://localhost:6379/0"
 
-    # ── Database ──────────────────────────────────────────────────────────────
     DATABASE_URL:                  str = "postgresql://user:pass@localhost:5432/docforge"
 
-    # ── App ───────────────────────────────────────────────────────────────────
     APP_ENV:                       str = "development"
     LOG_LEVEL:                     str = "INFO"
-    CORS_ALLOWED_ORIGINS:          str = "http://localhost:8501"  # Comma-separated list
-    IMGUR_CLIENT_ID:               Optional[str] = None          # For flowchart image hosting
+    CORS_ALLOWED_ORIGINS:          str = "http://localhost:8501"
 
     def model_post_init(self, __context):
         """
-        Pydantic v2 lifecycle hook.
-        
-        Finalizes configuration after the model is initialized:
-        - Resolves CHROMA_PATH to an absolute path.
-        - Ensures the storage directory exists.
+        Pydantic v2 post-initialization hook.
+
+        Resolves `CHROMA_PATH` to an absolute filesystem path and creates
+        the directory if it does not already exist.
         """
-        # Resolve CHROMA_PATH to absolute path
         if not self.CHROMA_PATH:
             self.CHROMA_PATH = str(Path(__file__).parent.parent.parent / "chroma_db")
         else:
             self.CHROMA_PATH = str(Path(self.CHROMA_PATH).resolve())
-        # Auto-create directory if it doesn't exist
         Path(self.CHROMA_PATH).mkdir(parents=True, exist_ok=True)
 
 

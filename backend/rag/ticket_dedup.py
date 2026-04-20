@@ -2,39 +2,29 @@
 ticket_dedup.py — LLM-based duplicate ticket detection
 =======================================================
 
-New approach (replaces Redis + cosine similarity):
-  1. Fetch all Open + "In Progress" tickets from Notion (live, always fresh)
-  2. Ask the LLM if the new question is semantically the same as any existing ticket
-  3. Duplicate found  → return existing ticket info, block creation
-  4. No duplicate     → allow creation
+Prevents duplicate Notion support tickets by comparing new questions
+against all currently Open / In Progress tickets using an LLM judge
+rather than a vector-similarity cache.
 
-Why this is better than Redis embeddings:
-  - Live Notion data — no stale 1-hour caches
-  - Works across server restarts
-  - LLM understands intent & meaning better than cosine similarity
-  - Zero Redis dependency for deduplication
-  - Only compares against ACTIVE tickets (Open / In Progress) —
-    Resolved tickets are ignored on purpose
+Pipeline:
+    1. Fetch all Open + In Progress tickets from Notion (always live).
+    2. Ask the LLM whether the new question matches any existing ticket.
+    3. If a duplicate is found, return the existing ticket and block creation.
+    4. If no duplicate, allow creation to proceed.
 
-Usage:
-    dup = await find_duplicate(question)
-    if dup:
-        # {"ticket_id": ..., "ticket_url": ..., "question": ...}
-        return already-exists reply
-    # else: create the ticket
+Public API:
+    find_duplicate(question)  — returns a matching ticket dict or None.
+    flush_dedup_cache()       — no-op (no cache exists; included for interface compatibility).
 """
 
-# ── Standard library ──────────────────────────────────────────────────────────
 from typing import Optional
 
-# ── Third-party ───────────────────────────────────────────────────────────────
-import httpx  # async Notion API calls
+import httpx
 
-# ── Internal ──────────────────────────────────────────────────────────────────
 from backend.core.logger import logger
 from backend.services.notion_service import _headers as _notion_headers, NOTION_API_URL as NOTION_API
 from backend.api.agent_routes import _get_ticket_db_id
-from backend.core.llm import get_llm as _get_llm  # M1 FIX: use shared factory
+from backend.core.llm import get_llm as _get_llm
 
 # Max tickets sent to LLM to avoid huge prompts
 _MAX_TICKETS_FOR_LLM = 50
@@ -72,9 +62,14 @@ DUPLICATE: NO\
 
 async def _fetch_open_tickets() -> list[dict]:
     """
-    Fetch Open + In Progress tickets from Notion.
-    Returns list of {ticket_id, page_id, question, url}.
-    Returns [] on any error (fail-open — allow ticket creation).
+    Fetch all Open and In Progress tickets from Notion.
+
+    Results are capped at `_MAX_TICKETS_FOR_LLM` to avoid oversized prompts.
+    Fails open: any Notion API error returns an empty list so that ticket
+    creation is never blocked by a network or configuration issue.
+
+    Returns:
+        A list of dicts with keys: ticket_id, page_id, question, url.
     """
     try:
 
@@ -109,7 +104,6 @@ async def _fetch_open_tickets() -> list[dict]:
         for page in results:
             props = page.get("properties", {})
 
-            # Get ticket question (title field)
             q_items = (
                 props.get("Question", {}).get("title", [])
                 or props.get("Name", {}).get("title", [])
@@ -120,9 +114,8 @@ async def _fetch_open_tickets() -> list[dict]:
             if not question:
                 continue
 
-            # Get numeric Ticket ID if available, else fallback to Page ID snippet
-            id_prop = props.get("Ticket ID", {})
-            id_items = id_prop.get("rich_text", []) or id_prop.get("title", [])
+            id_prop   = props.get("Ticket ID", {})
+            id_items  = id_prop.get("rich_text", []) or id_prop.get("title", [])
             manual_id = "".join(t.get("plain_text", "") for t in id_items).strip()
 
             ticket_id = manual_id if manual_id else page["id"].replace("-", "")[:8].upper()
@@ -143,12 +136,19 @@ async def _fetch_open_tickets() -> list[dict]:
 
 async def _llm_duplicate_check(new_question: str, tickets: list[dict]) -> Optional[dict]:
     """
-    Ask the LLM if new_question duplicates any existing ticket.
-    Returns the matching ticket dict, or None if no duplicate.
+    Ask the LLM whether `new_question` is semantically identical to any existing ticket.
+
+    Fails open: if the LLM call raises any exception, None is returned so that
+    ticket creation is never silently blocked.
+
+    Args:
+        new_question: The unanswered question the user wants to file a ticket for.
+        tickets:      List of existing open/in-progress ticket dicts from Notion.
+
+    Returns:
+        The matching ticket dict if a duplicate is found, otherwise None.
     """
     try:
-
-        # Build the ticket list string for the prompt
         ticket_lines = "\n".join(
             f"  [{t['ticket_id']}] {t['question']}"
             for t in tickets
@@ -158,13 +158,11 @@ async def _llm_duplicate_check(new_question: str, tickets: list[dict]) -> Option
             new_question=new_question,
         )
 
-        # C3 FIX: use ainvoke directly instead of deprecated get_event_loop + run_in_executor
         resp = await _get_llm().ainvoke(prompt)
         raw  = resp.content.strip()
 
         logger.debug("[dedup] LLM response: %s", raw)
 
-        # Parse response
         lines = {
             line.split(":", 1)[0].strip().upper(): line.split(":", 1)[1].strip()
             for line in raw.splitlines()
@@ -178,7 +176,6 @@ async def _llm_duplicate_check(new_question: str, tickets: list[dict]) -> Option
         if not matched_id:
             return None
 
-        # Find the ticket dict for the matched ID
         for t in tickets:
             if t["ticket_id"] == matched_id:
                 logger.info(
@@ -195,7 +192,7 @@ async def _llm_duplicate_check(new_question: str, tickets: list[dict]) -> Option
         return None
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+
 
 async def find_duplicate(question: str) -> Optional[dict]:
     """

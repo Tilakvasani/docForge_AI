@@ -1,38 +1,45 @@
 """
-DocForge AI — document_utils.py 
-  1. markdown_to_plain_text()     — strip markdown, preserve table lines + mermaid blocks
-  2. DOC_WORD_TARGETS             — industry-standard total word counts
-  3. get_words_per_section()      — per-section target words
-  4. SECTIONS_NEEDING_TABLES      — patterns for sections that require a table
+document_utils.py — Shared document processing utilities
+=========================================================
+
+Provides text normalisation, word-count targets, and section routing
+used throughout the document generation pipeline.
+
+Exports:
+    markdown_to_plain_text(md)    — Strip markdown while preserving pipe tables
+                                    and mermaid diagram blocks.
+    DOC_WORD_TARGETS              — Industry-standard total word counts per doc type.
+    get_words_per_section(...)    — Distribute the total word budget across sections.
+    SECTIONS_NEEDING_TABLES       — Regex patterns for sections that must include a table.
 """
 import re
 from typing import Dict, List
 
 
-# ─── Markdown → Plain Text ────────────────────────────────────────────────────
-
 def markdown_to_plain_text(md: str) -> str:
     """
-    Strip markdown formatting.
-    NEVER touches:
-      - Lines containing | (pipe table lines)
-      - Lines inside ```mermaid ... ``` blocks
-      - Lines starting with ``` (fence markers)
+    Strip markdown formatting from a single line of text.
+
+    Preserves lines containing tables, mermaid syntax, or diagram declarations
+    to maintain document structure during processing.
+
+    Args:
+        md: A single line of markdown text.
+
+    Returns:
+        The line with inline markdown stripped, or the line unmodified if it
+        matches one of the preservation guards above.
     """
-    # ── Guard 1: pipe table lines — return untouched ──────────────────────────
     if '|' in md:
         return md.rstrip()
 
-    # ── Guard 2: mermaid fence line or content inside a mermaid block ─────────
     stripped = md.strip()
     if stripped.startswith('```mermaid') or stripped == '```':
         return md.rstrip()
 
-    # ── Guard 3: bare flowchart/graph declaration lines ───────────────────────
     if stripped.startswith('flowchart') or stripped.startswith('graph '):
         return md.rstrip()
 
-    # ── Guard 4: mermaid node/edge lines (contain --> or -->) ─────────────────
     if '-->' in md or '--->' in md:
         return md.rstrip()
 
@@ -44,11 +51,7 @@ def markdown_to_plain_text(md: str) -> str:
     # Strip markdown links [text](url) → text
     t = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', t)
 
-    # ── CRITICAL: skip stripping ```code``` blocks ────────────────────────────
-    # Old code had: re.sub(r'`{3}.*?`{3}', '', t, flags=re.DOTALL)
-    # That was destroying mermaid fences. We do NOT strip triple-backtick blocks
-    # here because _clean_preserve_flowcharts handles them upstream.
-    # Only strip single backtick inline code:
+    # Strip single backtick inline code
     t = re.sub(r'`([^`]+)`', r'\1', t)
 
     # Strip bold/italic

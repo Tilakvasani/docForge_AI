@@ -1,36 +1,30 @@
 """
-DocForge AI — notion_service.py  v3.0
-════════════════════════════════════════════════════════════════
-Flowchart rendering strategy:
-  - Mermaid blocks → PNG via flowchart_renderer.py
-  - PNG uploaded to Imgur (anonymous, free, permanent URL)
-  - Notion image block embeds the Imgur URL → renders as real visual
-  - Fallback: if upload fails → numbered step list callout
+notion_service.py — Notion publishing and document library API
+==============================================================
 
-Setup (one time):
-  1. Go to https://api.imgur.com/oauth2/addclient
-  2. Register → "Anonymous usage without user authorization"
-  3. Add IMGUR_CLIENT_ID=your_client_id to your .env file
-  4. If not set → falls back to step-list rendering (no image)
+Provides two public coroutines consumed by the core API routes:
+
+    publish_to_notion(req)        — Render a generated document as a structured
+                                    Notion page (headings, paragraphs, tables,
+                                    code blocks, callouts) and create it in the
+                                    configured Notion database.
+
+    fetch_library_from_notion()   — Query all published documents from the
+                                    configured database and return a normalised
+                                    list of library entries for the frontend.
+
+Internal block-builder helpers (_para, _heading2, _heading3, _bullet, _code,
+_divider, _callout) produce the Notion API block objects used by the renderer.
 """
-
 import re
-import base64
-import httpx
 import asyncio
 from typing import Optional
 from backend.core.config import settings
 from backend.core.logger import logger
 from backend.schemas.document_schema import NotionPublishRequest
+import httpx
 
-try:
-    from flowchart_renderer import mermaid_to_png_bytes
-    FLOWCHART_RENDERER_AVAILABLE = True
-except ImportError:
-    FLOWCHART_RENDERER_AVAILABLE = False
-
-NOTION_API_URL  = "https://api.notion.com/v1"
-IMGUR_UPLOAD_URL = "https://api.imgur.com/3/image"
+NOTION_API_URL = "https://api.notion.com/v1"
 
 DEPT_MAP = {
     "HR": "HR", "Human Resources": "HR",
@@ -42,21 +36,12 @@ DEPT_MAP = {
 }
 
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  FIX: TOKEN HELPER — tries NOTION_TOKEN first, then NOTION_API_KEY
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _get_notion_token() -> str:
     token = settings.NOTION_TOKEN or settings.NOTION_API_KEY
     if not token:
         raise ValueError("Notion token not set. Add NOTION_TOKEN=secret_xxx to your .env")
     return token
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  FIX: DB ID HELPER — strips ?v=... view suffix from NOTION_DATABASE_ID
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_notion_db_id() -> str:
     raw = settings.NOTION_DATABASE_ID or ""
@@ -68,10 +53,6 @@ def _get_notion_db_id() -> str:
     return db_id
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  NOTION HEADERS
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _headers() -> dict:
     return {
         "Authorization": f"Bearer {_get_notion_token()}",
@@ -79,49 +60,6 @@ def _headers() -> dict:
         "Notion-Version": "2022-06-28",
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  IMGUR UPLOAD — PNG bytes → public image URL
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _upload_png_to_imgur(png_bytes: bytes, title: str = "") -> Optional[str]:
-    """
-    Upload PNG to Imgur anonymously and return the direct image URL.
-    Returns None if IMGUR_CLIENT_ID is not set or upload fails.
-    """
-    client_id = getattr(settings, "IMGUR_CLIENT_ID", None)
-    if not client_id:
-        logger.warning("IMGUR_CLIENT_ID not configured — flowchart will render as step list")
-        return None
-
-    try:
-        b64 = base64.b64encode(png_bytes).decode("utf-8")
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                IMGUR_UPLOAD_URL,
-                headers={"Authorization": f"Client-ID {client_id}"},
-                json={
-                    "image": b64,
-                    "type": "base64",
-                    "title": title or "DocForge AI Flowchart",
-                    "description": f"Process flow diagram — {title}",
-                }
-            )
-        if resp.status_code == 200:
-            url = resp.json().get("data", {}).get("link", "")
-            if url:
-                logger.info(f"Imgur upload OK: {url}")
-                return url
-        logger.warning(f"Imgur upload failed {resp.status_code}: {resp.text[:200]}")
-        return None
-    except Exception as e:
-        logger.warning(f"Imgur upload exception: {e}")
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  NOTION BLOCK HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _txt(content: str, bold=False, italic=False, code=False, color="default") -> dict:
     return {
@@ -143,21 +81,6 @@ def _heading2(content: str) -> dict:
 
 def _divider() -> dict:
     return {"object": "block", "type": "divider", "divider": {}}
-
-
-def _image_block(url: str, caption: str = "") -> dict:
-    """Notion external image block — renders as a real visual image."""
-    block = {
-        "object": "block",
-        "type": "image",
-        "image": {
-            "type": "external",
-            "external": {"url": url},
-        }
-    }
-    if caption:
-        block["image"]["caption"] = [_txt(caption, italic=True)]
-    return block
 
 
 def _callout(lines: list, emoji: str = "📋", color: str = "gray_background") -> dict:
@@ -206,15 +129,11 @@ def _table_to_notion(table_lines: list) -> Optional[dict]:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  MERMAID → NOTION BLOCKS
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _parse_mermaid_steps(mermaid_text: str) -> list:
     steps, seen = [], set()
-    rounded_re  = re.compile(r'\w+\(\[([^\]\)]+)\]\)')
-    diamond_re  = re.compile(r'\w+\{([^\}]+)\}')
-    rect_re     = re.compile(r'\w+\[([^\]]+)\]')
+    rounded_re = re.compile(r'\w+\(\[([^\]\)]+)\]\)')
+    diamond_re = re.compile(r'\w+\{([^\}]+)\}')
+    rect_re    = re.compile(r'\w+\[([^\]]+)\]')
     for line in mermaid_text.strip().split('\n'):
         line = line.strip()
         if not line or line.startswith('flowchart') or line.startswith('graph'):
@@ -237,8 +156,7 @@ def _parse_mermaid_steps(mermaid_text: str) -> list:
     return steps
 
 
-def _mermaid_fallback_blocks(mermaid_text: str, section_name: str = "") -> list:
-    """Fallback: render flowchart as step-list callout when image upload unavailable."""
+def _mermaid_to_notion_blocks(mermaid_text: str, section_name: str = "") -> list:
     blocks = [{
         "object": "block", "type": "callout",
         "callout": {
@@ -275,33 +193,6 @@ def _mermaid_fallback_blocks(mermaid_text: str, section_name: str = "") -> list:
     return blocks
 
 
-async def _mermaid_to_notion_blocks(mermaid_text: str, section_name: str = "") -> list:
-    """
-    Convert Mermaid flowchart to Notion blocks.
-    Tries: render PNG → upload to Imgur → Notion image block
-    Falls back to: numbered step list callout
-    """
-    if FLOWCHART_RENDERER_AVAILABLE:
-        try:
-            png_bytes = mermaid_to_png_bytes(mermaid_text, title=section_name, dpi=180)
-            img_url   = await _upload_png_to_imgur(png_bytes, title=section_name)
-            if img_url:
-                caption = f"Figure: {section_name} — Process Flow Diagram" if section_name else "Process Flow Diagram"
-                return [
-                    _divider(),
-                    _image_block(img_url, caption=caption),
-                    _divider(),
-                ]
-        except Exception as e:
-            logger.warning(f"Flowchart image pipeline failed: {e}")
-
-    return _mermaid_fallback_blocks(mermaid_text, section_name)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PLAIN TEXT → NOTION BLOCKS  (async for image uploads)
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
     blocks          = [meta_callout, _divider()]
     mermaid_pattern = re.compile(r'```mermaid(.*?)```', re.DOTALL)
@@ -310,12 +201,10 @@ async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
 
     for seg_idx, segment in enumerate(segments):
 
-        # Mermaid block → image or fallback
         if seg_idx % 2 == 1:
-            blocks.extend(await _mermaid_to_notion_blocks(segment.strip(), current_section))
+            blocks.extend(_mermaid_to_notion_blocks(segment.strip(), current_section))
             continue
 
-        # Regular text
         lines = segment.split('\n')
         i     = 0
         while i < len(lines):
@@ -326,7 +215,6 @@ async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
                 i += 1
                 continue
 
-            # Section heading (ALL CAPS + dash line)
             next_line  = lines[i + 1].strip() if i + 1 < len(lines) else ""
             is_heading = (stripped.isupper() and len(stripped) > 2
                           and next_line and all(c == '-' for c in next_line))
@@ -336,12 +224,10 @@ async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
                 i += 2
                 continue
 
-            # Standalone dash separator
             if all(c == '-' for c in stripped) and len(stripped) > 2:
                 i += 1
                 continue
 
-            # Pipe table
             if '|' in stripped:
                 table_lines = []
                 while i < len(lines) and (
@@ -355,8 +241,7 @@ async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
                     blocks.append(tbl)
                 continue
 
-            # Numbered list
-            num_match = re.match(r'^(\d+)[.)]\s+(.+)$', stripped)
+            num_match = re.match(r'^(\d+)[.)] \s+(.+)$', stripped)
             if num_match:
                 blocks.append({
                     "object": "block", "type": "numbered_list_item",
@@ -365,7 +250,6 @@ async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
                 i += 1
                 continue
 
-            # Bullet list
             bullet_match = re.match(r'^[-•]\s+(.+)$', stripped)
             if bullet_match:
                 blocks.append({
@@ -375,7 +259,6 @@ async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
                 i += 1
                 continue
 
-            # Regular paragraph
             para_lines = []
             while i < len(lines):
                 cur = lines[i].strip()
@@ -396,10 +279,6 @@ async def _plain_text_to_blocks(plain_text: str, meta_callout: dict) -> list:
     return blocks
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  BATCH BLOCK APPENDER
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def _post_blocks_in_batches(page_id: str, blocks: list):
     async with httpx.AsyncClient(timeout=30) as client:
         for start in range(0, len(blocks), 100):
@@ -415,7 +294,6 @@ async def _post_blocks_in_batches(page_id: str, blocks: list):
                     continue
                 break
             if resp.status_code not in (200, 201):
-                # M4 FIX: raise instead of silently continuing — prevents partial/corrupted Notion pages
                 error_detail = resp.text[:300]
                 logger.error(f"Block append error {resp.status_code}: {error_detail}")
                 raise RuntimeError(
@@ -423,21 +301,7 @@ async def _post_blocks_in_batches(page_id: str, blocks: list):
                 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  VERSION CONTROL — get next version for dept + doc_type combo
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def _get_next_version(dept: str, doc_type: str) -> int:
-    """
-    Queries the Notion database for existing versions of a document.
-    
-    Args:
-        dept: The department name (e.g., "HR", "IT").
-        doc_type: The type of document (e.g., "Standard Operating Procedure").
-        
-    Returns:
-        The next version number (max existing + 1), defaulting to 1.
-    """
     query = {
         "filter": {
             "and": [
@@ -464,7 +328,6 @@ async def _get_next_version(dept: str, doc_type: str) -> int:
             logger.info(f"No existing doc for dept='{dept}' type='{doc_type}' — starting at v1")
             return 1
 
-        # M6 FIX: explicit None check — `0 or 1` would skip v1 if Notion returns 0
         v = results[0].get("properties", {}).get("Version", {}).get("number")
         existing_version = int(v) if v is not None else 0
         next_version = existing_version + 1
@@ -476,29 +339,7 @@ async def _get_next_version(dept: str, doc_type: str) -> int:
         return 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PUBLISH TO NOTION
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def publish_to_notion(request: NotionPublishRequest) -> dict:
-    """
-    Publishes a generated document to a Notion database.
-    
-    This includes:
-      1. Auto-calculating the document version.
-      2. Converting plain text/Markdown to Notion blocks.
-      3. Rendering Mermaid diagrams as images via Imgur.
-      4. Batch-appending blocks to the new page.
-      
-    Args:
-        request: A NotionPublishRequest containing the text and metadata.
-        
-    Returns:
-        A dictionary with "notion_url", "notion_page_id", and "version".
-        
-    Raises:
-        Exception: If the Notion page creation fails.
-    """
     ctx        = request.company_context or {}
     company    = ctx.get("company_name", "Company")
     industry   = ctx.get("industry", "")
@@ -507,9 +348,7 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
     title      = f"{request.doc_type} — {company}"
     dept       = DEPT_MAP.get(request.department, "Operations")
     word_count = len(request.gen_doc_full.split())
-    fc_count   = len(re.findall(r'```mermaid', request.gen_doc_full))
 
-    # ── Version control: auto-increment if same dept + doc_type exists ──────
     version = await _get_next_version(dept, request.doc_type)
 
     logger.info(f"📤 Publishing: '{title}' | dept={dept} | words={word_count} | version=v{version}")
@@ -569,10 +408,6 @@ async def publish_to_notion(request: NotionPublishRequest) -> dict:
     logger.info(f"Published: {url} | blocks={len(all_blocks)} | version=v{version}")
     return {"notion_url": url, "notion_page_id": page_id, "version": version}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  LIBRARY FETCH
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def fetch_library_from_notion() -> list:
     library, cursor = [], None

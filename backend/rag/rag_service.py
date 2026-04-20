@@ -24,7 +24,7 @@ from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from backend.core.config import settings
 from backend.core.logger import logger
 from backend.services.redis_service import cache
-from backend.core.llm import get_llm as _core_get_llm  # H2+M1 FIX: shared race-free factory
+from backend.core.llm import get_llm as _core_get_llm
 
 
 COLLECTION_NAME = "rag_chunks"
@@ -307,7 +307,7 @@ def _get_collection():
         client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
         _collection_instance = client.get_or_create_collection(
             name="rag_chunks",
-            metadata={"hnsw:space": "cosine"},  # M5 FIX: match ingest_service — use cosine distance
+            metadata={"hnsw:space": "cosine"},
         )
     return _collection_instance
 # ══════════════════════════════════════════════════════════════════════════════
@@ -450,7 +450,7 @@ async def _retrieve(query: str, filters: dict, top_k: int = 8) -> list:
         try:
             count = collection.count()
             if count > 0:
-                # M5 FIX: Push substring filtering down to ChromaDB instead of python memory loop
+                # Push substring filtering down to ChromaDB instead of python memory loop
                 broad_results = collection.get(
                     where_document={"$contains": sec_ref.lower()},
                     include=["documents", "metadatas"],
@@ -984,7 +984,7 @@ async def tool_analysis(question: str, filters: dict,
                     seen.add(uid)
                     chunks.append(c)
 
-    # Bug 7 fix: only run broad contract sweep for legal questions
+    # Only run broad contract sweep for legal questions
     if is_legal:
         legal_contract_queries = [
             "employment contract termination confidentiality obligations",
@@ -1063,7 +1063,7 @@ async def generate_followups(question: str, answer: str) -> list[str]:
     try:
         import json
         llm = _get_llm()
-        # Fixed: use async instead of blocking run_in_executor
+        # Fetch async from LLM
         resp = await llm.ainvoke(prompt)
         res = resp.content
         

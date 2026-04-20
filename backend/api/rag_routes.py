@@ -1,34 +1,34 @@
 """
-rag_routes.py — FastAPI routes for RAG + Single Router LLM
-============================================================
+FastAPI routes for RAG ingestion, Q&A, evaluation, and cache management.
 
-POST /api/rag/ingest    — Notion → Chunks → Embeddings → ChromaDB
-POST /api/rag/ask       — User message → Single Router LLM (agent_graph.run_agent)
-GET  /api/rag/status    — Collection stats
-DELETE /api/rag/cache   — Flush retrieval cache
-GET  /api/rag/scores    — Poll RAGAS scores by key
-POST /api/rag/eval      — Manual RAGAS evaluation
+Provides the HTTP interface to the CiteRAG pipeline. The `/ask` endpoint
+is the primary entry point and routes all questions through the LangGraph
+agent graph for intent detection and tool execution.
 
-Flow for /ask:
-  1. sanitized_question() — fast string-match injection guard (HTTP 422 on obvious patterns)
-  2. run_agent() — ONE LLM call with full history; picks the right tool; executes it; returns answer
-  No pre-RAG run. No separate classify step. No rewrite step.
+Route prefix: /api/rag/
+
+Endpoints:
+    POST   /ingest           — Notion → ChromaDB ingestion pipeline
+    POST   /ask              — CiteRAG Q&A with optional streaming
+    GET    /status           — ChromaDB collection stats
+    DELETE /cache            — Flush all RAG Redis caches
+    GET    /scores           — Poll RAGAS scores by key
+    POST   /eval             — Manual RAGAS evaluation run
+    GET    /eval/runs        — List last 50 RAGAS evaluation runs
+    GET    /eval/runs/{id}   — Retrieve a specific RAGAS run snapshot
 """
 
-# ── Standard library ──────────────────────────────────────────────────────────
 import asyncio
 import datetime
 import re
 import uuid
 from typing import Dict, List, Optional
 
-# ── Third-party ───────────────────────────────────────────────────────────────
 import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-# ── Internal ──────────────────────────────────────────────────────────────────
 from backend.core.logger import logger
 from backend.services.redis_service import cache
 from backend.rag.rag_service import tool_search, _save_turn, _answer_key
@@ -39,79 +39,75 @@ from backend.agents.agent_graph import run_agent
 router = APIRouter(prefix="/rag", tags=["RAG"])
 
 
-
-# M2 FIX: Single definition of safe (idempotent) tools — only these are cached.
 _SAFE_TOOLS = frozenset({"search", "compare", "multi_compare", "multi_query", "full_doc", "analysis", "refine"})
 
 
 class IngestRequest(BaseModel):
-    """Configuration for the Notion ingestion process."""
-    force: bool = False  # If True, re-indexes even if chunks exist.
+    """Configuration for the Notion-to-ChromaDB ingestion process."""
+
+    force: bool = False
 
 
 class AskRequest(BaseModel):
     """
-    Schema for a CiteRAG question request.
-    
+    Request body for the CiteRAG Q&A endpoint.
+
     Attributes:
-        question: The user's query or instruction.
-        filters: Optional department or doc_type filters.
-        session_id: Unique ID for conversation history tracking.
-        top_k: Number of chunks to retrieve for single tasks.
-        doc_a: Name of first document (for comparisons).
-        doc_b: Name of second document (for comparisons).
-        doc_list: List of 3+ documents for multi-comparisons.
-        stream: If True, returns a token stream.
+        question:   The user's query or instruction (max 2000 characters).
+        filters:    Optional key-value filters (e.g. department, doc_type).
+        session_id: Unique identifier for conversation history tracking.
+        top_k:      Number of chunks to retrieve for single-question tasks.
+        doc_a:      First document name for pairwise comparisons.
+        doc_b:      Second document name for pairwise comparisons.
+        doc_list:   Three or more document names for multi-comparisons.
+        stream:     If True, returns tokens as a newline-delimited JSON stream.
         skip_cache: If True, bypasses the Redis answer cache.
     """
-    # H5 FIX: Constrained fields to prevent oversized prompts and Redis key injection
-    question:       str = Field(..., max_length=2000)
-    filters:        Dict[str, str] = Field(default_factory=dict)
-    session_id:     str = Field("default", max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
-    top_k:          int = 5
-    doc_a:          str = ""
-    doc_b:          str = ""
-    doc_list:       list[str] = Field(default_factory=list)
-    stream:         bool = False
-    skip_cache:     bool = False
+
+    question:   str = Field(..., max_length=2000)
+    filters:    Dict[str, str] = Field(default_factory=dict)
+    session_id: str = Field("default", max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    top_k:      int = 5
+    doc_a:      str = ""
+    doc_b:      str = ""
+    doc_list:   list[str] = Field(default_factory=list)
+    stream:     bool = False
+    skip_cache: bool = False
 
     def sanitized_question(self) -> str:
         """
-        Cleans and truncates the user question for safety.
-        
-        Collapses multiple whitespaces and caps length to prevent 
-        DoS-style oversized query attacks.
-        
+        Normalize and truncate the user question for safe downstream use.
+
+        Collapses multiple whitespace characters and caps the string at
+        2000 characters to prevent oversized prompt injection.
+
         Returns:
             The normalized question string.
         """
-        # ── Fast normalisation ──
         q = " ".join(self.question.strip().split())
-        q = q[:2000]
-        return q
+        return q[:2000]
 
-
-# ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.post("/ingest")
 async def api_ingest(req: IngestRequest):
-    """Trigger Notion → ChromaDB ingest pipeline.
-    
-    Smart auto-detect:
-      - If ChromaDB has 0 chunks → auto-force ingest (first time)
-      - If chunks exist → respect the force flag (default=False skips, True re-ingests)
+    """
+    Trigger the Notion → ChromaDB ingestion pipeline.
+
+    If ChromaDB contains zero chunks, ingest is forced automatically
+    regardless of the `force` flag (first-run bootstrap). Otherwise,
+    the `force` flag controls whether existing chunks are re-indexed.
     """
     try:
-        # Auto-detect: if no chunks exist, force ingest automatically
-        collection = _get_collection()
+        collection  = _get_collection()
         chunk_count = collection.count()
-        auto_force = req.force
+        auto_force  = req.force
+
         if chunk_count == 0:
             logger.info("📦 [Ingest] No chunks found in ChromaDB — auto-forcing ingest")
             auto_force = True
         else:
             logger.info("📦 [Ingest] %d chunks already in ChromaDB (force=%s)", chunk_count, req.force)
-        
+
         result  = await ingest_from_notion(force=auto_force)
         flushed = await cache.flush_pattern("docforge:rag:answer:*")
         logger.info("🧹 [Cache] Flushed after ingest (%d keys)", flushed)
@@ -126,20 +122,24 @@ async def api_ingest(req: IngestRequest):
 async def api_ask(req: AskRequest):
     """
     Primary Q&A endpoint for CiteRAG.
-    
-    Routes questions to the Agent Graph for intent detection and tool
-    execution (search, compare, ticket creation, etc.). Supports 
-    streaming for low-latency feedback.
-    
+
+    Routes questions through the LangGraph agent graph for intent
+    detection and tool execution (search, compare, ticket creation, etc.).
+    Supports optional streaming for low-latency token delivery.
+
+    Security: If `sanitized_question()` raises HTTP 422, the request is
+    treated as a potential injection and a safe deflection response is
+    returned without invoking the agent. Azure content filter violations
+    are handled similarly.
+
     Args:
-        req: AskRequest containing question, session, and filters.
-        
+        req: `AskRequest` with question, session, and optional filters.
+
     Returns:
-        The dictionary response or a StreamingResponse if req.stream is True.
+        A dict response, or a `StreamingResponse` (NDJSON) if `req.stream` is True.
     """
     request_id = str(uuid.uuid4())[:8]
 
-    # ── Injection guard ───────────────────────────────────────────────────────
     try:
         question = req.sanitized_question()
     except HTTPException as e:
@@ -175,14 +175,13 @@ async def api_ask(req: AskRequest):
         logger.info("   ↳ Multi-compare docs: %s", req.doc_list)
 
     try:
-        # ── Cache Check ───────────────────────────────────────────────────────
         a_key = _answer_key(question, req.filters)
         if not req.skip_cache:
             hit = await cache.get(a_key)
             if hit:
                 logger.info("⚡ [%s] Cache HIT", request_id)
                 await _save_turn(req.session_id, question, hit.get("answer", ""))
-                
+
                 if req.stream:
                     async def cache_streamer():
                         yield json.dumps({"type": "token", "content": hit.get("answer", "")}) + "\n"
@@ -190,13 +189,17 @@ async def api_ask(req: AskRequest):
                     return StreamingResponse(cache_streamer(), media_type="application/x-ndjson")
                 return hit
 
-        # ── Run Agent Graph ───────────────────────────────────────────────────
         if req.stream:
             stream_queue = asyncio.Queue()
-            
+
             async def streaming_generator():
-                # H2 FIX: sentinel-based drain — task signals completion by putting None on the queue,
-                # eliminating the 0.1s poll loop and its per-token tail latency.
+                """
+                Drain agent output tokens from the queue until the sentinel None is received.
+
+                The agent task always puts None on completion (even on error), so
+                the generator is guaranteed to terminate. Errors from the agent task
+                are surfaced as a JSON error event rather than silently closing the stream.
+                """
                 async def _run_and_sentinel():
                     try:
                         return await run_agent(
@@ -208,19 +211,16 @@ async def api_ask(req: AskRequest):
                             stream_queue=stream_queue,
                         )
                     finally:
-                        await stream_queue.put(None)  # sentinel — always sent, even on error
+                        await stream_queue.put(None)
 
                 task = asyncio.create_task(_run_and_sentinel())
 
-                # Drain queue until sentinel
                 while True:
                     item = await stream_queue.get()
                     if item is None:
                         break
                     yield json.dumps(item) + "\n"
 
-                # H3 FIX: Catch exceptions from run_agent and yield an error event
-                # instead of silently closing the stream.
                 try:
                     result = task.result()
                 except Exception as agent_err:
@@ -229,7 +229,7 @@ async def api_ask(req: AskRequest):
                     yield json.dumps({"type": "error", "message": err_msg}) + "\n"
                     return
 
-                tool_used = result.get("tool_used", "chat")
+                tool_used  = result.get("tool_used", "chat")
                 info_found = "could not find" not in result.get("answer", "").lower()
 
                 if tool_used in _SAFE_TOOLS and info_found:
@@ -238,8 +238,7 @@ async def api_ask(req: AskRequest):
                 yield json.dumps({"type": "done", "result": result}) + "\n"
 
             return StreamingResponse(streaming_generator(), media_type="application/x-ndjson")
-            
-        # Pass the full question to the agent graph, which will split it if needed.
+
         result = await run_agent(
             question=question,
             session_id=req.session_id,
@@ -249,16 +248,12 @@ async def api_ask(req: AskRequest):
         )
 
         logger.info("✅ [%s] Done | tool=%s", request_id, result.get("tool_used", "?"))
-        
-        # ── Global Result Cache Save ──────────────────────────────────────────
-        # Uses module-level _SAFE_TOOLS frozenset (defined at top of file).
-        # NOTE: Do NOT re-define _SAFE_TOOLS as a local variable here — doing so
-        # would poison the streaming_generator closure and cause a NameError.
-        tool_used = result.get("tool_used", "chat")
+
+        tool_used  = result.get("tool_used", "chat")
         info_found = "could not find" not in result.get("answer", "").lower()
         if tool_used in _SAFE_TOOLS and info_found:
             await cache.set(a_key, result, ttl=3600)
-        
+
         return result
 
     except HTTPException:
@@ -284,13 +279,12 @@ async def api_ask(req: AskRequest):
 
 @router.get("/status")
 async def api_rag_status():
-    """Return ChromaDB collection stats (chunk count, doc count, ingest lock status)."""
+    """Return ChromaDB collection stats including chunk count, doc count, and ingest lock status."""
     try:
-        # FIX: reuse singleton — two PersistentClients on same path = file-lock crash
         collection   = _get_collection()
         total_chunks = collection.count()
-        meta   = await cache.get("docforge:rag:ingest_meta") or {}
-        locked = await cache.exists("docforge:rag:ingest_lock")
+        meta         = await cache.get("docforge:rag:ingest_meta") or {}
+        locked       = await cache.exists("docforge:rag:ingest_lock")
         return {
             "collection_ok":   True,
             "total_chunks":    total_chunks,
@@ -304,7 +298,7 @@ async def api_rag_status():
 
 @router.delete("/cache")
 async def api_flush_cache():
-    """Flush all RAG retrieval, session, and answer caches in Redis."""
+    """Flush all RAG retrieval, session, and answer caches from Redis."""
     count  = await cache.flush_pattern("docforge:rag:retrieval:*")
     count += await cache.flush_pattern("docforge:rag:session:*")
     count += await cache.flush_pattern("docforge:rag:answer:*")
@@ -313,7 +307,7 @@ async def api_flush_cache():
 
 @router.get("/scores")
 async def api_get_scores(key: str):
-    """Poll for RAGAS evaluation scores by a ragas_key returned from /eval."""
+    """Poll for RAGAS evaluation scores by the `ragas_key` returned from `/eval`."""
     if not key or not key.startswith("ragas:"):
         raise HTTPException(status_code=400, detail="Invalid ragas_key format")
     try:
@@ -324,6 +318,8 @@ async def api_get_scores(key: str):
 
 
 class EvalRequest(BaseModel):
+    """Request body for a manual RAGAS evaluation run."""
+
     question:     str
     ground_truth: str = ""
     top_k:        int = 15
@@ -331,11 +327,16 @@ class EvalRequest(BaseModel):
 
 @router.post("/eval")
 async def api_eval(req: EvalRequest):
-    """Manual RAGAS evaluation. Stores run snapshot in Redis for reproducibility."""
+    """
+    Run a manual RAGAS evaluation against the live RAG pipeline.
+
+    Calls `tool_search` directly (bypassing the agent graph) to capture
+    the raw retrieval result, then scores it with RAGAS. The full run
+    snapshot is stored in Redis for up to 7 days for reproducibility.
+    """
     request_id = str(uuid.uuid4())[:8]
     logger.info("🧪 [%s] /eval | q=%r", request_id, req.question[:60])
     try:
-        # Eval calls search directly — no agent overhead
         rag_result = await tool_search(
             question=req.question, filters={}, session_id="ragas_eval",
         )
@@ -379,7 +380,7 @@ async def api_eval(req: EvalRequest):
 
 @router.get("/eval/runs")
 async def api_eval_runs():
-    """Browse the last 50 stored RAGAS evaluation runs."""
+    """Browse the index of the last 50 stored RAGAS evaluation runs."""
     try:
         runs = await cache.get("ragas:run_index") or []
         return {"total": len(runs), "runs": runs}
@@ -389,7 +390,7 @@ async def api_eval_runs():
 
 @router.get("/eval/runs/{run_id}")
 async def api_eval_run_detail(run_id: str):
-    """Retrieve the full snapshot of a specific RAGAS evaluation run."""
+    """Retrieve the full snapshot of a specific RAGAS evaluation run by its ID."""
     try:
         snapshot = await cache.get(f"ragas:runs:{run_id}")
         if snapshot is None:

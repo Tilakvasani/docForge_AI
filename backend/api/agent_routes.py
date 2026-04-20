@@ -1,14 +1,19 @@
 """
-agent_routes.py — FastAPI routes for the CiteRAG Agent layer
+FastAPI routes for the CiteRAG Agent layer.
 
-Bug fixes vs v2:
-  1. TICKETS_CACHE_KEY is a module-level constant — no more duplicate string
-     literals in get_tickets() and update_ticket() that could silently diverge.
-  2. Added _fetch_session_tickets() so agent_graph can query Notion for
-     session-specific tickets without importing route handlers.
-  3. update_ticket pagination: falls back to a proper Notion query (not just
-     the first 100 pages) when the page_id is not in the Redis cache.
-  4. Removed dead `random` import — ticket IDs are numeric strings only.
+Handles support ticket lifecycle management (create, list, update)
+and session memory persistence via Redis. Ticket data is stored in
+a dedicated Notion database; the route layer provides both an HTTP
+interface and internal helpers used directly by the agent graph.
+
+Route prefix: /api/agent/
+
+Endpoints:
+    GET    /tickets          — List all tickets (60-second Redis cache)
+    POST   /tickets/update   — Update ticket status (Open / In Progress / Resolved)
+    POST   /memory           — Save or merge session context into Redis
+    POST   /ticket/create    — Create a new Notion support ticket
+    DELETE /dedup/flush      — No-op (dedup uses live Notion data)
 """
 
 from datetime import datetime, timezone
@@ -25,22 +30,21 @@ from backend.services.redis_service import cache
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-NOTION_API       = "https://api.notion.com/v1"
-NOTION_VER       = "2022-06-28"
-TICKETS_CACHE_KEY = "docforge:agent:tickets"   # single source of truth
+NOTION_API        = "https://api.notion.com/v1"
+NOTION_VER        = "2022-06-28"
+TICKETS_CACHE_KEY = "docforge:agent:tickets"
 
-
-# ── Schemas ───────────────────────────────────────────────────────────────────
 
 class TicketUpdateRequest(BaseModel):
     """Schema for updating the status of an existing Notion support ticket."""
+
     ticket_id: str
-    status:    str   # "Open" | "In Progress" | "Resolved"
+    status:    str
 
 
 class TicketCreateRequest(BaseModel):
     """Schema for creating a new Notion support ticket from the CiteRAG agent context."""
+
     question:          str
     session_id:        str       = "default"
     attempted_sources: List[str] = []
@@ -53,14 +57,24 @@ class TicketCreateRequest(BaseModel):
 
 
 class MemorySaveRequest(BaseModel):
-    """Schema for saving dynamic session memory (like user names or roles) to Redis."""
+    """Schema for saving dynamic session memory (such as user name or role) to Redis."""
+
     session_id: str
     memory:     dict
 
 
-# ── Notion REST helpers ───────────────────────────────────────────────────────
-
 def _notion_headers() -> dict:
+    """
+    Build the HTTP headers required by the Notion API.
+
+    Reads from `NOTION_TOKEN` or `NOTION_API_KEY` in settings.
+
+    Returns:
+        A dict with Authorization, Content-Type, and Notion-Version headers.
+
+    Raises:
+        ValueError: If neither token setting is configured.
+    """
     token = (
         getattr(settings, "NOTION_TOKEN", "")
         or getattr(settings, "NOTION_API_KEY", "")
@@ -77,10 +91,30 @@ def _notion_headers() -> dict:
 
 
 def _get_ticket_db_id() -> str:
+    """
+    Return the Notion database ID for ticket storage.
+
+    Prefers `NOTION_TICKET_DB_ID`; falls back to the primary
+    `NOTION_DATABASE_ID` if the dedicated ticket DB is not configured.
+
+    Returns:
+        The Notion database ID string.
+    """
     return getattr(settings, "NOTION_TICKET_DB_ID", None) or settings.NOTION_DATABASE_ID
 
 
 def _page_to_ticket(page: dict) -> dict:
+    """
+    Convert a raw Notion page object into a structured ticket dict.
+
+    Args:
+        page: A raw Notion page object from the REST API response.
+
+    Returns:
+        A flat dict with ticket_id, page_id, url, question, status,
+        priority, summary, session_id, attempted_sources, created,
+        assigned_owner, user_info, and created_time.
+    """
     props = page.get("properties", {})
 
     def _text(key: str) -> str:
@@ -120,15 +154,20 @@ def _page_to_ticket(page: dict) -> dict:
     }
 
 
-# ── Internal helpers (used by agent_graph) ────────────────────────────────────
-
 async def _fetch_session_tickets(session_id: str) -> list[dict]:
     """
-    Query Notion for all tickets belonging to a specific session_id.
-    Used by agent_graph._exec_update_ticket() as a fallback when session
-    memory is empty (e.g. after a restart or UI-created tickets).
+    Query Notion for all open tickets belonging to a specific session.
 
-    Returns [] on any error (fail-open so updates are never silently blocked).
+    Used by the agent graph as a fallback when session memory is empty —
+    for example, after a server restart or when tickets were created via
+    the Notion UI rather than through the chat interface.
+
+    Args:
+        session_id: The session identifier to filter by.
+
+    Returns:
+        A list of ticket dicts, or an empty list on any error (fail-open
+        so ticket updates are never silently blocked).
     """
     try:
         db_id = _get_ticket_db_id()
@@ -148,7 +187,7 @@ async def _fetch_session_tickets(session_id: str) -> list[dict]:
             )
             resp.raise_for_status()
 
-        pages = resp.json().get("results", [])
+        pages   = resp.json().get("results", [])
         tickets = [_page_to_ticket(p) for p in pages]
         logger.info("_fetch_session_tickets: found %d for session=%s", len(tickets), session_id)
         return tickets
@@ -160,18 +199,26 @@ async def _fetch_session_tickets(session_id: str) -> list[dict]:
 
 async def _create_notion_ticket(req: TicketCreateRequest) -> dict:
     """
-    Core ticket-creation logic.  Called by both the HTTP route handler and
-    directly from agent_graph (bypassing HTTP overhead).
+    Core ticket-creation logic, shared by the HTTP route and the agent graph.
 
-    Returns {"success": bool, "ticket_id": str, "page_id": str, "url": str}.
-    Raises on Notion API failure.
+    Builds the Notion page payload, optionally attaches retrieved context
+    snippets as callout blocks, and invalidates the ticket cache after
+    a successful create.
+
+    Args:
+        req: A `TicketCreateRequest` with question, session, and metadata.
+
+    Returns:
+        A dict with `success`, `ticket_id`, `page_id`, and `url`.
+
+    Raises:
+        `httpx.HTTPStatusError`: If the Notion API returns an error response.
     """
     db_id     = _get_ticket_db_id()
     headers   = _notion_headers()
     priority  = req.priority if req.priority in {"High", "Medium", "Low"} else "Medium"
     live_date = datetime.now(timezone.utc).isoformat()
 
-    # Generate a simple numeric ticket ID
     ticket_id = req.ticket_id or "".join(random.choices(string.digits, k=8))
 
     properties: dict = {
@@ -222,7 +269,6 @@ async def _create_notion_ticket(req: TicketCreateRequest) -> dict:
     resp.raise_for_status()
     page = resp.json()
 
-    # Invalidate ticket cache so next read reflects the new ticket
     await cache.flush_pattern(f"{TICKETS_CACHE_KEY}*")
     logger.info("Ticket created: %s for: %s", ticket_id, req.question[:60])
 
@@ -234,13 +280,13 @@ async def _create_notion_ticket(req: TicketCreateRequest) -> dict:
     }
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-
 @router.get("/tickets")
 async def get_tickets():
     """
-    Fetch all tickets from Notion.  Redis 60-second cache.
-    Returns empty list (not an error) when NOTION_TICKET_DB_ID is not configured.
+    Fetch all support tickets from Notion with a 60-second Redis cache.
+
+    Returns an empty list (not an error) when `NOTION_TICKET_DB_ID` is
+    not configured.
     """
     cached = await cache.get(TICKETS_CACHE_KEY)
     if cached is not None:
@@ -303,9 +349,13 @@ async def get_tickets():
 @router.post("/tickets/update")
 async def update_ticket(req: TicketUpdateRequest):
     """
-    Update ticket status.  Looks up page_id from Redis cache first;
-    falls back to a Notion filter query if not cached.
-    Invalidates cache after a successful update.
+    Update the status of an existing support ticket.
+
+    Looks up the Notion page_id from the Redis cache first, then falls
+    back to a direct Notion database query by Ticket ID. Invalidates
+    the ticket cache after a successful update.
+
+    Valid status values: `Open`, `In Progress`, `Resolved`.
     """
     VALID = {"Open", "In Progress", "Resolved"}
     if req.status not in VALID:
@@ -323,7 +373,6 @@ async def update_ticket(req: TicketUpdateRequest):
 
         async with _httpx.AsyncClient(timeout=30) as client:
             if not page_id:
-                # Fallback: query Notion by Ticket ID property
                 db_id = _get_ticket_db_id()
                 body  = {
                     "page_size": 10,
@@ -362,7 +411,7 @@ async def update_ticket(req: TicketUpdateRequest):
 
 @router.post("/memory")
 async def save_memory(req: MemorySaveRequest):
-    """Save or merge agent session context."""
+    """Save or merge agent session context into Redis (TTL: 24 hours)."""
     try:
         mem_key  = f"docforge:agent:memory:{req.session_id}"
         existing = await cache.get(mem_key) or {}
@@ -376,7 +425,7 @@ async def save_memory(req: MemorySaveRequest):
 
 @router.post("/ticket/create")
 async def create_ticket(req: TicketCreateRequest):
-    """HTTP endpoint — delegates to _create_notion_ticket()."""
+    """HTTP endpoint that delegates ticket creation to `_create_notion_ticket()`."""
     try:
         return await _create_notion_ticket(req)
     except Exception as e:
@@ -386,5 +435,5 @@ async def create_ticket(req: TicketCreateRequest):
 
 @router.delete("/dedup/flush")
 async def flush_dedup_cache():
-    """No-op — dedup uses live Notion data now, no cache to flush."""
+    """No-op endpoint — deduplication uses live Notion data, so there is no cache to flush."""
     return {"flushed": 0, "note": "Dedup uses live Notion data — no cache to flush."}

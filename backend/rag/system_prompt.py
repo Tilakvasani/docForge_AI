@@ -1,24 +1,22 @@
 """
-system_prompt.py — Dynamic Master System Prompt for CiteRAG
+system_prompt.py — Dynamic master system prompt for CiteRAG
 ============================================================
 
-Replaces the static SYSTEM_PROMPT string in agent_graph.py.
+Builds the full LLM system prompt on every turn, injecting a live document
+registry fetched directly from ChromaDB. This ensures the agent's routing
+decision tree always reflects the currently indexed documents without
+requiring a server restart.
 
-What this adds vs the old static prompt:
-  ✅ Live document registry — fetched from ChromaDB, cached 5 min.
-     No more hardcoded KNOWN_DOCS list; auto-updates as docs are ingested.
-  ✅ 12 new attack categories blocked:
-       data dump · schema discovery · author/PII enumeration ·
-       prompt extraction · social engineering · fictional framing ·
-       system-tag injection · indirect reconstruction ·
-       timing/activity analysis · overload queries ·
-       hallucination triggers · doc-not-in-registry questions
-  ✅ Coverage Gap Rule — partial answers instead of silent failures.
-  ✅ Uses the SAME _get_llm() / ChromaDB already in rag_service.py.
-     Zero new LLM instances. Zero extra cost.
+Key features:
+    - Live document registry with 5-minute in-process cache.
+    - 12 attack categories explicitly blocked (injection, PII enumeration, etc.).
+    - Coverage gap rule: partial answers instead of silent failures.
+    - Cross-session user context injection for personalised routing.
+    - Uses the shared `_get_collection()` from `rag_service.py` — no new clients.
 
-Drop this file into:  backend/rag/system_prompt.py
-Then in agent_graph.py make the two changes shown at the bottom of this file.
+Public API:
+    build_system_prompt(user_context)  — async; returns the full prompt string.
+    HISTORY_SUMMARY_PROMPT             — template for the chat history summary node.
 """
 
 import time
@@ -32,14 +30,19 @@ from backend.rag.rag_service import _get_collection
 # ── Simple in-process cache so we don't hit ChromaDB on every turn ────────────
 _doc_cache:     list[str] = []
 _doc_cache_at:  float     = 0.0
-_DOC_CACHE_TTL: int       = 300   # seconds — refresh every 5 minutes
+_DOC_CACHE_TTL: int       = 300
 
 
 async def _fetch_live_doc_list() -> list[str]:
     """
-    Pull distinct doc_title values from ChromaDB (your existing collection).
-    Caches the result for _DOC_CACHE_TTL seconds.
-    Returns an empty list on any error.
+    Pull distinct `doc_title` values from ChromaDB, with a 5-minute in-process cache.
+
+    Batches ChromaDB `get()` calls to handle collections larger than the default
+    page size. Returns an empty list on any error so the agent can still route
+    correctly (it will simply have no document registry to consult).
+
+    Returns:
+        A sorted list of unique document title strings.
     """
     global _doc_cache, _doc_cache_at
 
@@ -47,15 +50,12 @@ async def _fetch_live_doc_list() -> list[str]:
         return _doc_cache
 
     try:
-
         collection = _get_collection()
         count      = collection.count()
         if count == 0:
-            logger.info("ChromaDB collection is empty — no docs available.")
+            logger.info("📦 [DocRegistry] ChromaDB collection is empty — no docs available")
             return []
 
-        # Fetch all metadatas to collect unique titles
-        # ChromaDB returns up to `limit` items; we page if needed
         batch_size = 1000
         offset     = 0
         titles: set[str] = set()
@@ -78,16 +78,17 @@ async def _fetch_live_doc_list() -> list[str]:
         if titles:
             _doc_cache    = sorted(titles)
             _doc_cache_at = time.time()
-            logger.info("Dynamic doc list refreshed: %d documents", len(_doc_cache))
+            logger.info("🗒️  [DocRegistry] Refreshed — %d documents indexed in ChromaDB", len(_doc_cache))
             return _doc_cache
 
     except Exception as e:
-        logger.warning("Could not fetch live doc list: %s — returning empty list", e)
+        logger.warning("⚠️  [DocRegistry] Could not fetch live doc list: %s — returning empty list", e)
 
     return []
 
 
 def _bullet_list(docs: list[str]) -> str:
+    """Format a list of document titles as a markdown bullet list."""
     return "\n".join(f"  • {d}" for d in docs)
 
 
@@ -109,7 +110,6 @@ async def build_system_prompt(user_context: str = "") -> str:
     # from its static list, so compare/full_doc tools still get exact names.
     known_docs_inline = "\n".join(f"  • {d}" for d in docs)
 
-    # L1 FIX: inject cross-session user context block if provided by agent load_context
     user_context_block = ""
     if user_context and user_context.strip():
         user_context_block = f"""

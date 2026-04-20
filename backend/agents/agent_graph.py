@@ -1,28 +1,20 @@
 """
-agent_graph.py — CiteRAG LangGraph Agent  (v3 — Bug-Fixed)
-===========================================================
+agent_graph.py — CiteRAG LangGraph Agent
+=========================================
 
-KEY BUG FIXES vs v2:
-  1. [CRITICAL] Duplicate-ticket check now runs SYNCHRONOUSLY *before* creation.
-     In v2, `find_duplicate` ran in a background task *after* the ticket was
-     already posted to Notion.  Result: user saw "✅ Ticket created" even for
-     duplicates; the background archive silently deleted the new page without
-     any user feedback — or failed entirely, leaving the duplicate in Notion.
-     Fix: await find_duplicate() before _create_notion_ticket().
-     _bg_dedup_task() and its asyncio.create_task() call are fully removed.
+Orchestrates the full LangGraph agent pipeline for the CiteRAG Q&A system.
+Handles intent routing, tool execution, ticket lifecycle management, session
+memory, and multi-query fan-out — all within a single LangGraph StateGraph.
 
-  2. [CRITICAL] `_exec_update_ticket` now queries Notion directly when the
-     session-memory ticket list is empty.  In v2 only tickets created in the
-     current session were tracked, so a restart or a UI-created ticket could
-     never be updated from the chat.
+Graph nodes (in execution order):
+    load_context  — Load session history, memory, and user profile from Redis.
+    route         — Call the LLM with tools bound; select the best tool to run.
+    execute_tool  — Execute the chosen tool and populate the result state.
+    save_history  — Append the Q&A turn to the session history in Redis.
 
-  3. [HIGH] `_exec_create_all_tickets` no longer fire-and-forget.  Tickets are
-     created sequentially with per-item error reporting; dedup check inside
-     _make_ticket protects each one.
-
-  4. [MEDIUM] Removed ~80 lines of dead/unreachable code and duplicate helpers.
-
-  5. [MEDIUM] CACHE_KEY references consolidated — no local string literals.
+Public entry point:
+    run_agent(question, session_id, ...)  — Invoke the compiled graph and
+    return a structured response dict with answer, citations, tool_used, etc.
 """
 
 import asyncio
@@ -361,10 +353,10 @@ async def _detect_priority_async(question: str) -> str:
         resp   = await _get_llm().ainvoke(prompt)
         result = resp.content.strip().upper()
         priority = "High" if result.startswith("HIGH") else "Low"
-        logger.info("Priority classified: %s for: %s", priority, question[:60])
+        logger.info("🎯 [Priority] Classified as %s — %r", priority, question[:60])
         return priority
     except Exception as e:
-        logger.warning("Priority LLM failed (%s) — defaulting to Low", e)
+        logger.warning("⚠️  [Priority] LLM failed (%s) — defaulting to Low", e)
         return "Low"
 
 
@@ -457,7 +449,7 @@ async def _track_if_unanswered(question: str, result: dict, session_id: str):
         })
         memory["unanswered_questions"] = unanswered
         await _save_memory(session_id, memory)
-        logger.info("Unanswered saved: %r (total: %d)", question[:50], len(unanswered))
+        logger.info("📌 [Memory] Unanswered question saved: %r  (total in queue: %d)", question[:50], len(unanswered))
 
 
 # ── Ticket helpers ────────────────────────────────────────────────────────────
@@ -470,26 +462,28 @@ async def _make_ticket(
     ticket_id: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """
-    Create a Notion ticket — but ONLY if no open/in-progress ticket already
-    exists for the same question.
+    Create a Notion ticket, suppressing duplicates via a synchronous dedup check.
 
-    BUG FIX (v2 → v3):
-      v2 called `_create_notion_ticket` FIRST, then ran `find_duplicate` in a
-      background asyncio task.  This caused:
-        - User saw "✅ Ticket created" even when a duplicate was found.
-        - The background archive could fail silently, leaving duplicates in Notion.
-        - Or succeed, making the ticket invisible — user thought it was saved
-          but it disappeared.
+    The deduplication check is performed against live Notion data *before* the
+    ticket is created. If an open or in-progress ticket already exists for the
+    same question, creation is skipped and the existing ticket ID is returned
+    to the user instead.
 
-      v3 calls `find_duplicate` SYNCHRONOUSLY *before* creation.
-      No background task needed; _bg_dedup_task is removed entirely.
+    Args:
+        question:   The unanswered question to file a ticket for.
+        raw_chunks: Retrieved context chunks to attach as callout blocks.
+        session_id: Current session identifier for memory persistence.
+        memory:     Mutable session memory dict; updated in place with ticket metadata.
+        ticket_id:  Optional explicit ticket ID to assign (auto-generated if None).
 
-    Returns (reply_text, ticket_id_or_None).
+    Returns:
+        A tuple of `(reply_text: str, ticket_id: Optional[str])`. `ticket_id`
+        is None when a duplicate was found and creation was suppressed.
     """
     # ── 1. Dedup check — Notion ground truth, no Redis cache ─────────────────
     dup = await find_duplicate(question)
     if dup:
-        logger.info("Duplicate suppressed: new question %r matches existing ticket #%s (%r)",
+        logger.info("🔁 [Dedup] Suppressed — new q=%r matches ticket #%s (%r)",
                     question[:60], dup["ticket_id"], dup["question"][:60])
         return (
             f"🎫 A ticket already exists for this question "
@@ -533,7 +527,7 @@ async def _make_ticket(
     })
     memory["created_tickets"] = created
 
-    logger.info("Ticket created: id=%s priority=%s q='%s'", tid, priority, question[:50])
+    logger.info("🎫 [Ticket] Created #%s | priority=%s | q=%r", tid, priority, question[:50])
     return f"✅ Ticket created for: **{question}**", tid
 
 
@@ -595,17 +589,18 @@ async def _exec_select_ticket(index: int, session_id: str) -> str:
 
 async def _exec_create_all_tickets(session_id: str) -> str:
     """
-    Create tickets for all unanswered questions SYNCHRONOUSLY.
+    Create Notion tickets for all pending unanswered questions sequentially.
 
-    BUG FIX (v2 → v3):
-      v2 used asyncio.create_task() (fire-and-forget).  Problems:
-        - Tasks without a stored reference can be garbage-collected.
-        - User saw optimistic "Creating X tickets" but had no way to know
-          if creation actually succeeded.
-        - dedup check inside _make_ticket was still post-creation in v2.
+    Each question is dedup-checked and created one at a time so that per-item
+    success or failure can be reported accurately. Questions are cleared from
+    session memory after all attempts complete, regardless of individual outcomes.
 
-      v3 runs synchronously: each ticket is created, dedup-checked, and
-      confirmed before moving to the next.
+    Args:
+        session_id: The session whose unanswered question queue to process.
+
+    Returns:
+        A markdown-formatted summary string listing created, skipped (duplicate),
+        and failed tickets.
     """
     memory     = await _load_memory(session_id)
     unanswered = memory.get("unanswered_questions", [])
@@ -628,7 +623,7 @@ async def _exec_create_all_tickets(session_id: str) -> str:
             else:
                 lines_dup.append(f"  🎫 Already exists — {q[:70]}")
         except Exception as e:
-            logger.error("create_all_tickets: failed for q='%s': %s", q[:60], e)
+            logger.error("❌ [Ticket] create_all failed | q=%r | err=%s", q[:60], e)
             lines_failed.append(f"  ❌ Failed — {q[:70]}")
 
     memory["unanswered_questions"] = []
@@ -658,7 +653,7 @@ async def _exec_update_ticket(status: str, session_id: str, ticket_index: int = 
         try:
             tickets = await _fetch_session_tickets(session_id)
         except Exception as e:
-            logger.warning("_exec_update_ticket: Notion fallback failed: %s", e)
+            logger.warning("⚠️  [Ticket] Notion fallback failed: %s", e)
 
     if not tickets:
         return "⚠️ No tickets found for this session. Create one by saying **create ticket**."
@@ -725,7 +720,7 @@ async def _exec_update_ticket(status: str, session_id: str, ticket_index: int = 
                 t["status"] = status
                 results.append(f"✅ `{t['ticket_id']}` → **{status}** ({t['question'][:50]})")
             except Exception as e:
-                logger.error("Update failed for ticket %s: %s", t['ticket_id'], e)
+                logger.error("❌ [Ticket] Update failed | id=%s | err=%s", t['ticket_id'], e)
                 results.append(f"❌ `{t['ticket_id']}` failed: {str(e)[:50]}...")
 
     # Persist updated statuses + invalidate cache
@@ -806,6 +801,18 @@ def _merge_multi_results(sub_questions: list, sub_results: list) -> dict:
 # ── LangGraph nodes ───────────────────────────────────────────────────────────
 
 async def node_load_context(state: AgentState) -> AgentState:
+    """
+    Load session history, memory, and user profile from Redis.
+
+    Populates the `history`, `memory`, `history_context`, and
+    `_user_profile` keys of the agent state before routing begins.
+
+    Args:
+        state: The incoming agent state with `session_id` set.
+
+    Returns:
+        The updated state with context fields populated.
+    """
     sid   = state["session_id"]
     history = await _load_history(sid)
     state["history"]         = history
@@ -816,6 +823,21 @@ async def node_load_context(state: AgentState) -> AgentState:
 
 
 async def node_route(state: AgentState) -> AgentState:
+    """
+    Route the user question to the best available tool via a single LLM call.
+
+    Builds a system prompt from session context, binds the full tool list to
+    the LLM, and parses the resulting tool call. Falls back to
+    `block_off_topic` if no tool call is returned or if the Azure content
+    filter is triggered.
+
+    Args:
+        state: Agent state with `question`, `session_id`, `memory`, and
+               `history_context` populated by `node_load_context`.
+
+    Returns:
+        Updated state with `tool_name` and `tool_args` set.
+    """
     question = state["question"]
     doc_a    = state.get("doc_a", "")
     doc_b    = state.get("doc_b", "")
@@ -862,7 +884,7 @@ async def node_route(state: AgentState) -> AgentState:
         tool_calls     = getattr(response, "tool_calls", []) or []
 
         if not tool_calls:
-            logger.warning("LLM returned no tool call — routing to block_off_topic")
+            logger.warning("⚠️  [Router] LLM returned no tool call — routing to block_off_topic")
             tool_name = "block_off_topic"
             tool_args = {"reason": "off_topic"}
         else:
@@ -872,21 +894,38 @@ async def node_route(state: AgentState) -> AgentState:
             if hasattr(response, "content"):
                 response.content = ""
 
-        logger.info("Router → tool=%s args=%s", tool_name, str(tool_args)[:200])
+        logger.info("🔀 [Router] tool=%-18s | args=%s", tool_name, str(tool_args)[:200])
 
     except Exception as e:
         err_str = str(e)
         if "content_filter" in err_str or "ResponsibleAIPolicyViolation" in err_str:
-            logger.error("Azure Content Filter triggered in router")
+            logger.error("🛡️  [Router] Azure Content Filter triggered — blocking request")
             tool_name = "block_off_topic"
             tool_args = {"reason": "injection"}
         else:
-            logger.error("Router LLM failed: %s — defaulting to search", e)
+            logger.error("❌ [Router] LLM call failed: %s — defaulting to search", e)
 
     return {**state, "tool_name": tool_name, "tool_args": tool_args}
 
 
 async def node_execute_tool(state: AgentState) -> AgentState:  # noqa: C901
+    """
+    Dispatch to the tool selected by `node_route` and return the result.
+
+    Handles all registered tools: search, compare, multi_compare, analyze,
+    summarize, full_doc, block_off_topic, create_ticket, select_ticket,
+    create_all_tickets, update_ticket, multi_query, chat_history_summary,
+    and cancel. Unknown tools fall back to search.
+
+    Azure content filter errors are caught and returned as a safe deflection
+    response rather than raising an HTTP exception.
+
+    Args:
+        state: Agent state with `tool_name` and `tool_args` populated.
+
+    Returns:
+        Updated state with `result` and `reply` populated.
+    """
     tool_name  = state.get("tool_name", "search")
     tool_args  = state.get("tool_args", {})
     question   = state["question"]
@@ -990,7 +1029,7 @@ async def node_execute_tool(state: AgentState) -> AgentState:  # noqa: C901
                     sub = await node_execute_tool(sub)
                     sub_results.append(sub.get("result", {}))
                 except Exception as e:
-                    logger.error("Sub-task %d failed: %s", i, e)
+                    logger.error("❌ [MultiQuery] Sub-task #%d failed: %s", i, e)
                     sub_results.append({"answer": f"Error: {e}", "chunks": [], "citations": []})
 
             result = _merge_multi_results(sub_tasks, sub_results)
@@ -1006,7 +1045,7 @@ async def node_execute_tool(state: AgentState) -> AgentState:  # noqa: C901
             result = {"tool_used": "cancel", "confidence": "high", "citations": [], "chunks": []}
 
         else:
-            logger.warning("Unknown tool '%s' — falling back to search", tool_name)
+            logger.warning("⚠️  [Tool] Unknown tool %r — falling back to search", tool_name)
             result = await _exec_search(question, session_id, sq)
             reply  = result.get("answer", "")
 
@@ -1014,11 +1053,11 @@ async def node_execute_tool(state: AgentState) -> AgentState:  # noqa: C901
         err_str = str(e)
         is_azure = "content_filter" in err_str or "ResponsibleAIPolicyViolation" in err_str
         if is_azure:
-            logger.warning("Azure content filter blocked tool=%s", tool_name)
+            logger.warning("🛡️  [Tool] Azure content filter blocked tool=%s", tool_name)
             reply  = "I could not find information about this. [Security policy restriction 🛡️]"
             result = {"tool_used": "block_off_topic", "confidence": "low", "citations": [], "chunks": []}
         else:
-            logger.error("Tool execution failed (%s): %s", tool_name, e, exc_info=True)
+            logger.error("❌ [Tool] Execution failed | tool=%s | err=%s", tool_name, e, exc_info=True)
             reply  = "Something went wrong. Please try again."
             result = {"tool_used": tool_name, "confidence": "low", "citations": [], "chunks": []}
 
@@ -1030,6 +1069,19 @@ async def node_execute_tool(state: AgentState) -> AgentState:  # noqa: C901
 
 
 async def node_save_history(state: AgentState) -> AgentState:
+    """
+    Append the current Q&A turn to the session history in Redis.
+
+    Deduplication check: if the last two history entries already match
+    this question and reply, the turn is not appended again (prevents
+    duplicate entries on retry).
+
+    Args:
+        state: Agent state with `session_id`, `question`, and `reply` set.
+
+    Returns:
+        The state unchanged.
+    """
     sid      = state["session_id"]
     question = state["question"]
     reply    = state.get("reply", "")
@@ -1052,6 +1104,16 @@ async def node_save_history(state: AgentState) -> AgentState:
 # ── Graph compilation ─────────────────────────────────────────────────────────
 
 def _build_graph():
+    """
+    Compile and return the LangGraph StateGraph for the CiteRAG agent.
+
+    Wires the four nodes in order: load_context → route → execute_tool →
+    save_history, with START and END edges. The compiled graph is stored
+    as a module-level singleton (`_graph`) and reused across all requests.
+
+    Returns:
+        A compiled `langgraph.graph.StateGraph` instance.
+    """
     builder = StateGraph(AgentState)
     builder.add_node("load_context",  node_load_context)
     builder.add_node("route",         node_route)
@@ -1077,6 +1139,29 @@ async def run_agent(
     doc_list:     Optional[list[str]] = None,
     stream_queue: Optional[asyncio.Queue] = None,
 ) -> dict:
+    """
+    Public entry point for the CiteRAG LangGraph agent.
+
+    Initializes the agent state and invokes the compiled graph. On success,
+    returns a structured response dict. On any unhandled exception, returns
+    a safe error response rather than propagating.
+
+    If the answered question used a RAG tool, follow-up question suggestions
+    are generated and included in the response under the `followups` key.
+
+    Args:
+        question:     The user's question or instruction.
+        session_id:   Unique identifier for conversation history and memory.
+        doc_a:        First document for pairwise compare (optional).
+        doc_b:        Second document for pairwise compare (optional).
+        doc_list:     Three or more documents for multi-compare (optional).
+        stream_queue: If provided, tokens are put on this queue as they are
+                      generated for streaming delivery.
+
+    Returns:
+        A dict with keys: answer, citations, chunks, tool_used, intent,
+        confidence, agent_reply, and followups.
+    """
     initial_state: AgentState = {
         "question":      question,
         "session_id":    session_id,
@@ -1099,7 +1184,7 @@ async def run_agent(
     try:
         final = await _graph.ainvoke(initial_state)
     except Exception as e:
-        logger.error("LangGraph invocation failed: %s", e, exc_info=True)
+        logger.error("❌ [Agent] LangGraph invocation failed: %s", e, exc_info=True)
         return {
             "answer": "Something went wrong. Please try again.",
             "citations": [], "chunks": [], "tool_used": "error",

@@ -1,16 +1,10 @@
 """
-streamlit_app.py — DocForge AI  v15
+streamlit_app.py — DocForge AI UI Entry Point
+==============================================
 
-Changes vs v14:
-  1. Blank-page flash eliminated — Step 2 & Step 3 generation loops now run
-     entirely inside a single script execution using st.empty() placeholders.
-     No mid-loop st.rerun() is issued; placeholders are mutated in-place so
-     Streamlit never renders an empty screen.
-  2. Section tiles turn ⚪→✅ green (st.success) in real-time as each section
-     completes, both for question generation (Step 2) and document generation
-     (Step 3b).
-  3. Dead code removed — sec_ids_ordered session key was never referenced.
-  4. All imports are at the top, directly after the docstring.
+This module serves as the primary Streamlit frontend for the DocForge AI application.
+It orchestrates the Document Generation flow, CiteRAG chat interface, Document
+Library browser, and Agent Ticket analysis, communicating with the backend API.
 """
 
 import sys

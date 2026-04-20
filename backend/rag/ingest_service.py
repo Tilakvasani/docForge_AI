@@ -2,29 +2,26 @@
 ingest_service.py — Notion → Chunks → Embeddings → ChromaDB
 =============================================================
 
-POST /api/rag/ingest triggers this module.
+Triggered by POST /api/rag/ingest.
 
 Pipeline:
-  1. Fetch all pages from the configured Notion database
-  2. Extract + clean text from each page (blocks → plain text)
-  3. Chunk text with overlap (respects paragraph boundaries)
-  4. Embed chunks using Azure OpenAI text-embedding-3-large
-  5. Upsert into ChromaDB with rich metadata
-  6. Store ingest metadata in Redis for /status endpoint
+    1. Fetch all pages from the configured Notion database.
+    2. Extract and clean text from each page (blocks → plain text).
+    3. Split text into overlapping chunks that respect paragraph boundaries.
+    4. Embed chunks using Azure OpenAI text-embedding-3-large.
+    5. Upsert into ChromaDB with rich metadata (title, heading, doc_type, etc.).
+    6. Persist ingest metadata to Redis for the /status endpoint.
 
-Idempotent: chunks are upserted by deterministic ID (md5 of page_id+heading+chunk_index),
-so re-running ingest updates changed content without duplicating.
+Idempotency:
+    Chunks are upserted by a deterministic ID (MD5 of page_id + heading + chunk_index),
+    so re-running ingest updates changed content without creating duplicates.
 
-force=True skips the "already ingested" Redis lock check.
+Delta sync:
+    Each page's `last_edited_time` is cached in Redis. Pages that have not changed
+    since the last ingest are skipped, reducing both Notion API calls and embedding cost.
 
-FIXES applied:
-  - Heading text is now included in the section body (was silently dropped)
-  - Headings-only sections (no body blocks) are no longer lost
-  - MIN_CHUNK_LEN lowered to 40 to avoid discarding short-but-valid chunks
-  - Per-page section/chunk log upgraded from DEBUG → INFO so it's always visible
-  - NOTION_DATABASE_ID is auto-stripped of any '?v=...' view suffix on startup
-  - Notion token fallback: tries NOTION_TOKEN then NOTION_API_KEY
-  - Redis lock is force-cleared if previous ingest never released it
+Args (ingest_from_notion):
+    force: Skip the Redis lock check and delta-sync cache; always re-ingest all pages.
 """
 
 import asyncio
@@ -52,13 +49,19 @@ INGEST_META_KEY   = "docforge:rag:ingest_meta"
 INGEST_LOCK_TTL   = 1800    # 30 min — prevent concurrent ingests
 
 
-# ── Singleton clients (reused across calls) ───────────────────────────────────
+
 
 _embedder_instance   = None
 _collection_instance = None
 
 
 def _get_embedder():
+    """
+    Return the shared Azure OpenAI embeddings singleton, creating it on first call.
+
+    Returns:
+        An initialised `AzureOpenAIEmbeddings` instance.
+    """
     global _embedder_instance
     if _embedder_instance is None:
         _embedder_instance = AzureOpenAIEmbeddings(
@@ -66,8 +69,8 @@ def _get_embedder():
             api_key=settings.AZURE_OPENAI_EMB_KEY,
             azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
             api_version=settings.AZURE_EMB_API_VERSION,
-            timeout=60,        # FIX: prevent silent hang on slow Azure response
-            max_retries=2,     # FIX: retry on transient errors instead of hanging
+            timeout=60,
+            max_retries=2,
         )
     return _embedder_instance
 
@@ -84,7 +87,7 @@ def _get_collection():
     return _collection_instance
 
 
-# ── Notion helpers ─────────────────────────────────────────────────────────────
+
 
 def _get_notion_token() -> str:
     """
@@ -134,10 +137,13 @@ def _get_notion():
 def _fetch_all_notion_pages() -> list[dict]:
     """
     Query all pages from the configured Notion source database.
-    Handles Notion pagination automatically.
 
-    NOTE: NOTION_DATABASE_ID must be just the UUID (no '?v=...' suffix).
-          _get_db_id() strips it automatically, but fix your .env anyway.
+    Handles Notion pagination automatically via the ``has_more`` / ``next_cursor``
+    pattern. The database ID is resolved through ``_get_db_id()``, which strips any
+    browser-copied ``?v=...`` view suffix.
+
+    Returns:
+        A list of raw Notion page objects.
     """
     notion  = _get_notion()
     db_id   = _get_db_id()
@@ -200,7 +206,7 @@ def _fetch_page_blocks(page_id: str) -> list[dict]:
     return expanded
 
 
-# ── Text extraction ────────────────────────────────────────────────────────────
+
 
 def _rich_text_to_str(rich_text_items: list) -> str:
     return "".join(t.get("plain_text", "") for t in rich_text_items)
@@ -211,10 +217,8 @@ def _block_to_text(block: dict) -> tuple[str, str]:
     Extract (heading_label, text) from a Notion block.
 
     heading_label — non-empty only for heading block types; signals a new section.
-    text          — the actual text content; ALWAYS returned so it can be added
-                    to the section body (fixes the original bug where heading text
-                    was set as both heading and text, then the text branch was
-                    skipped because heading was truthy).
+    text          — the actual text content. Always returned so it can be added
+                    to the section body.
 
     Returns ("", "") for unsupported / empty block types.
     """
@@ -265,13 +269,20 @@ def _block_to_text(block: dict) -> tuple[str, str]:
 
 def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
     """
-    Extract metadata and full text sections from a Notion page + its blocks.
-    Returns a dict with title, doc_type, department, text sections with headings.
+    Extract metadata and structured text sections from a Notion page and its blocks.
 
-    FIX 1: heading text is now appended to current_texts so it's included in
-            the section body and not silently discarded.
-    FIX 2: the final section is always saved even if it only contains a heading
-            with no following body blocks.
+    Walks the block list to build a list of ``{heading, text}`` section dicts.
+    Heading text is included in the section body so it contributes to retrieval.
+    The final accumulated section is always flushed, even if it contains only a
+    heading with no following body blocks.
+
+    Args:
+        page:   The raw Notion page object (from the databases.query API).
+        blocks: All blocks for the page, including recursively expanded children.
+
+    Returns:
+        A dict with keys: page_id, title, doc_type, department, version, status,
+        url, and sections (list of {heading, text} dicts).
     """
     props = page.get("properties", {})
 
@@ -349,19 +360,16 @@ def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
                 })
                 current_texts = []
             current_heading = heading
-            # FIX 1: include the heading text in the new section's body
             current_texts.append(text)
         else:
             current_texts.append(text)
 
-    # FIX 2: always flush the last section
     if current_texts:
         sections.append({
             "heading": current_heading,
             "text":    "\n".join(current_texts).strip(),
         })
 
-    # ✅ FIX 3 (was debug → now info): always visible in default INFO log level
     logger.info(
         "  Page '%s': %d blocks → %d sections %s",
         title,
@@ -382,7 +390,7 @@ def _extract_page_content(page: dict, blocks: list[dict]) -> dict:
     }
 
 
-# ── Chunker ────────────────────────────────────────────────────────────────────
+
 
 def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     """
@@ -461,14 +469,12 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
     return [c for c in chunks if len(c) >= MIN_CHUNK_LEN]
 
 
-# ── Chunk ID generator ─────────────────────────────────────────────────────────
 
 def _chunk_id(page_id: str, heading: str, chunk_index: int) -> str:
     raw = f"{page_id}::{heading}::{chunk_index}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-# ── Citation formatter ─────────────────────────────────────────────────────────
 
 def _format_citation(title: str, heading: str, doc_type: str) -> str:
     parts = [title]
@@ -479,7 +485,6 @@ def _format_citation(title: str, heading: str, doc_type: str) -> str:
     return " › ".join(parts)
 
 
-# ── Embedding + upsert ─────────────────────────────────────────────────────────
 
 def _embed_and_upsert(chunks_batch: list[dict], collection) -> int:
     """
@@ -517,7 +522,6 @@ def _embed_and_upsert(chunks_batch: list[dict], collection) -> int:
         return 0
 
 
-# ── Main ingest function ───────────────────────────────────────────────────────
 
 async def ingest_from_notion(force: bool = False) -> dict:
     """
