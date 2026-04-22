@@ -1,166 +1,291 @@
 """
-ticket_dedup.py — LLM-based duplicate ticket detection
-=======================================================
+ticket_dedup.py — Embedding + LLM duplicate ticket detection
+=============================================================
 
-Prevents duplicate Notion support tickets by comparing new questions
-against all currently Open / In Progress tickets using an LLM judge
-rather than a vector-similarity cache.
+Scalable duplicate detection using ChromaDB and LLM.
 
-Pipeline:
-    1. Fetch all Open + In Progress tickets from Notion (always live).
-    2. Ask the LLM whether the new question matches any existing ticket.
-    3. If a duplicate is found, return the existing ticket and block creation.
-    4. If no duplicate, allow creation to proceed.
+Stage 1 — Vector Pre-filter (fast, cheap)
+  • Tickets questions are normalized (Hinglish -> English intent)
+  • Tickets are embedded once and stored in ChromaDB
+  • New question is normalized and embedded
+  • ChromaDB similarity finds Top-K candidates fast
+  • Combined scoring (0.7 embedding + 0.3 keyword)
+  • Top-K (default 10) candidates ALWAYS go to the LLM to avoid missing matches
+
+Stage 2 — LLM Judge (accurate, focused)
+  • LLM receives the Top-K candidates
+  • Small, focused prompt → fast + cheap
+  • Returns YES/NO + matched ticket ID
 
 Public API:
-    find_duplicate(question)  — returns a matching ticket dict or None.
-    flush_dedup_cache()       — no-op (no cache exists; included for interface compatibility).
+    find_duplicate(question)           — returns a matching ticket dict or None.
+    insert_ticket(ticket)              — embed + insert a single new ticket into ChromaDB.
+    insert_tickets(tickets)            — batched version for efficient bulk inserts.
+    update_ticket_status(ticket_id, status) — update status of a ticket in ChromaDB.
+    find_similar_tickets(question, top_k)   — raw query to ChromaDB for similar open/in-progress tickets.
+    embed_ticket(ticket)               — alias for insert_ticket for backward compatibility.
+    flush_dedup_cache()                — wipe the vector collection (force full re-index).
 """
 
 from typing import Optional
-
-import httpx
+import chromadb
+from chromadb.api.types import QueryResult
 
 from backend.core.logger import logger
-from backend.services.notion_service import _headers as _notion_headers, NOTION_API_URL as NOTION_API
-from backend.api.agent_routes import _get_ticket_db_id
+from backend.core.config import settings
 from backend.core.llm import get_llm as _get_llm
 
-# Max tickets sent to LLM to avoid huge prompts
-_MAX_TICKETS_FOR_LLM = 50
+# ── Tuning knobs ──────────────────────────────────────────────────────────────
+
+_TOP_K = 10
+_CHROMA_COLLECTION = "ticket_vectors"
+
+# ── LLM prompts ───────────────────────────────────────────────────────────────
+
+_NORMALIZE_PROMPT = """\
+Translate the following support question to clear, intent-focused English.
+Fix any Hinglish, shorthand, or spelling mistakes. Do not answer the question, just return the normalized question text.
+
+Question: "{question}"
+Normalized Question:"""
 
 _DEDUP_PROMPT = """\
-You are a support ticket duplicate detector.
+You are a support ticket duplicate detector with multilingual and paraphrase intelligence.
 
-Below are existing OPEN or IN-PROGRESS support tickets (ID + original question):
+Below are the most semantically similar OPEN or IN-PROGRESS support tickets:
 {ticket_list}
 
 New question from user:
 "{new_question}"
+Normalized intent:
+"{normalized_question}"
 
-Task: Decide if the new question is asking about the EXACT SAME TOPIC and INTENT as any existing ticket.
-Only count as a duplicate if the user is asking about the same specific entity (person, policy, document, or comparison).
+STEP 1 — COMPARE NORMALISED INTENT
+Count as DUPLICATE only if the normalised intent asks about the EXACT SAME
+specific entity (same person, same policy, same document, same comparison).
 
-Examples of DUPLICATES:
-- "who is raju" vs "tell me about raju"         → same person lookup
-- "what is notice period" vs "how long is notice period" → same policy question
+DUPLICATE examples (same intent, different words or language):
+- "who is tilak"          vs "tilak kon he"                  -> SAME person, different language
+- "who is raju"           vs "tell me about raju"            -> SAME person lookup
+- "what is notice period" vs "how long is notice period"     -> SAME policy
+- "NDA mandatory hai kya" vs "is NDA mandatory"              -> SAME document question
 
-Examples of NOT DUPLICATES:
-- "who is raju" vs "who is ramesh"            → DIFFERENT people
-- "is NDA mandatory" vs "is SOW mandatory"    → DIFFERENT documents
-- "salary structure" vs "notice period"          → DIFFERENT HR topics
-- "who is raju" vs "what is leave policy"        → completely different topics
+NOT DUPLICATE examples (different entity or topic):
+- "who is raju"      vs "who is ramesh"        -> DIFFERENT people
+- "is NDA mandatory" vs "is SOW mandatory"     -> DIFFERENT documents
+- "salary structure" vs "notice period"        -> DIFFERENT HR topics
+- "who is raju"      vs "what is leave policy" -> completely different
 
 Reply in EXACTLY this format, nothing else:
 DUPLICATE: YES
 TICKET_ID: <the matching ticket id>
 
 OR:
-DUPLICATE: NO\
-"""
+DUPLICATE: NO"""
+
+from backend.core.vector import get_embedder as _get_embedder
+from backend.core.vector import get_chroma_client as _get_chroma_client
 
 
-async def _fetch_open_tickets() -> list[dict]:
-    """
-    Fetch all Open and In Progress tickets from Notion.
+def _get_chroma_collection():
+    """Return the ChromaDB collection for ticket deduplication."""
+    return _get_chroma_client().get_or_create_collection(
+        name=_CHROMA_COLLECTION,
+        metadata={"hnsw:space": "cosine"}
+    )
 
-    Results are capped at `_MAX_TICKETS_FOR_LLM` to avoid oversized prompts.
-    Fails open: any Notion API error returns an empty list so that ticket
-    creation is never blocked by a network or configuration issue.
 
-    Returns:
-        A list of dicts with keys: ticket_id, page_id, question, url.
-    """
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+async def _normalize_question(question: str) -> str:
+    """Use LLM to normalize a question to English intent."""
     try:
+        prompt = _NORMALIZE_PROMPT.format(question=question)
+        resp = await _get_llm().ainvoke(prompt)
+        return resp.content.strip()
+    except Exception as e:
+        logger.warning("[dedup] Failed to normalize question: %s", e)
+        return question
 
-        db_id   = _get_ticket_db_id()
-        headers = _notion_headers()
+def _keyword_overlap(text1: str, text2: str) -> float:
+    """Compute Jaccard similarity for keyword overlap."""
+    t1 = set(text1.lower().replace("?", "").replace(",", "").split())
+    t2 = set(text2.lower().replace("?", "").replace(",", "").split())
+    if not t1 or not t2: return 0.0
+    return len(t1 & t2) / len(t1 | t2)
 
-        body = {
-            "page_size": _MAX_TICKETS_FOR_LLM,
-            "filter": {
-                "or": [
-                    {"property": "Status", "select": {"equals": "Open"}},
-                    {"property": "Status", "select": {"equals": "In Progress"}},
-                ]
-            },
-        }
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"{NOTION_API}/databases/{db_id}/query",
-                headers=headers,
-                json=body,
-            )
+# ── Stage 1: ChromaDB Storage & Pre-filter ────────────────────────────────────
 
-        if resp.status_code == 404:
-            logger.warning("[dedup] Notion DB not found (404) — skipping dedup")
-            return []
-
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
-
-        tickets = []
-        for page in results:
-            props = page.get("properties", {})
-
-            q_items = (
-                props.get("Question", {}).get("title", [])
-                or props.get("Name", {}).get("title", [])
-                or props.get("Title", {}).get("title", [])
-            )
-            question = "".join(t.get("plain_text", "") for t in q_items).strip()
-
-            if not question:
-                continue
-
-            id_prop   = props.get("Ticket ID", {})
-            id_items  = id_prop.get("rich_text", []) or id_prop.get("title", [])
-            manual_id = "".join(t.get("plain_text", "") for t in id_items).strip()
-
-            ticket_id = manual_id if manual_id else page["id"].replace("-", "")[:8].upper()
-            tickets.append({
-                "ticket_id": ticket_id,
-                "page_id":   page["id"],
-                "question":  question,
-                "url":       page.get("url", ""),
+async def insert_tickets(tickets: list[dict]) -> None:
+    """
+    Generate embeddings and bulk upsert multiple tickets into ChromaDB.
+    
+    Args:
+        tickets: list of dicts with keys {ticket_id, question, page_id, url, status}
+    """
+    if not tickets:
+        return
+        
+    try:
+        collection = _get_chroma_collection()
+        embedder = _get_embedder()
+        
+        ids = []
+        questions = []
+        norm_qs = []
+        
+        for t in tickets:
+            ids.append(str(t["ticket_id"]))
+            questions.append(t["question"])
+            norm = await _normalize_question(t["question"])
+            norm_qs.append(norm)
+        
+        vectors = embedder.embed_documents(norm_qs)
+        
+        metadatas = []
+        for i, t in enumerate(tickets):
+            metadatas.append({
+                "ticket_id": t["ticket_id"],
+                "question": t["question"],
+                "normalized_question": norm_qs[i],
+                "page_id": t.get("page_id", ""),
+                "url": t.get("url", ""),
+                "status": t.get("status", "Open"),
             })
-
-        logger.info("Fetched %d open/in-progress tickets from Notion", len(tickets))
-        return tickets
+            
+        collection.upsert(
+            ids=ids,
+            embeddings=vectors,
+            documents=questions,
+            metadatas=metadatas
+        )
+        logger.info("[dedup] Bulk upserted %d tickets into ChromaDB", len(tickets))
 
     except Exception as e:
-        logger.warning("Could not fetch Notion tickets: %s — skipping dedup", e)
-        return []
+        logger.warning("[dedup] Failed to bulk upsert tickets: %s", e)
 
 
-async def _llm_duplicate_check(new_question: str, tickets: list[dict]) -> Optional[dict]:
+async def insert_ticket(ticket: dict) -> None:
     """
-    Ask the LLM whether `new_question` is semantically identical to any existing ticket.
+    Generate embedding and upsert a single ticket into ChromaDB.
+    """
+    await insert_tickets([ticket])
 
-    Fails open: if the LLM call raises any exception, None is returned so that
-    ticket creation is never silently blocked.
 
-    Args:
-        new_question: The unanswered question the user wants to file a ticket for.
-        tickets:      List of existing open/in-progress ticket dicts from Notion.
-
-    Returns:
-        The matching ticket dict if a duplicate is found, otherwise None.
+async def update_ticket_status(ticket_id: str, status: str) -> None:
+    """
+    Update the status metadata for an existing ticket in ChromaDB.
+    Closed tickets will be automatically excluded from future searches.
     """
     try:
+        collection = _get_chroma_collection()
+        
+        res = collection.get(ids=[ticket_id])
+        if not res or not res["ids"]:
+            logger.warning("[dedup] Cannot update status, ticket %s not found in ChromaDB", ticket_id)
+            return
+            
+        existing_meta = res["metadatas"][0]
+        existing_meta["status"] = status
+        
+        collection.update(
+            ids=[ticket_id],
+            metadatas=[existing_meta]
+        )
+        logger.info("[dedup] Updated status for ticket %s to %s", ticket_id, status)
+    except Exception as e:
+        logger.warning("[dedup] Failed to update status for ticket %s: %s", ticket_id, e)
+
+
+async def find_similar_tickets(question: str, top_k: int = _TOP_K) -> tuple[list, str]:
+    """
+    Query ChromaDB for similar tickets, filtering by Status = Open or In Progress.
+    Combines embedding and keyword scores to ALWAYS return top_k candidates to LLM.
+    
+    Returns: (list of candidates, normalized_question)
+    """
+    try:
+        norm_q = await _normalize_question(question)
+        collection = _get_chroma_collection()
+        embedder = _get_embedder()
+        
+        query_vec = embedder.embed_query(norm_q)
+        
+        results = collection.query(
+            query_embeddings=[query_vec],
+            n_results=top_k,
+            where={"status": {"$in": ["Open", "In Progress"]}}
+        )
+        
+        # Calculate dynamic threshold for logging purposes only
+        word_count = len(norm_q.split())
+        dyn_threshold = 0.6 if word_count < 5 else 0.75
+        
+        candidates = []
+        if results and results["ids"] and results["ids"][0]:
+            ids = results["ids"][0]
+            distances = results["distances"][0]
+            metadatas = results["metadatas"][0]
+            
+            for i in range(len(ids)):
+                meta = metadatas[i]
+                cand_norm_q = meta.get("normalized_question", meta.get("question", ""))
+                
+                emb_score = max(0.0, 1.0 - distances[i])
+                kw_score = _keyword_overlap(norm_q, cand_norm_q)
+                
+                final_score = (0.7 * emb_score) + (0.3 * kw_score)
+                
+                candidates.append({
+                    "ticket_id": meta.get("ticket_id", ids[i]),
+                    "question": meta.get("question", ""),
+                    "normalized_question": cand_norm_q,
+                    "page_id": meta.get("page_id", ""),
+                    "url": meta.get("url", ""),
+                    "score": round(final_score, 4),
+                    "embedding_score": round(emb_score, 4),
+                    "keyword_score": round(kw_score, 4),
+                })
+        
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        
+        if candidates:
+            best = candidates[0]["score"]
+            if best < dyn_threshold:
+                logger.info("[dedup] Best score %.2f < threshold %.2f, but passing to LLM anyway.", best, dyn_threshold)
+            else:
+                logger.info("[dedup] Best score %.2f >= threshold %.2f. Passing to LLM.", best, dyn_threshold)
+        
+        return candidates, norm_q
+        
+    except Exception as e:
+        logger.warning("[dedup] Failed to search similar tickets in ChromaDB: %s", e)
+        return [], question
+
+
+# ── Stage 2: LLM judge ────────────────────────────────────────────────────────
+
+async def _llm_duplicate_check(new_question: str, norm_question: str, candidates: list) -> Optional[dict]:
+    """
+    Ask the LLM whether `new_question` duplicates any of the Top-K candidates.
+    """
+    if not candidates:
+        return None
+
+    try:
         ticket_lines = "\n".join(
-            f"  [{t['ticket_id']}] {t['question']}"
-            for t in tickets
+            f"  [{c['ticket_id']}] (score={c['score']:.0%}) {c['question']}"
+            for c in candidates
         )
         prompt = _DEDUP_PROMPT.format(
             ticket_list=ticket_lines,
             new_question=new_question,
+            normalized_question=norm_question,
         )
 
         resp = await _get_llm().ainvoke(prompt)
         raw  = resp.content.strip()
-
         logger.debug("[dedup] LLM response: %s", raw)
 
         lines = {
@@ -176,44 +301,47 @@ async def _llm_duplicate_check(new_question: str, tickets: list[dict]) -> Option
         if not matched_id:
             return None
 
-        for t in tickets:
-            if t["ticket_id"] == matched_id:
+        for c in candidates:
+            if c["ticket_id"] == matched_id:
                 logger.info(
-                    "✅ LLM found duplicate  ticket=%s  q='%s'",
-                    matched_id, t["question"][:60],
+                    "[dedup] ✅ LLM confirmed duplicate  ticket=%s  q='%s'",
+                    matched_id, c["question"][:60],
                 )
-                return t
+                return c
 
-        logger.warning("LLM returned ticket_id=%s but not found in list", matched_id)
+        logger.warning("[dedup] LLM returned ticket_id=%s but not in candidate list", matched_id)
         return None
 
     except Exception as e:
-        logger.warning("LLM duplicate check failed: %s — allowing ticket creation", e)
+        logger.warning("[dedup] LLM check failed: %s — allowing ticket creation", e)
         return None
 
 
-
+# ── Public API ────────────────────────────────────────────────────────────────
 
 async def find_duplicate(question: str) -> Optional[dict]:
     """
-    Check if an Open/In-Progress Notion ticket already exists for this question.
-
-    Flow:
-      1. Fetch Open + In Progress tickets from Notion
-      2. If none exist → no duplicate possible, return None immediately
-      3. Ask LLM to compare new question against all existing tickets
-      4. Return matching ticket or None
-
-    Fails open: any error returns None so ticket creation is never blocked by a bug.
+    Check whether an Open/In-Progress ticket already exists for this question.
     """
-    tickets = await _fetch_open_tickets()
-    if not tickets:
-        logger.info("No open tickets in Notion — no duplicate possible")
+    candidates, norm_q = await find_similar_tickets(question, _TOP_K)
+    if not candidates:
+        logger.info("[dedup] No candidates found in ChromaDB — no duplicate")
         return None
 
-    return await _llm_duplicate_check(question, tickets)
+    return await _llm_duplicate_check(question, norm_q, candidates)
 
 
 async def flush_dedup_cache() -> None:
-    """No-op — dedup now uses live Notion data, no cache to flush."""
-    logger.info("[dedup] Nothing to flush — using live Notion data for dedup")
+    """
+    Wipe the ticket vector collection from ChromaDB.
+    """
+    try:
+        client = _get_chroma_client()
+        try:
+            client.delete_collection(name=_CHROMA_COLLECTION)
+            logger.info("[dedup] ChromaDB collection %s deleted.", _CHROMA_COLLECTION)
+        except Exception:
+            pass # Collection doesn't exist
+            
+    except Exception as e:
+        logger.warning("[dedup] Failed to flush ChromaDB collection: %s", e)

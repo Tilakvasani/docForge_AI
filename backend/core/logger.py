@@ -109,6 +109,11 @@ def _setup_logging():
                 h.setFormatter(_PrettyFormatter())
                 h.setLevel(level)
 
+    # Force streamlit logger to also use the pretty formatter so it strips the dates
+    for h in logging.getLogger("streamlit").handlers:
+        if isinstance(h, logging.StreamHandler):
+            h.setFormatter(_PrettyFormatter())
+
     for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "langsmith"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 

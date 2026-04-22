@@ -179,12 +179,8 @@ def _init_ragas() -> bool:
             api_version="2024-12-01-preview",
             temperature=0,
         )
-        judge_emb = AzureOpenAIEmbeddings(
-            azure_endpoint=settings.AZURE_EMB_ENDPOINT,
-            api_key=settings.AZURE_OPENAI_EMB_KEY,
-            azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
-            api_version=settings.AZURE_EMB_API_VERSION,
-        )
+        from backend.core.vector import get_embedder
+        judge_emb = get_embedder()
 
         if major == 0 and minor >= 2:
             _ragas_llm = LangchainLLMWrapper(judge_llm)

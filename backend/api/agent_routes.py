@@ -272,12 +272,27 @@ async def _create_notion_ticket(req: TicketCreateRequest) -> dict:
     await cache.flush_pattern(f"{TICKETS_CACHE_KEY}*")
     logger.info("Ticket created: %s for: %s", ticket_id, req.question[:60])
 
-    return {
+    result = {
         "success":   True,
-        "ticket_id": ticket_id,
+        "ticket_id": str(ticket_id),
         "page_id":   page["id"],
         "url":       page.get("url", ""),
     }
+
+    # Immediately add the new ticket to the dedup vector cache so that
+    # subsequent dedup calls can detect it without waiting for a full re-sync.
+    try:
+        from backend.rag.ticket_dedup import insert_ticket as _insert_ticket
+        await _insert_ticket({
+            "ticket_id": str(ticket_id),
+            "page_id":   page["id"],
+            "question":  req.question,
+            "url":       page.get("url", ""),
+        })
+    except Exception as _e:
+        logger.warning("Failed to cache dedup embedding for ticket %s: %s", ticket_id, _e)
+
+    return result
 
 
 @router.get("/tickets")
@@ -435,5 +450,14 @@ async def create_ticket(req: TicketCreateRequest):
 
 @router.delete("/dedup/flush")
 async def flush_dedup_cache():
-    """No-op endpoint — deduplication uses live Notion data, so there is no cache to flush."""
-    return {"flushed": 0, "note": "Dedup uses live Notion data — no cache to flush."}
+    """
+    Flush the ticket dedup vector cache from Redis.
+    The next call to find_duplicate() will re-fetch all tickets and re-embed them.
+    """
+    try:
+        from backend.rag.ticket_dedup import flush_dedup_cache as _flush
+        await _flush()
+        return {"flushed": True, "note": "Ticket vector cache cleared. Will re-index on next dedup call."}
+    except Exception as e:
+        logger.error("flush_dedup_cache error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

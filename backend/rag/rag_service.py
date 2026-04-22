@@ -289,22 +289,13 @@ def _get_llm(temperature: float = 0.2, max_tokens: int = 3000):
     return _core_get_llm(temperature=temperature, max_tokens=max_tokens)
 
 
-def _get_embedder():
-    global _embedder_instance
-    if _embedder_instance is None:
-        _embedder_instance = AzureOpenAIEmbeddings(
-            azure_endpoint=settings.AZURE_EMB_ENDPOINT,
-            api_key=settings.AZURE_OPENAI_EMB_KEY,
-            azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
-            api_version=settings.AZURE_EMB_API_VERSION,
-        )
-    return _embedder_instance
-
+from backend.core.vector import get_embedder as _get_embedder
+from backend.core.vector import get_chroma_client
 
 def _get_collection():
     global _collection_instance
     if _collection_instance is None:
-        client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
+        client = get_chroma_client()
         _collection_instance = client.get_or_create_collection(
             name="rag_chunks",
             metadata={"hnsw:space": "cosine"},

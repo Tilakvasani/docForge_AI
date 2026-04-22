@@ -51,34 +51,15 @@ INGEST_LOCK_TTL   = 1800    # 30 min — prevent concurrent ingests
 
 
 
-_embedder_instance   = None
+from backend.core.vector import get_embedder as _get_embedder
+from backend.core.vector import get_chroma_client
+
 _collection_instance = None
-
-
-def _get_embedder():
-    """
-    Return the shared Azure OpenAI embeddings singleton, creating it on first call.
-
-    Returns:
-        An initialised `AzureOpenAIEmbeddings` instance.
-    """
-    global _embedder_instance
-    if _embedder_instance is None:
-        _embedder_instance = AzureOpenAIEmbeddings(
-            azure_endpoint=settings.AZURE_EMB_ENDPOINT,
-            api_key=settings.AZURE_OPENAI_EMB_KEY,
-            azure_deployment=settings.AZURE_EMB_DEPLOYMENT,
-            api_version=settings.AZURE_EMB_API_VERSION,
-            timeout=60,
-            max_retries=2,
-        )
-    return _embedder_instance
-
 
 def _get_collection():
     global _collection_instance
     if _collection_instance is None:
-        client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
+        client = get_chroma_client()
         _collection_instance = client.get_or_create_collection(
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},

@@ -485,10 +485,29 @@ async def _make_ticket(
     if dup:
         logger.info("🔁 [Dedup] Suppressed — new q=%r matches ticket #%s (%r)",
                     question[:60], dup["ticket_id"], dup["question"][:60])
+
+        # Register the existing ticket in session memory so the user can
+        # immediately say "resolve" or "in progress" and it will work.
+        created = memory.get("created_tickets", [])
+        already_in_memory = any(t.get("ticket_id") == dup["ticket_id"] for t in created)
+        if not already_in_memory:
+            created.append({
+                "ticket_id": dup["ticket_id"],
+                "page_id":   dup["page_id"],
+                "url":       dup.get("url", ""),
+                "question":  dup["question"],
+                "status":    "Open",
+            })
+            memory["created_tickets"]  = created
+            memory["last_ticket_id"]   = dup["ticket_id"]
+            memory["last_page_id"]     = dup["page_id"]
+            memory["last_ticket_url"]  = dup.get("url", "")
+
         return (
             f"🎫 A ticket already exists for this question "
             f"(#{dup['ticket_id']}).  No new ticket was created.\n"
-            f"You can update it by saying **\"mark {dup['ticket_id']} as resolved\"**.",
+            f"You can update it by saying **\"mark {dup['ticket_id']} as resolved\"** "
+            f"or **\"mark it as in progress\"**.",
             None,
         )
 
