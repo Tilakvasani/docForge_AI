@@ -55,12 +55,13 @@ A second major subsystem — **CiteRAG** — is a tool-calling conversational RA
 
 ### CiteRAG Support Agent
 - **Persistent Session Memory**: 30-day conversation history backed by Redis, synchronized across cache hits and live agent turns.
+- **Unanswered Questions Queue**: Automatically tracks questions the AI cannot answer with high confidence; users can file tickets for these later.
 - **Direct-Shot Retrieval**: Vector search → LLM in a single round-trip for minimum latency.
-- **LLM-First Routing**: All tool selection, security, and intent routing handled by the LLM — no hardcoded keyword lists.
+- **LLM-First Routing**: All tool selection, security, and intent routing handled by the LLM via LangGraph — no hardcoded keyword lists.
 - **Multi-language Support**: Handles Hindi, Hinglish, Marathi, and Gujarati queries natively.
 - **3-Layer Security**: Azure Content Filter → LLM System Guard → Action-Specific Cache Guard.
-- **Ticket Lifecycle Management**: Auto-creates Notion support tickets for low-confidence answers; full status management via natural language commands.
-- **Duplicate Detection**: Checks Notion for existing tickets before creating new ones to avoid duplicates.
+- **Two-Stage Deduplication**: Prevents duplicate tickets using a fast Vector Pre-filter followed by an accurate LLM Judge.
+- **Urgency Detection**: Automatically classifies ticket priority (High/Low) based on legal, security, or financial risk.
 - **Streaming Responses**: `/api/rag/ask` supports NDJSON token streaming for low-latency feedback.
 
 ### RAGAS Evaluation
@@ -77,42 +78,43 @@ A second major subsystem — **CiteRAG** — is a tool-calling conversational RA
 docForge_AI-main/
 ├── backend/
 │   ├── agents/
-│   │   └── agent_graph.py          # Tool-calling agent: intent routing + tool execution
+│   │   └── agent_graph.py          # LangGraph orchestrator: intent routing + tools
 │   ├── api/
-│   │   ├── routes.py               # Core document generation endpoints (/api/*)
-│   │   ├── agent_routes.py         # Ticket management & session memory endpoints
-│   │   └── rag_routes.py           # CiteRAG endpoints (/api/rag/*)
+│   │   ├── routes.py               # DocForge document generation endpoints
+│   │   ├── agent_routes.py         # Ticket lifecycle & session memory routes
+│   │   └── rag_routes.py           # CiteRAG Q&A and Evaluation routes
 │   ├── core/
-│   │   ├── config.py               # Global settings loaded from .env (Pydantic)
-│   │   ├── llm.py                  # Azure OpenAI client singleton
-│   │   └── logger.py               # Structured logging configuration
+│   │   ├── config.py               # Settings loaded via Pydantic Settings
+│   │   ├── llm.py                  # Azure OpenAI client singletons
+│   │   ├── logger.py               # Structured logging configuration
+│   │   └── vector.py               # Vector store & embedding client helpers
 │   ├── models/
-│   │   └── document_model.py       # Core document data entities
+│   │   └── document_model.py       # SQLAlchemy/SQLModel data entities
 │   ├── prompts/
-│   │   ├── prompts.py              # LLM prompt templates for 100+ document types
-│   │   └── quality_gates.py        # Post-generation output validation
+│   │   ├── prompts.py              # LLM templates for 100+ doc types
+│   │   └── quality_gates.py        # Post-generation content validation
 │   ├── rag/
-│   │   ├── ingest_service.py       # Notion → chunk → embed → ChromaDB pipeline
-│   │   ├── rag_service.py          # RAG tool functions (search, compare, full_doc, etc.)
-│   │   ├── ragas_scorer.py         # RAGAS evaluation scoring
-│   │   ├── system_prompt.py        # CiteRAG agent system instructions
-│   │   ├── ticket_dedup.py         # Duplicate ticket detection against Notion
-│   │   └── qa_dataset.json         # Ground truth Q&A pairs for batch evaluation
+│   │   ├── ingest_service.py       # Notion → ChromaDB ingestion pipeline
+│   │   ├── rag_service.py          # Core RAG retrieval tools
+│   │   ├── ragas_scorer.py         # RAGAS metric calculation
+│   │   ├── system_prompt.py        # CiteRAG agent identity & instructions
+│   │   └── ticket_dedup.py         # Two-stage duplicate detection logic
 │   ├── schemas/
-│   │   ├── document_schema.py      # Pydantic request/response models for DocForge
-│   │   └── notion_schema.py        # Pydantic models for Notion publish requests
+│   │   ├── document_schema.py      # Pydantic request/response models
+│   │   └── notion_schema.py        # Notion-specific API schemas
 │   ├── services/
-│   │   ├── db_service.py           # PostgreSQL pool + all queries (4 tables)
-│   │   ├── document_utils.py       # Content formatting and metadata helpers
-│   │   ├── generator.py            # Section question/answer/generation orchestration
-│   │   ├── notion_service.py       # Notion API wrapper + version control logic
-│   │   └── redis_service.py        # Redis cache with graceful no-op fallback
-│   └── main.py                     # FastAPI entry point — registers all 3 routers
+│   │   ├── db_service.py           # PostgreSQL database operations
+│   │   ├── document_utils.py       # Formatting and metadata helpers
+│   │   ├── generator.py            # LLM generation orchestration
+│   │   ├── notion_service.py       # Notion API wrapper & versioning
+│   │   └── redis_service.py        # Redis cache with graceful fallback
+│   └── main.py                     # FastAPI entry point & lifespan manager
 ├── ui/
-│   └── streamlit_app.py            # Streamlit frontend (DocForge, CiteRAG, Library, Tickets, RAGAS tabs)
-├── chroma_db/                      # Local ChromaDB vector store (auto-created)
-├── docx_builder.py                 # Builds .docx Word files from generated content
-├── flowchart_renderer.py           # Mermaid → PNG via Imgur for Notion image blocks
+│   ├── app.py                      # Main Streamlit entry point
+│   ├── components/                 # UI tabs (Chat, Generate, Library, etc.)
+│   ├── services/                   # API clients for backend communication
+│   └── utils/                      # Session and UI helper functions
+├── chroma_db/                      # Persistent vector storage
 ├── docker-compose.yml              # Multi-container orchestration
 ├── requirements.txt                # Python dependencies
 └── .env.example                    # Environment variable template
@@ -195,12 +197,6 @@ NOTION_TOKEN=secret_...
 NOTION_DATABASE_ID=...           # Published documents DB (also used as RAG source)
 NOTION_TICKET_DB_ID=...          # Support ticket tracking DB (CiteRAG)
 
-# ── PostgreSQL ────────────────────────────────────────────────────────────────
-DATABASE_URL=postgresql://user:pass@localhost:5432/docforge
-
-# ── Redis ─────────────────────────────────────────────────────────────────────
-REDIS_URL=redis://localhost:6379/0   # Optional — app degrades gracefully without it
-
 # ── Azure OpenAI — LLM ────────────────────────────────────────────────────────
 AZURE_OPENAI_LLM_KEY=...
 AZURE_LLM_ENDPOINT=https://your-resource.openai.azure.com/
@@ -213,9 +209,14 @@ AZURE_EMB_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_EMB_DEPLOYMENT=text-embedding-3-large
 AZURE_EMB_API_VERSION=2024-02-01
 
-# ── Optional ──────────────────────────────────────────────────────────────────
+# ── Storage & Infrastructure ──────────────────────────────────────────────────
+DATABASE_URL=postgresql://user:pass@localhost:5432/docforge
+REDIS_URL=redis://localhost:6379/0   # Optional — app degrades gracefully without it
+CHROMA_PATH=./chroma_db              # Optional — defaults to project root
+
+# ── Optional & Misc ──────────────────────────────────────────────────────────
 IMGUR_CLIENT_ID=...              # Enables Mermaid flowchart rendering in Notion
-CORS_ALLOWED_ORIGINS=http://localhost:8501  # Comma-separated; must include Streamlit URL
+CORS_ALLOWED_ORIGINS=http://localhost:8501
 APP_ENV=development              # development | production
 LOG_LEVEL=INFO                   # INFO | DEBUG | WARNING
 ```
@@ -397,14 +398,24 @@ A single LLM prompt governs all of CiteRAG: it selects a tool, executes it, and 
 | Intent / Trigger | Tool | Description |
 |------------------|------|-------------|
 | Policy or knowledge questions | `search` | Standard vector retrieval + cited answer |
-| "Summarize the SLA" | `refine` | HyDE-guided summarization for executive summaries |
-| "Read the full handbook" | `full_doc` | Max vector returns to reconstruct a complete document |
 | "Compare Policy A to B" | `compare` | Retrieves both docs, builds a differences table |
-| "Find risks in..." | `analysis` | Deep gap and contradiction analysis |
-| Multi-part questions | `multi_query` | Splits the question and merges results |
-| Low-confidence answers | `create_ticket` | Auto-creates a Notion support ticket |
-| "Resolve ticket #12345" | `update_ticket` | Updates the Notion ticket status |
+| "Compare A, B, and C" | `multi_compare` | Pairwise comparison across 3+ documents |
+| "Find risks in..." | `analyze` | Deep gap, risk, and contradiction analysis |
+| "Summarize the SLA" | `summarize` | HyDE-guided summarization for executive summaries |
+| "Read the full handbook" | `full_doc` | Max vector returns to reconstruct a complete document |
+| Multi-part questions | `multi_query` | Splits complex queries into 2-5 sub-tasks |
+| Low-confidence answers | `create_ticket` | Create ticket for a specific or pending question |
+| "Resolve ticket #12345" | `update_ticket` | Updates status (Open / In Progress / Resolved) |
+| "What did we talk about?" | `chat_history_summary` | Answers questions about the current conversation |
 | Off-topic or injection attempts | `block_off_topic` | Security layer — returns a safe fallback response |
+| "Nevermind" / "Stop" | `cancel` | Aborts a pending ticket creation flow |
+
+### Deduplication Engine
+
+CiteRAG uses a robust two-stage process to ensure no duplicate tickets are created in Notion:
+
+1. **Stage 1 — Vector Pre-filter**: The new question is normalized and embedded. ChromaDB quickly finds the top 10 most similar open/in-progress tickets.
+2. **Stage 2 — LLM Judge**: The LLM receives the candidates and performs a deep intent comparison. It only flags a duplicate if the *exact same entity* (person, policy, document) is being queried.
 
 ### Ingestion Pipeline
 
@@ -432,14 +443,15 @@ The RAGAS tab in the UI provides a batch evaluation interface:
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | AI / LLM | Azure OpenAI (GPT-4.1 Mini) | Document generation, agent routing, RAGAS scoring |
+| Orchestration | LangGraph | Complex agent tool-calling and state management |
 | Embeddings | Azure OpenAI (text-embedding-3-large) | Semantic vector generation for RAG |
 | Vector Store | ChromaDB | Chunk storage and similarity retrieval |
-| Backend | FastAPI + Pydantic | REST API, request validation, async performance |
-| Frontend | Streamlit | Multi-tab UI (DocForge, CiteRAG, Library, Tickets, RAGAS) |
-| Relational DB | PostgreSQL (asyncpg) | Persistent storage for departments, sections, Q&A, generated docs |
+| Backend | FastAPI + Pydantic Settings | REST API, request validation, configuration |
+| Frontend | Streamlit | Multi-tab UI (Chat, Generate, Library, Agent, RAGAS) |
+| Relational DB | PostgreSQL (asyncpg) | Persistent storage for departments, sections, Q&A |
 | Document Store | Notion API | Published document library + ticket tracking |
 | Cache | Redis | Session history, answer cache, rate limiting |
-| Flowchart Render | Mermaid + Imgur | Converts Mermaid syntax to PNG for Notion image blocks |
+| Flowchart Render | Mermaid + Imgur | Converts Mermaid syntax to PNG for Notion |
 | Reporting | python-docx | RAGAS report and document export to .docx |
 
 ---
